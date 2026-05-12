@@ -1,16 +1,6 @@
 name: Windows CUDA Build
 
 on:
-  push:
-    branches: [ dev, master ]
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
-  pull_request:
-    branches: [ dev, master ]
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
   workflow_dispatch:
 
 jobs:
@@ -19,7 +9,6 @@ jobs:
     uses: ./.github/workflows/windows-build-preflight.yml
 
   test-plugin-venv:
-    if: github.repository == 'MrNeRF/LichtFeld-Studio' || github.event.pull_request.base.repo.full_name == 'MrNeRF/LichtFeld-Studio'
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
@@ -89,8 +78,6 @@ jobs:
           Write-Host "PASS: uv sync resilient to wrong PYTHONHOME"
 
   build-windows:
-    needs: windows-preflight
-    if: github.repository == 'MrNeRF/LichtFeld-Studio' || github.event.pull_request.base.repo.full_name == 'MrNeRF/LichtFeld-Studio'
     runs-on: windows-2022
     strategy:
       fail-fast: false
