@@ -24,6 +24,10 @@ on:
         description: Stable version without leading v, for manual stable publishes
         required: false
         type: string
+      build_ref:
+        description: Build ref
+        required: false
+        type: string
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
@@ -40,6 +44,7 @@ jobs:
       previous_sha: ${{ steps.decide.outputs.previous_sha }}
       build_channel: ${{ steps.decide.outputs.build_channel }}
       stable_version: ${{ steps.decide.outputs.stable_version }}
+      build_ref: ${{ steps.decide.outputs.build_ref }}
 
     steps:
       - name: Decide whether package build is needed
@@ -58,6 +63,9 @@ jobs:
               ? refName.replace(/^v/, '')
               : (inputs.release_version || '').trim().replace(/^v/, '');
             const stableVersionPattern = /^[0-9]+(\.[0-9]+){1,2}$/;
+
+            
+            core.setOutput('build_ref', inputs.build_ref || '');
 
             if (isTagRelease || requestedChannel === 'stable') {
               core.setOutput('build_channel', 'stable');
@@ -182,6 +190,7 @@ jobs:
         with:
           fetch-depth: 0
           submodules: recursive
+          ref: ${{ needs.precheck.outputs.build_ref }}
 
       - name: Install CUDA 12.8
         run: |
