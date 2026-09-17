@@ -28,6 +28,11 @@ on:
         description: Build ref
         required: false
         type: string
+      use_upstream_repo:
+        description: Use upstream repo
+        required: false
+        type: boolean
+        default: false
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
@@ -45,6 +50,7 @@ jobs:
       build_channel: ${{ steps.decide.outputs.build_channel }}
       stable_version: ${{ steps.decide.outputs.stable_version }}
       build_ref: ${{ steps.decide.outputs.build_ref }}
+      repo: ${{ steps.decide.outputs.repo }}
 
     steps:
       - name: Decide whether package build is needed
@@ -66,6 +72,9 @@ jobs:
 
             
             core.setOutput('build_ref', inputs.build_ref || '');
+            if (inputs.use_upstream_repo) {
+              core.setOutput('repo', 'MrNeRF/LichtFeld-Studio');
+            }
 
             if (isTagRelease || requestedChannel === 'stable') {
               core.setOutput('build_channel', 'stable');
@@ -192,6 +201,7 @@ jobs:
         with:
           fetch-depth: 0
           submodules: recursive
+          repository: ${{ needs.precheck.outputs.repo }}
           ref: ${{ needs.precheck.outputs.build_ref }}
 
       - name: Install CUDA 12.8
