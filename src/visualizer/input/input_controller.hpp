@@ -139,6 +139,9 @@ namespace lfs::vis {
             return movement_active || camera_drag || orbit_coasting || pan_coasting ||
                    keyboard_camera.isGliding() || wasd_coasting || drone_settling;
         }
+        [[nodiscard]] bool isCameraNavigating() const {
+            return camera_is_moving_ || isContinuousInputActive();
+        }
         [[nodiscard]] bool hasViewportKeyboardFocus() const;
         [[nodiscard]] bool isViewportPoint(double x, double y) const { return isInViewport(x, y); }
         [[nodiscard]] int currentModifierKeys() const { return getModifierKeys(); }
@@ -156,7 +159,7 @@ namespace lfs::vis {
         void handleMouseMove(double x, double y);
         void handleScroll(double xoff, double yoff);
         void handleKey(int key, int action, int mods);
-        void handleKey(int physical_key, int logical_key, int scancode, int action, int mods);
+        void handleKey(int physical_key, int logical_key, int scancode, int action, int mods, bool owned_release = false, bool gui_consumed = false);
         void handleFileDrop(const std::vector<std::string>& paths);
         void onWindowFocusLost();
         bool focusSelection();

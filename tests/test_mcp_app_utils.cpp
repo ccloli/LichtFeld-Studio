@@ -87,7 +87,8 @@ namespace {
         }
         lfs::Result<void> projectCreateAt(
             const std::filesystem::path&,
-            lfs::vis::ProjectSwitchDisposition) override {
+            lfs::vis::ProjectSwitchDisposition,
+            bool = false) override {
             return {};
         }
         lfs::Result<lfs::vis::ProjectOpenOutcome> projectOpen(
@@ -221,6 +222,19 @@ TEST(McpAppUtilsTest, PostAndWaitExecutesInlineOnViewerThread) {
     EXPECT_EQ(viewer.postCount(), 0);
     EXPECT_TRUE(result["success"].get<bool>());
     EXPECT_EQ(result["mode"], "inline");
+}
+
+TEST(McpAppUtilsTest, PostAndWaitBlocksNativeDialogsOnlyForTheGuiWork) {
+    FakeVisualizer viewer;
+    EXPECT_FALSE(lfs::vis::gui::nativeFileDialogsBlocked());
+    const auto blocked = lfs::app::post_and_wait(&viewer, [] {
+        EXPECT_TRUE(lfs::vis::gui::nativeFileDialogsBlocked());
+        EXPECT_TRUE(lfs::vis::gui::OpenFileDialog().empty());
+        return nlohmann::json{{"success", true}};
+    });
+    EXPECT_EQ(blocked["error"],
+              "This MCP operation requested a native file dialog. Use project_save_as, project_open, scene.load_ply, or scene.load_dataset with an explicit path instead.");
+    EXPECT_FALSE(lfs::vis::gui::nativeFileDialogsBlocked());
 }
 
 TEST(McpAppUtilsTest, PostAndWaitQueuesAndWaitsOffViewerThread) {

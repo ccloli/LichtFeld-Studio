@@ -14,6 +14,12 @@
 
 namespace fast_lfs::optimizer::kernels::adam {
 
+    inline constexpr int kMaxContiguousBatch = 6;
+
+    struct JointContiguousBatch {
+        JointContiguousBatchEntry entries[kMaxContiguousBatch];
+    };
+
     // Non-fused joint Adam step for contiguous [n_prims, n_attr] params.
     // Grid = ceil(n_prims/256), block = 256 so blockIdx.x == bounds block index
     // (matches fused preprocess_backward / joint_adam::kBlockSizeDevice).
@@ -110,12 +116,13 @@ namespace fast_lfs::optimizer::kernels::adam {
                 float v = mv.y;
                 if (apply_step) {
                     float grad = param_grad[static_cast<int64_t>(prim) * n_attr + i];
+                    float hinge = 0.0f;
                     if (screen_share_max != nullptr && prim < screen_share_n) {
-                        grad += lfs::training::screen_share_hinge_extra_grad(
+                        hinge = lfs::training::screen_share_hinge_extra_grad(
                             screen_share_max[prim], screen_share_limit, screen_share_penalty,
                             mv.y, bias_correction2_sqrt_rcp, eps);
                     }
-                    m = beta1 * mv.x + beta1_comp * grad;
+                    m = beta1 * mv.x + beta1_comp * (grad + hinge);
                     v = beta2 * mv.y + beta2_comp * grad * grad;
                     const float denom = sqrtf(v) * bias_correction2_sqrt_rcp + eps;
                     param[static_cast<int64_t>(prim) * n_attr + i] -= step_size * m / denom;
@@ -165,8 +172,7 @@ namespace fast_lfs::optimizer::kernels::adam {
 
     template <int BITS>
     __global__ void adam_step_joint_contiguous_batched_cu(
-        const JointContiguousBatchEntry* table,
-        const int n_entries,
+        const __grid_constant__ JointContiguousBatch batch,
         const bool* frozen_mask,
         const int frozen_mask_size,
         const float frozen_lr_scale,
@@ -193,10 +199,7 @@ namespace fast_lfs::optimizer::kernels::adam {
         constexpr int kMaxAttr = 16;
 
         const int e = static_cast<int>(blockIdx.y);
-        if (e >= n_entries || table == nullptr) {
-            return;
-        }
-        const JointContiguousBatchEntry ent = table[e];
+        const JointContiguousBatchEntry& ent = batch.entries[e];
         float* const param = ent.param;
         uint8_t* const packed = ent.packed;
         float* const bounds = ent.bounds;
@@ -262,13 +265,14 @@ namespace fast_lfs::optimizer::kernels::adam {
                 float v = mv.y;
                 if (apply_step) {
                     float grad = param_grad[static_cast<int64_t>(prim) * n_attr + i];
+                    float hinge = 0.0f;
                     if (ent.apply_screen_share && screen_share_max != nullptr &&
                         prim < screen_share_n) {
-                        grad += lfs::training::screen_share_hinge_extra_grad(
+                        hinge = lfs::training::screen_share_hinge_extra_grad(
                             screen_share_max[prim], screen_share_limit, screen_share_penalty,
                             mv.y, bias_correction2_sqrt_rcp, eps);
                     }
-                    m = beta1 * mv.x + beta1_comp * grad;
+                    m = beta1 * mv.x + beta1_comp * (grad + hinge);
                     v = beta2 * mv.y + beta2_comp * grad * grad;
                     const float denom = sqrtf(v) * bias_correction2_sqrt_rcp + eps;
                     param[static_cast<int64_t>(prim) * n_attr + i] -= step_size * m / denom;

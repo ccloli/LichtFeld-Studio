@@ -354,15 +354,6 @@ namespace lfs::vis::gui {
         }
     }
 
-    static bool isOrHasAncestor(Rml::Element* el, const Rml::String& id) {
-        while (el) {
-            if (el->GetId() == id)
-                return true;
-            el = el->GetParentNode();
-        }
-        return false;
-    }
-
     void RmlRightPanel::setTabStripScroll(const float value) {
         if (!std::isfinite(value))
             return;
@@ -420,6 +411,8 @@ namespace lfs::vis::gui {
     }
 
     void RmlRightPanel::processInput(const RightPanelLayout& layout, const PanelInputState& input) {
+        if (rml_manager_ && rml_context_ && rml_manager_->routeInput(rml_context_, input, [this, layout](const PanelInputState& event) { processInput(layout, event); }))
+            return;
         const CursorRequest previous_cursor_request = cursor_request_;
         wants_input_ = false;
         wants_keyboard_ = false;
@@ -448,9 +441,7 @@ namespace lfs::vis::gui {
         const bool pointer_down =
             input.mouse_down[0] || input.mouse_down[1] || input.mouse_down[2];
         const bool keyboard_event =
-            !input.keys_pressed.empty() || !input.keys_released.empty() ||
-            !input.keys_repeated.empty() || !input.text_codepoints.empty() ||
-            !input.text_inputs.empty() || input.has_text_editing;
+            !input.keys_pressed.empty() || !input.input_events.empty();
         auto* const focused_before = rml_context_->GetFocusElement();
         if (pointer_event || keyboard_event)
             last_blurred_focus_ = nullptr;
@@ -475,8 +466,9 @@ namespace lfs::vis::gui {
         const float mx = input.mouse_x - layout.pos.x;
         const float my = input.mouse_y - layout.pos.y;
         const float dp_ratio = rml_manager_ ? rml_manager_->getDpRatio() : 1.0f;
-        const float resize_handle_half_w =
-            PanelLayoutManager::RIGHT_PANEL_RESIZE_EDGE_HALF_WIDTH * dp_ratio;
+        const auto resize_zone = resizeHitZone(layout.pos.x, dp_ratio);
+        const auto splitter_zone = resizeHitZone(
+            layout.pos.y + layout.scene_h + layout.splitter_h * 0.5f, dp_ratio);
 
         const int mods = sdlModsToRml(input.key_ctrl, input.key_shift,
                                       input.key_alt, input.key_super);
@@ -498,21 +490,19 @@ namespace lfs::vis::gui {
         }
         auto* hover = pointer_in_context ? rml_context_->GetHoverElement() : nullptr;
         const bool over_resize_handle_geom =
-            mx >= -resize_handle_half_w &&
-            mx <= resize_handle_half_w &&
+            resize_zone.contains(input.mouse_x) &&
             my >= 0.0f &&
             my < layout.size.y;
-        // Use geometry for the resize edge so stale RmlUi hover state cannot
-        // keep the cursor active after the pointer leaves the panel.
-        const bool over_resize_handle =
-            over_resize_handle_geom || (hover && isOrHasAncestor(hover, "resize-handle"));
+        const bool over_resize_handle = over_resize_handle_geom;
         if (resize_handle_el_ && !resize_dragging_ &&
             over_resize_handle != last_over_resize_handle_) {
             resize_handle_el_->SetAttribute("class", over_resize_handle ? "hover" : "");
             last_over_resize_handle_ = over_resize_handle;
             input_dirty_ = true;
         }
-        const bool over_splitter = hover && isOrHasAncestor(hover, "splitter");
+        const bool over_splitter =
+            mx >= 0.0f && mx < layout.size.x &&
+            splitter_zone.contains(input.mouse_y);
         const bool over_interactive = hover && hover->GetTagName() != "body" &&
                                       hover->GetId() != "rp-body" &&
                                       hover->GetId() != "left-border" &&
@@ -531,8 +521,8 @@ namespace lfs::vis::gui {
             input_dirty_ = true;
 
             if (input.mouse_down[0]) {
-                if (on_resize_delta && delta_x != 0.0f)
-                    on_resize_delta(delta_x);
+                if (on_resize_width)
+                    on_resize_width(resize_start_width_ - (input.mouse_x - resize_start_mouse_x_));
                 cursor_request_ = CursorRequest::ResizeEW;
             } else {
                 resize_dragging_ = false;
@@ -551,8 +541,9 @@ namespace lfs::vis::gui {
             input_dirty_ = true;
 
             if (input.mouse_down[0]) {
-                if (on_splitter_delta && delta_y != 0.0f)
-                    on_splitter_delta(delta_y);
+                if (on_splitter_height)
+                    on_splitter_height(splitter_start_scene_h_ + input.mouse_y - splitter_start_mouse_y_,
+                                       layout.size.y);
                 cursor_request_ = CursorRequest::ResizeNS;
             } else {
                 splitter_dragging_ = false;
@@ -570,6 +561,8 @@ namespace lfs::vis::gui {
                 cursor_request_ = CursorRequest::ResizeEW;
                 if (input.mouse_clicked[0]) {
                     resize_dragging_ = true;
+                    resize_start_mouse_x_ = input.mouse_x;
+                    resize_start_width_ = layout.size.x;
                     input_dirty_ = true;
                     if (resize_handle_el_)
                         resize_handle_el_->SetAttribute("class", "dragging");
@@ -578,6 +571,8 @@ namespace lfs::vis::gui {
                 cursor_request_ = CursorRequest::ResizeNS;
                 if (input.mouse_clicked[0]) {
                     splitter_dragging_ = true;
+                    splitter_start_mouse_y_ = input.mouse_y;
+                    splitter_start_scene_h_ = layout.scene_h;
                     input_dirty_ = true;
                     if (splitter_el_)
                         splitter_el_->SetAttribute("class", "dragging");
@@ -599,20 +594,8 @@ namespace lfs::vis::gui {
 
         if (rml_input::hasFocusedKeyboardTarget(rml_context_->GetFocusElement()) &&
             !input.viewport_keyboard_focus) {
-            for (const int sc : input.keys_pressed) {
-                const auto rml_key = sdlScancodeToRml(static_cast<SDL_Scancode>(sc));
-                if (rml_key != Rml::Input::KI_UNKNOWN) {
-                    rml_context_->ProcessKeyDown(rml_key, mods);
-                    input_dirty_ = true;
-                }
-            }
-            for (const int sc : input.keys_released) {
-                const auto rml_key = sdlScancodeToRml(static_cast<SDL_Scancode>(sc));
-                if (rml_key != Rml::Input::KI_UNKNOWN) {
-                    rml_context_->ProcessKeyUp(rml_key, mods);
-                    input_dirty_ = true;
-                }
-            }
+            for (const auto& event : input.input_events)
+                input_dirty_ |= rml_input::processKeyboardEvent(*rml_context_, event, rml_manager_->getTextInputHandler());
         }
 
         auto* focused = rml_context_->GetFocusElement();

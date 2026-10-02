@@ -135,12 +135,19 @@ namespace fast_lfs::rasterization::kernels::forward {
 
         // compute 3d covariance from raw scale and rotation
         const float3 raw_scale = active ? raw_scales[primitive_idx] : make_float3(0.0f, 0.0f, 0.0f);
+        const float4 raw_rotation = raw_rotations[primitive_idx];
+        if (!isfinite(mean3d.x) || !isfinite(mean3d.y) || !isfinite(mean3d.z) ||
+            !isfinite(raw_scale.x) || !isfinite(raw_scale.y) || !isfinite(raw_scale.z) ||
+            !isfinite(raw_rotation.x) || !isfinite(raw_rotation.y) ||
+            !isfinite(raw_rotation.z) || !isfinite(raw_rotation.w) || !isfinite(raw_opacity))
+            active = false;
+        if (__ballot_sync(0xffffffffu, active) == 0)
+            return;
         const float3 clamped_scale = make_float3(
             fminf(raw_scale.x, config::max_raw_scale),
             fminf(raw_scale.y, config::max_raw_scale),
             fminf(raw_scale.z, config::max_raw_scale));
         const float3 variance = make_float3(expf(2.0f * clamped_scale.x), expf(2.0f * clamped_scale.y), expf(2.0f * clamped_scale.z));
-        const float4 raw_rotation = raw_rotations[primitive_idx];
         const float qr = raw_rotation.x;
         const float qx = raw_rotation.y;
         const float qy = raw_rotation.z;
@@ -585,7 +592,7 @@ namespace fast_lfs::rasterization::kernels::forward {
     // warp_cull_mode: 0 = enabled (production), 1 = disabled (mask all-1s, reference),
     //                 2 = deliberately incorrect empty mask for negative coverage.
     // blend_batch_size_runtime: multiple of 32 in [32, block_size_blend_forward]; 0 → config default.
-    template <bool kRenderNormal>
+    template <bool kRenderNormal, bool kRenderDepth>
     __global__ void __launch_bounds__(config::block_size_blend_forward) blend_cu(
         const uint2* __restrict__ tile_instance_ranges,
         const uint* __restrict__ instance_primitive_indices,
@@ -849,7 +856,9 @@ namespace fast_lfs::rasterization::kernels::forward {
             image[pixel_idx + n_pixels] = color_pixel0.y + transmittance0 * bg.y;
             image[pixel_idx + n_pixels * 2] = color_pixel0.z + transmittance0 * bg.z;
             alpha_map[pixel_idx] = 1.0f - transmittance0;
-            depth_map[pixel_idx] = depth_pixel0;
+            if constexpr (kRenderDepth) {
+                depth_map[pixel_idx] = depth_pixel0;
+            }
             if constexpr (kRenderNormal) {
                 normal_map[pixel_idx] = normal_pixel0.x;
                 normal_map[pixel_idx + n_pixels] = normal_pixel0.y;
@@ -874,7 +883,9 @@ namespace fast_lfs::rasterization::kernels::forward {
             image[pixel_idx + n_pixels] = color_pixel1.y + transmittance1 * bg.y;
             image[pixel_idx + n_pixels * 2] = color_pixel1.z + transmittance1 * bg.z;
             alpha_map[pixel_idx] = 1.0f - transmittance1;
-            depth_map[pixel_idx] = depth_pixel1;
+            if constexpr (kRenderDepth) {
+                depth_map[pixel_idx] = depth_pixel1;
+            }
             if constexpr (kRenderNormal) {
                 normal_map[pixel_idx] = normal_pixel1.x;
                 normal_map[pixel_idx + n_pixels] = normal_pixel1.y;

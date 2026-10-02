@@ -532,16 +532,9 @@ namespace lfs::vis::gui {
         overlay_input.key_shift = (sdl_buf.key_mods & SDL_KMOD_SHIFT) != 0;
         overlay_input.key_alt = (sdl_buf.key_mods & SDL_KMOD_ALT) != 0;
         overlay_input.key_super = (sdl_buf.key_mods & SDL_KMOD_GUI) != 0;
+        overlay_input.input_events = sdl_buf.input_events;
         for (auto sc : sdl_buf.keys_pressed)
             overlay_input.keys_pressed.push_back(static_cast<int>(sc));
-        for (auto sc : sdl_buf.keys_released)
-            overlay_input.keys_released.push_back(static_cast<int>(sc));
-        overlay_input.text_codepoints = sdl_buf.text_codepoints;
-        overlay_input.text_inputs = sdl_buf.text_inputs;
-        overlay_input.text_editing = sdl_buf.text_editing;
-        overlay_input.text_editing_start = sdl_buf.text_editing_start;
-        overlay_input.text_editing_length = sdl_buf.text_editing_length;
-        overlay_input.has_text_editing = sdl_buf.has_text_editing;
 
         renderKeyframeEditOverlay(viewport);
         overlay_->processInput(overlay_input);
@@ -1149,13 +1142,29 @@ namespace lfs::vis::gui {
 
         const bool is_playing = controller_.isPlaying() && controller_.timeline().realKeyframeCount() > 0;
         rm->setOverlayAnimationActive(is_playing);
-        if (ui_state_.follow_playback && controller_.timeline().realKeyframeCount() > 0) {
-            const auto state = controller_.currentCameraState();
-            auto& vp = viewer_->getViewport();
-            vp.setViewMatrix(glm::mat3_cast(state.rotation), state.position);
-            rm->setFocalLength(state.focal_length_mm);
-            rm->markCameraPoseChanged();
-        }
+        if (ui_state_.follow_playback)
+            (void)applyCurrentTimelineCamera();
+    }
+
+    bool SequencerUIManager::applyCurrentTimelineCamera() {
+        if (controller_.timeline().realKeyframeCount() == 0)
+            return false;
+
+        auto* const rm = viewer_->getRenderingManager();
+        if (!rm)
+            return false;
+
+        const auto state = controller_.currentCameraState();
+        auto& vp = viewer_->getViewport();
+        vp.setViewMatrix(glm::mat3_cast(state.rotation), state.position);
+        rm->setFocalLength(state.focal_length_mm);
+        rm->markCameraPoseChanged();
+        return true;
+    }
+
+    bool SequencerUIManager::scrubToTime(const float time, const bool update_camera) {
+        controller_.seek(time);
+        return update_camera && applyCurrentTimelineCamera();
     }
 
     void SequencerUIManager::advancePlayback(const float delta_time) {

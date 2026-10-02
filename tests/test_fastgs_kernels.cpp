@@ -1193,6 +1193,51 @@ TEST_F(FastGSKernelTest, Optimizer_ZeroRows) {
 
     std::vector<int64_t> indices = {0, 1, 2, 3, 4};
     ASSERT_NO_THROW(opt->reset_state_at_indices(ParamType::Means, indices));
+
+    auto host_indices = Tensor::empty({indices.size()}, Device::CPU, DataType::Int64);
+    std::memcpy(host_indices.ptr<int64_t>(), indices.data(), indices.size() * sizeof(int64_t));
+    auto device_indices = host_indices.cuda();
+    ASSERT_NO_THROW(opt->reset_state_at_indices(ParamType::Means, device_indices));
+}
+
+TEST_F(FastGSKernelTest, Optimizer_ResetRowsTensorMatchesVectorPath) {
+    const auto state_bytes = [](const AdamOptimizer& opt, ParamType type) {
+        const auto* state = opt.get_state(type);
+        EXPECT_NE(state, nullptr);
+        auto packed = state->exp_avg.cpu().contiguous();
+        auto bounds = state->joint_bounds.cpu().contiguous();
+        std::vector<uint8_t> bytes(packed.bytes() + bounds.bytes());
+        std::memcpy(bytes.data(), packed.data_ptr(), packed.bytes());
+        std::memcpy(bytes.data() + packed.bytes(), bounds.data_ptr(), bounds.bytes());
+        return bytes;
+    };
+
+    for (const auto index_dtype : {DataType::Int64, DataType::Int32}) {
+        auto vector_opt = make_optimizer();
+        auto tensor_opt = make_optimizer();
+        for (auto* opt : {vector_opt.get(), tensor_opt.get()}) {
+            opt->get_grad(ParamType::Means).fill_(0.5f);
+            opt->get_grad(ParamType::Opacity).fill_(0.25f);
+            opt->step(1);
+        }
+        ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+        const std::vector<int64_t> rows = {0, 3, 7, static_cast<int64_t>(n_) - 1};
+        auto host_rows = Tensor::empty({rows.size()}, Device::CPU, DataType::Int64);
+        std::memcpy(host_rows.ptr<int64_t>(), rows.data(), rows.size() * sizeof(int64_t));
+        const auto device_rows = host_rows.cuda().to(index_dtype);
+
+        for (const auto type : {ParamType::Means, ParamType::Opacity}) {
+            const auto before = state_bytes(*vector_opt, type);
+            vector_opt->reset_state_at_indices(type, rows);
+            tensor_opt->reset_state_at_indices(type, device_rows);
+            ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+            const auto after_vector = state_bytes(*vector_opt, type);
+            // A tensor overload that skipped the reset would leave `before` in place.
+            EXPECT_NE(after_vector, before);
+            EXPECT_EQ(state_bytes(*tensor_opt, type), after_vector);
+        }
+    }
 }
 
 // Numerical tests
@@ -2555,6 +2600,82 @@ TEST(NormalLossHunt, JointRotationCuda100kSteps) {
     const float expected_delta = .002f * (1.0f - .9f) * g[8] /
                                  (std::sqrt((1.0f - .999f) * g[8] * g[8]) + 1e-15f);
     EXPECT_NEAR(resumed.ptr<float>()[8] - pc.ptr<float>()[8], -expected_delta, 1e-8f);
+}
+
+TEST(ScreenShareAdamHingeTest, HingeDoesNotInflateSecondMoment) {
+    if (!torch::cuda::is_available()) {
+        GTEST_SKIP() << "CUDA not available";
+    }
+
+    constexpr int steps = 400;
+    constexpr float lr = 0.001f;
+    constexpr float beta1 = 0.9f;
+    constexpr float beta2 = 0.999f;
+    constexpr float eps = 1e-15f;
+    constexpr float limit = 0.3f;
+    constexpr float penalty = 10.0f;
+    constexpr float share = 0.6f;
+    constexpr float hinge = penalty * 1.0f; // log2(share / limit)
+
+    for (const bool batched : {false, true}) {
+        SCOPED_TRACE(batched ? "batched Adam" : "raw Adam");
+        auto param = Tensor::zeros({size_t{1}}, Device::CUDA);
+        auto grad = Tensor::zeros({size_t{1}}, Device::CUDA);
+        auto packed = Tensor::zeros({size_t{1}, size_t{4}}, Device::CUDA, DataType::UInt8);
+        auto bounds = Tensor::from_vector(std::vector<float>{-1.0f, 1.0f, 0.0f, 2.0f},
+                                          {size_t{1}, size_t{4}}, Device::CUDA);
+        auto screen_share = Tensor::from_vector(std::vector<float>{share}, {size_t{1}}, Device::CUDA);
+        std::vector<std::uint8_t> initial_packed(4);
+        joint_adam::Codec16::encode_g1g2(initial_packed.data(), 0, 0.0f, 1.0f,
+                                         -1.0f, 1.0f, 0.0f, 2.0f);
+        ASSERT_EQ(cudaMemcpy(packed.data_ptr(), initial_packed.data(), initial_packed.size(),
+                             cudaMemcpyHostToDevice),
+                  cudaSuccess);
+
+        fast_lfs::optimizer::JointContiguousBatchEntry entry{};
+        entry.param = param.ptr<float>();
+        entry.packed = packed.ptr<std::uint8_t>();
+        entry.bounds = bounds.ptr<float>();
+        entry.grad = grad.ptr<float>();
+        entry.n_prims = 1;
+        entry.n_attr = 1;
+        entry.lr = lr;
+        entry.apply_screen_share = 1;
+
+        for (int step = 1; step <= steps; ++step) {
+            const float bc1 = 1.0f / (1.0f - std::pow(beta1, step));
+            const float bc2 = 1.0f / std::sqrt(1.0f - std::pow(beta2, step));
+            if (batched) {
+                entry.bias_correction1_rcp = bc1;
+                entry.bias_correction2_sqrt_rcp = bc2;
+                fast_lfs::optimizer::adam_step_joint_contiguous_batched(
+                    &entry, 1, nullptr, 0, 1.0f, nullptr, 0, 1.0f,
+                    beta1, beta2, eps, nullptr, nullptr, 0, 0.0f, 1.0f, 300.0f,
+                    nullptr, 0, screen_share.ptr<float>(), 1, limit, penalty);
+            } else {
+                fast_lfs::optimizer::adam_step_joint_contiguous_raw(
+                    param.ptr<float>(), packed.ptr<std::uint8_t>(), bounds.ptr<float>(), grad.ptr<float>(),
+                    nullptr, 0, 1.0f, nullptr, 0, 1.0f, 1, 1, 16, lr,
+                    beta1, beta2, eps, bc1, bc2, nullptr,
+                    nullptr, 0, 0.0f, 1.0f, 300.0f, nullptr, 0,
+                    screen_share.ptr<float>(), 1, limit, penalty);
+            }
+        }
+        ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+        auto param_cpu = param.cpu();
+        auto packed_cpu = packed.cpu();
+        auto bounds_cpu = bounds.cpu();
+        float m = 0.0f, v = 0.0f;
+        const float* b = bounds_cpu.ptr<float>();
+        joint_adam::Codec16::decode_g1g2(packed_cpu.ptr<std::uint8_t>(), 0,
+                                         b[0], b[1], b[2], b[3], m, v);
+        ASSERT_TRUE(std::isfinite(param_cpu.ptr<float>()[0]));
+        EXPECT_TRUE(std::isfinite(m));
+        EXPECT_TRUE(std::isfinite(v));
+        EXPECT_LT(v, 2.0f);
+        EXPECT_NEAR(-param_cpu.ptr<float>()[0] / (steps * lr), hinge, 1.5f);
+    }
 }
 
 TEST(JointAdamUpdates, ZeroHistoryStaysFixedInOrdinaryAndFusedAllGroups) {

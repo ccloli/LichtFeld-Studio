@@ -9,6 +9,17 @@
 
 namespace lfs::vis::gui {
 
+    class ScopedNativeFileDialogBlock {
+    public:
+        LFS_VIS_API ScopedNativeFileDialogBlock() noexcept;
+        LFS_VIS_API ~ScopedNativeFileDialogBlock();
+        ScopedNativeFileDialogBlock(const ScopedNativeFileDialogBlock&) = delete;
+        ScopedNativeFileDialogBlock& operator=(const ScopedNativeFileDialogBlock&) = delete;
+    };
+
+    LFS_VIS_API bool nativeFileDialogsBlocked() noexcept;
+    LFS_VIS_API bool nativeFileDialogAttempted() noexcept;
+
     // Initializes the thread-local native dialog backend without opening a
     // dialog. Call only on the UI thread during an idle frame.
     LFS_VIS_API void warmupNativeFileDialogBackend();
@@ -52,6 +63,8 @@ namespace lfs::vis::gui {
                                                         const std::filesystem::path& defaultPath = {});
     LFS_VIS_API std::filesystem::path SaveSsogFileDialog(const std::string& defaultName);
     LFS_VIS_API std::filesystem::path SaveSpzFileDialog(const std::string& defaultName,
+                                                        const std::filesystem::path& defaultPath = {});
+    LFS_VIS_API std::filesystem::path SaveGlbFileDialog(const std::string& defaultName,
                                                         const std::filesystem::path& defaultPath = {});
     LFS_VIS_API std::filesystem::path SaveUsdFileDialog(const std::string& defaultName,
                                                         const std::filesystem::path& defaultPath = {});

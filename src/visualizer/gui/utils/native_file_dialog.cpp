@@ -13,6 +13,7 @@
 #include <SDL3/SDL_video.h>
 #include <nfd.h>
 
+#include <atomic>
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -29,6 +30,9 @@
 namespace lfs::vis::gui {
 
     namespace {
+
+        std::atomic_uint native_dialog_block_count{0};
+        thread_local bool native_dialog_block_attempted = false;
 
         enum class DialogKind : uint8_t {
             OpenFile,
@@ -357,6 +361,11 @@ namespace lfs::vis::gui {
 
         bool runDialog(const DialogRequest& request, std::filesystem::path& resultPath) {
             resultPath.clear();
+            if (nativeFileDialogsBlocked()) {
+                native_dialog_block_attempted = true;
+                LOG_WARN("Native file dialog request blocked during an MCP GUI operation");
+                return false;
+            }
             if (!ensureDialogBackendInitialized()) {
                 return false;
             }
@@ -438,7 +447,7 @@ namespace lfs::vis::gui {
         }
 
         [[nodiscard]] std::vector<DialogFilter> pointCloudFilters() {
-            return {makeFilter("Point Cloud Files", {".ply", ".sog", ".ssog", ".spz", ".rad", ".usd", ".usda", ".usdc", ".usdz"})};
+            return {makeFilter("Point Cloud Files", {".ply", ".sog", ".ssog", ".spz", ".glb", ".rad", ".usd", ".usda", ".usdc", ".usdz"})};
         }
 
         [[nodiscard]] std::vector<DialogFilter> meshFilters() {
@@ -509,6 +518,11 @@ namespace lfs::vis::gui {
             const char* title,
             const GtkFileChooserAction action,
             const bool returnCurrentFolder) {
+            if (nativeFileDialogsBlocked()) {
+                native_dialog_block_attempted = true;
+                LOG_WARN("Native file dialog request blocked during an MCP GUI operation");
+                return {};
+            }
             if (!ensureDialogBackendInitialized()) {
                 return {};
             }
@@ -567,6 +581,20 @@ namespace lfs::vis::gui {
 
     void warmupNativeFileDialogBackend() {
         (void)ensureDialogBackendInitialized();
+    }
+
+    ScopedNativeFileDialogBlock::ScopedNativeFileDialogBlock() noexcept {
+        if (native_dialog_block_count.fetch_add(1, std::memory_order_acq_rel) == 0)
+            native_dialog_block_attempted = false;
+    }
+    ScopedNativeFileDialogBlock::~ScopedNativeFileDialogBlock() {
+        native_dialog_block_count.fetch_sub(1, std::memory_order_acq_rel);
+    }
+    bool nativeFileDialogsBlocked() noexcept {
+        return native_dialog_block_count.load(std::memory_order_acquire) != 0;
+    }
+    bool nativeFileDialogAttempted() noexcept {
+        return native_dialog_block_attempted;
     }
 
     std::filesystem::path OpenImageFileDialog(const std::filesystem::path& defaultPath) {
@@ -796,6 +824,17 @@ namespace lfs::vis::gui {
                                       defaultPath,
                                       defaultName,
                                       ".spz"),
+                  result);
+        return result;
+    }
+
+    std::filesystem::path SaveGlbFileDialog(const std::string& defaultName,
+                                            const std::filesystem::path& defaultPath) {
+        std::filesystem::path result;
+        runDialog(makeSaveFileRequest(singleExtensionFilter("GLB Files", ".glb"),
+                                      defaultPath,
+                                      defaultName,
+                                      ".glb"),
                   result);
         return result;
     }

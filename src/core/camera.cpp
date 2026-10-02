@@ -198,6 +198,12 @@ namespace lfs::core {
           _cam_position(std::move(other._cam_position)),
           _cached_mask(std::move(other._cached_mask)),
           _mask_loaded(other._mask_loaded),
+          _cached_mask_resize_factor(other._cached_mask_resize_factor),
+          _cached_mask_max_width(other._cached_mask_max_width),
+          _cached_mask_invert(other._cached_mask_invert),
+          _cached_mask_threshold(other._cached_mask_threshold),
+          _cached_mask_binarize(other._cached_mask_binarize),
+          _cached_mask_undistort_prepared(other._cached_mask_undistort_prepared),
           _in_memory_mask_raw(std::move(other._in_memory_mask_raw)),
           _cached_depth(std::move(other._cached_depth)),
           _depth_loaded(other._depth_loaded),
@@ -255,6 +261,12 @@ namespace lfs::core {
             _cam_position = std::move(other._cam_position);
             _cached_mask = std::move(other._cached_mask);
             _mask_loaded = other._mask_loaded;
+            _cached_mask_resize_factor = other._cached_mask_resize_factor;
+            _cached_mask_max_width = other._cached_mask_max_width;
+            _cached_mask_invert = other._cached_mask_invert;
+            _cached_mask_threshold = other._cached_mask_threshold;
+            _cached_mask_binarize = other._cached_mask_binarize;
+            _cached_mask_undistort_prepared = other._cached_mask_undistort_prepared;
             _in_memory_mask_raw = std::move(other._in_memory_mask_raw);
             _cached_depth = std::move(other._cached_depth);
             _depth_loaded = other._depth_loaded;
@@ -527,7 +539,13 @@ namespace lfs::core {
     Tensor Camera::load_and_get_mask(const int resize_factor, const int max_width,
                                      const bool invert_mask, const float mask_threshold,
                                      const bool binarize) {
-        if (_mask_loaded && _cached_mask.is_valid()) {
+        if (_mask_loaded && _cached_mask.is_valid() &&
+            _cached_mask_resize_factor == resize_factor &&
+            _cached_mask_max_width == max_width &&
+            _cached_mask_invert == invert_mask &&
+            _cached_mask_threshold == mask_threshold &&
+            _cached_mask_binarize == binarize &&
+            _cached_mask_undistort_prepared == _undistort_prepared) {
             return _cached_mask;
         }
 
@@ -596,17 +614,27 @@ namespace lfs::core {
             const auto scaled = scale_undistort_params(
                 _undistort_params,
                 static_cast<int>(mask.shape()[1]),
-                static_cast<int>(mask.shape()[0]));
+                static_cast<int>(mask.shape()[0]),
+                max_width);
             mask = undistort_mask(mask, scaled, _stream);
         }
 
         if (binarize) {
             mask = mask.ge(0.5f).to(DataType::UInt8).contiguous();
         } else {
-            mask = (mask * 255.f).to(DataType::UInt8).contiguous();
+            // Keep Float32 [0,1] so undistorted samples match the pipelined
+            // loader / fused-kernel domain (kMaskKeepMin). Rounding through
+            // UInt8 truncates interpolated values such as 250.6 → 250.
+            mask = mask.contiguous();
         }
         _cached_mask = mask;
         _mask_loaded = true;
+        _cached_mask_resize_factor = resize_factor;
+        _cached_mask_max_width = max_width;
+        _cached_mask_invert = invert_mask;
+        _cached_mask_threshold = mask_threshold;
+        _cached_mask_binarize = binarize;
+        _cached_mask_undistort_prepared = _undistort_prepared;
 
         LOG_DEBUG("Loaded mask for {}: [{},{}]", _image_name, mask.shape()[0], mask.shape()[1]);
 
@@ -674,7 +702,8 @@ namespace lfs::core {
             const auto scaled = scale_undistort_params(
                 _undistort_params,
                 static_cast<int>(depth.shape()[1]),
-                static_cast<int>(depth.shape()[0]));
+                static_cast<int>(depth.shape()[0]),
+                max_width);
             depth = undistort_mask(depth, scaled, _stream);
         }
 
@@ -789,7 +818,8 @@ namespace lfs::core {
             const auto scaled = scale_undistort_params(
                 _undistort_params,
                 static_cast<int>(normal.shape()[2]),
-                static_cast<int>(normal.shape()[1]));
+                static_cast<int>(normal.shape()[1]),
+                max_width);
             normal = undistort_image(normal, scaled, _stream);
             normal = resize_normal_prior(normal.contiguous(), normal.shape()[1], normal.shape()[2], _stream);
         }

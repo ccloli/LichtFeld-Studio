@@ -15,7 +15,9 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cmath>
 #include <cstdint>
+#include <format>
 #include <optional>
 #include <string>
 
@@ -28,6 +30,10 @@ namespace lfs::app {
         using json = nlohmann::json;
         using mcp::McpTool;
 
+        json number_array_schema(const std::string& description) {
+            return json{{"type", "array"}, {"minItems", 3}, {"maxItems", 3}, {"items", json{{"type", "number"}}}, {"description", description}};
+        }
+
         json vec3_to_json(const glm::vec3& value) {
             return json::array({value.x, value.y, value.z});
         }
@@ -37,10 +43,27 @@ namespace lfs::app {
                 return std::optional<glm::vec3>{};
 
             const auto& value = args[key];
-            if (!value.is_array() || value.size() != 3)
-                return std::unexpected(std::string("Field '") + key + "' must be a 3-element array");
+            if (!value.is_array() || value.size() != 3 ||
+                !std::ranges::all_of(value, [](const json& item) { return item.is_number(); }))
+                return std::unexpected(std::format("Field '{}' must be a 3-element number array (got {})", key, value.dump()));
+            const glm::vec3 result(value[0].get<float>(), value[1].get<float>(), value[2].get<float>());
+            if (!std::isfinite(result.x) || !std::isfinite(result.y) || !std::isfinite(result.z))
+                return std::unexpected(std::format("Field '{}' must contain finite float values (got {})", key, value.dump()));
+            return result;
+        }
 
-            return glm::vec3(value[0].get<float>(), value[1].get<float>(), value[2].get<float>());
+        std::optional<std::string> view_vectors_error(const glm::vec3& eye, const glm::vec3& target) {
+            constexpr float max_coordinate = 1.0e20f;
+            const auto coordinate_ok = [](const glm::vec3& value) {
+                constexpr float limit = 1.0e20f;
+                return std::abs(value.x) <= limit && std::abs(value.y) <= limit && std::abs(value.z) <= limit;
+            };
+            if (!coordinate_ok(eye) || !coordinate_ok(target))
+                return std::format("Camera eye and target coordinates must be within +/-{}", max_coordinate);
+            const glm::vec3 direction = target - eye;
+            if (!std::isfinite(glm::length(direction)) || glm::length(direction) <= 1.0e-6f)
+                return "Camera eye and target must not coincide";
+            return std::nullopt;
         }
 
         const char* keyframe_easing_name(const uint8_t easing) {
@@ -208,9 +231,9 @@ namespace lfs::app {
                     .type = "object",
                     .properties = json{
                         {"time", json{{"type", "number"}, {"description", "Keyframe time in seconds; defaults to the playhead. Times past the clip duration extend it, which scrubbing cannot reach."}}},
-                        {"eye", json{{"type", "array"}, {"items", json{{"type", "number"}}}, {"description", "Optional camera eye position [x,y,z]"}}},
-                        {"target", json{{"type", "array"}, {"items", json{{"type", "number"}}}, {"description", "Optional camera target [x,y,z]"}}},
-                        {"up", json{{"type", "array"}, {"items", json{{"type", "number"}}}, {"description", "Optional camera up vector [x,y,z]"}}},
+                        {"eye", number_array_schema("Optional camera eye position [x,y,z]")},
+                        {"target", number_array_schema("Optional camera target [x,y,z]")},
+                        {"up", number_array_schema("Optional camera up vector [x,y,z]")},
                         {"fov_degrees", json{{"type", "number"}, {"description", "Optional camera FOV override"}}},
                         {"show_sequencer", json{{"type", "boolean"}, {"description", "Show the sequencer panel before operating (default: true)"}}}},
                     .required = {}}},
@@ -226,6 +249,10 @@ namespace lfs::app {
                     return json{{"error", up.error()}};
                 if (eye->has_value() != target->has_value())
                     return json{{"error", "Fields 'eye' and 'target' must either both be provided or both be omitted"}};
+                if (eye->has_value()) {
+                    if (auto error = view_vectors_error(**eye, **target))
+                        return mcp::invalid_argument_result(*error, "eye");
+                }
 
                 const std::optional<float> fov = args.contains("fov_degrees")
                                                      ? std::optional<float>(args["fov_degrees"].get<float>())
@@ -260,9 +287,9 @@ namespace lfs::app {
                     .type = "object",
                     .properties = json{
                         {"keyframe_id", json{{"type", "integer"}, {"description", "Stable keyframe id to select before updating"}}},
-                        {"eye", json{{"type", "array"}, {"items", json{{"type", "number"}}}, {"description", "Optional camera eye position [x,y,z]"}}},
-                        {"target", json{{"type", "array"}, {"items", json{{"type", "number"}}}, {"description", "Optional camera target [x,y,z]"}}},
-                        {"up", json{{"type", "array"}, {"items", json{{"type", "number"}}}, {"description", "Optional camera up vector [x,y,z]"}}},
+                        {"eye", number_array_schema("Optional camera eye position [x,y,z]")},
+                        {"target", number_array_schema("Optional camera target [x,y,z]")},
+                        {"up", number_array_schema("Optional camera up vector [x,y,z]")},
                         {"fov_degrees", json{{"type", "number"}, {"description", "Optional camera FOV override"}}},
                         {"show_sequencer", json{{"type", "boolean"}, {"description", "Show the sequencer panel before operating (default: true)"}}}},
                     .required = {}}},
@@ -278,6 +305,10 @@ namespace lfs::app {
                     return json{{"error", up.error()}};
                 if (eye->has_value() != target->has_value())
                     return json{{"error", "Fields 'eye' and 'target' must either both be provided or both be omitted"}};
+                if (eye->has_value()) {
+                    if (auto error = view_vectors_error(**eye, **target))
+                        return mcp::invalid_argument_result(*error, "eye");
+                }
 
                 const std::optional<float> fov = args.contains("fov_degrees")
                                                      ? std::optional<float>(args["fov_degrees"].get<float>())
@@ -539,7 +570,7 @@ namespace lfs::app {
                 .input_schema = {
                     .type = "object",
                     .properties = json{
-                        {"speed", json{{"type", "number"}, {"description", "Playback speed multiplier"}}}},
+                        {"speed", json{{"type", "number"}, {"minimum", 0.1}, {"maximum", 4.0}, {"description", "Playback speed multiplier"}}}},
                     .required = {"speed"}}},
             [viewer, backend](const json& args) -> json {
                 const float speed = args["speed"].get<float>();
@@ -591,20 +622,22 @@ namespace lfs::app {
         registry.register_tool(
             McpTool{
                 .name = "sequencer.scrub",
-                .description = "Move the sequencer playhead to a time (seconds) or PLY-sequence frame index",
+                .description = "Move the sequencer playhead to a time (seconds) or PLY-sequence frame index, optionally updating the viewport camera",
                 .input_schema = {
                     .type = "object",
                     .properties = json{
                         {"time", json{{"type", "number"}, {"description", "Playhead time in seconds"}}},
-                        {"frame", json{{"type", "integer"}, {"description", "PLY-sequence frame index (overrides time)"}}}},
+                        {"frame", json{{"type", "integer"}, {"description", "PLY-sequence frame index (overrides time)"}}},
+                        {"update_camera", json{{"type", "boolean"}, {"description", "Apply the interpolated camera pose to the viewport (default: false)"}}}},
                     .required = {}}},
             [viewer, backend](const json& args) -> json {
                 const bool has_time = args.contains("time") && !args["time"].is_null();
                 const bool has_frame = args.contains("frame") && !args["frame"].is_null();
                 const std::optional<float> time = has_time ? std::optional<float>(args["time"].get<float>()) : std::nullopt;
                 const std::optional<int64_t> frame = has_frame ? std::optional<int64_t>(args["frame"].get<int64_t>()) : std::nullopt;
+                const bool update_camera = args.value("update_camera", false);
 
-                return post_and_wait(viewer, [backend, time, frame]() -> json {
+                return post_and_wait(viewer, [backend, time, frame, update_camera]() -> json {
                     auto controller = ensure_ready_controller(backend);
                     if (!controller)
                         return json{{"error", controller.error()}};
@@ -614,13 +647,16 @@ namespace lfs::app {
                         const float fps = (*controller)->plySequenceFps();
                         target_time = static_cast<float>(std::max<int64_t>(*frame, 0)) / (fps > 0.0f ? fps : 24.0f);
                     }
-                    if (backend.scrub_to_time)
-                        backend.scrub_to_time(target_time);
-                    else
+                    bool camera_updated = false;
+                    if (backend.scrub_to_time) {
+                        camera_updated = backend.scrub_to_time(target_time, update_camera);
+                    } else {
                         (*controller)->seek(target_time);
+                    }
 
                     json result = sequencer_state_json(backend, **controller);
                     result["scrubbed_to_time"] = target_time;
+                    result["camera_updated"] = camera_updated;
                     return result;
                 });
             });

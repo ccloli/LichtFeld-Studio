@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include "core/export.hpp"
+
 #include "gui/rmlui/rml_tooltip.hpp"
 #include "gui/rmlui/rmlui_manager.hpp"
 #include "gui/vram_hud_overlay.hpp"
@@ -33,7 +35,7 @@ namespace lfs::vis::gui {
 
     struct PanelInputState;
 
-    class RmlViewportOverlay {
+    class LFS_VIS_API RmlViewportOverlay {
     public:
         struct GTMetricsOverlayState {
             bool visible = false;
@@ -74,6 +76,7 @@ namespace lfs::vis::gui {
 
         struct ProjectDragOverlayState {
             bool visible = false;
+            bool gallery_scene = false;
             std::string label;
         };
 
@@ -88,7 +91,7 @@ namespace lfs::vis::gui {
         void shutdown();
         void setViewportBounds(glm::vec2 pos, glm::vec2 size, glm::vec2 screen_origin);
         void setViewportContentOffset(float x);
-        void setToolbarPanels(float primary_x, float primary_width,
+        void setToolbarPanels(float primary_x, float primary_width, float inset,
                               bool show_secondary = false,
                               float secondary_x = 0.0f,
                               float secondary_width = 0.0f);
@@ -102,7 +105,7 @@ namespace lfs::vis::gui {
         void render();
         void renderCached();
         void renderFrostedGlass();
-        void processInput(const PanelInputState& input);
+        void processInput(const PanelInputState& input, std::function<bool(float, float)> pointer_blocker = {});
         bool wantsInput() const { return wants_input_; }
         [[nodiscard]] bool needsAnimationFrame() const {
             return render_needed_ || document_sync_dirty_ || animation_active_ || tooltip_.revealDue() ||
@@ -137,6 +140,7 @@ namespace lfs::vis::gui {
         [[nodiscard]] float toolbarFreeTop(float toolbar_height) const;
         [[nodiscard]] float toolbarFreeTravel(float toolbar_height) const;
         void updateViewportContentOffset();
+        void updateViewportContentClasses(float dp_ratio);
         void bindReactiveStore();
         void refreshGTMetricsOverlayFromStore();
         void applySplitDividerOverlay();
@@ -180,6 +184,7 @@ namespace lfs::vis::gui {
         glm::vec2 vp_size_{0, 0};
         glm::vec2 screen_origin_{0, 0};
         float primary_toolbar_x_ = 0.0f;
+        float toolbar_inset_ = 0.0f;
         float primary_toolbar_width_ = 0.0f;
         bool show_secondary_toolbar_ = false;
         float secondary_toolbar_x_ = 0.0f;

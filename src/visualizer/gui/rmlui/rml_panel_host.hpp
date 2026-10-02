@@ -11,6 +11,7 @@
 #include <core/export.hpp>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <mutex>
 #include <optional>
@@ -25,7 +26,8 @@ namespace Rml {
 
 namespace lfs::vis {
     struct Theme;
-}
+    struct FrameInputEvent;
+} // namespace lfs::vis
 namespace lfs::vis::gui {
 
     class RmlUIManager;
@@ -52,6 +54,7 @@ namespace lfs::vis::gui {
         void releaseRendererResources();
 
         void setInput(const PanelInputState* input) { input_ = input; }
+        void setKeyboardHandler(std::function<bool(const FrameInputEvent&)> handler) { keyboard_handler_ = std::move(handler); }
         bool hasInput() const { return input_ != nullptr; }
         bool wantsKeyboard() const { return wants_keyboard_; }
 
@@ -92,6 +95,9 @@ namespace lfs::vis::gui {
         bool openDropdownContainsPoint(float local_x, float local_y) const;
         Rml::Element* openDropdownOptionAtPoint(float local_x, float local_y) const;
         void setManualDropdownHover(Rml::Element* option);
+        void updateResizeCursorOverride(bool pointer_over_panel);
+        void updateLiveInspectorResize(float mouse_y, bool mouse_down, bool mouse_released);
+        void beginLiveInspectorResize(float mouse_y);
         void trackFrame(float panel_x, float panel_y);
         void applyHoverTooltip(int pw, float panel_y, float display_h);
         bool hitTestPanelShape(float local_x, float local_y, float logical_w, float logical_h) const;
@@ -111,6 +117,7 @@ namespace lfs::vis::gui {
         void renderIfDirty(int pw, int ph, float& display_h);
         void compositeDirectToScreen(float x, float y, float w, float h);
 
+        std::function<bool(const FrameInputEvent&)> keyboard_handler_;
         RmlUIManager* manager_;
         std::string context_name_;
         std::string rml_path_;
@@ -159,12 +166,17 @@ namespace lfs::vis::gui {
         int last_layout_padding_ = -1;
         int last_forwarded_mx_ = -1;
         int last_forwarded_my_ = -1;
+        int last_forwarded_mods_ = 0;
         bool last_hovered_ = false;
         Rml::Element* manual_dropdown_hover_ = nullptr;
         bool manual_dropdown_mouse_captured_ = false;
         // Per-button capture so scrollbar drags continue when the cursor
         // leaves the panel and the matching Up always reaches RmlUI.
         bool mouse_captured_[3] = {false, false, false};
+        std::string resize_cursor_override_;
+        Rml::Element* live_inspector_resize_target_ = nullptr;
+        float live_inspector_resize_start_y_ = 0.0f;
+        float live_inspector_resize_start_height_ = 0.0f;
         RmlTooltipController tooltip_;
     };
 

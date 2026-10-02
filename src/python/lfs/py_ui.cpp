@@ -47,12 +47,14 @@
 #include "rml_python_panel_adapter.hpp"
 #include "visualizer/app_store.hpp"
 #include "visualizer/core/editor_context.hpp"
+#include "visualizer/core/services.hpp"
 #include "visualizer/gui/gui_manager.hpp"
 #include "visualizer/gui/panel_registry.hpp"
 #include "visualizer/ipc/view_context.hpp"
 #include "visualizer/operation/undo_history.hpp"
 #include "visualizer/operator/operator_context.hpp"
 #include "visualizer/operator/operator_registry.hpp"
+#include "visualizer/operator/ops/align_ops.hpp"
 #include "visualizer/post_work_utils.hpp"
 #include "visualizer/rendering/rendering_manager.hpp"
 #include "visualizer/scene/scene_manager.hpp"
@@ -303,6 +305,38 @@ namespace lfs::python {
             g_project_switch_confirmation_callback;
         nb::object
             g_show_load_file_confirmation_callback;
+        lfs::event::HandlerId g_show_load_file_confirmation_handler_id = 0;
+        bool g_show_load_file_confirmation_with_batch = false;
+
+        void register_load_file_confirmation(nb::object callback, bool with_batch) {
+            using lfs::core::events::cmd::ShowLoadFileConfirmation;
+            if (g_show_load_file_confirmation_handler_id != 0) {
+                lfs::event::EventBridge::instance().unsubscribe(
+                    typeid(ShowLoadFileConfirmation), g_show_load_file_confirmation_handler_id);
+                g_show_load_file_confirmation_handler_id = 0;
+            }
+            g_show_load_file_confirmation_callback = std::move(callback);
+            g_show_load_file_confirmation_with_batch = with_batch;
+            if (!g_show_load_file_confirmation_callback || g_show_load_file_confirmation_callback.is_none())
+                return;
+            g_show_load_file_confirmation_handler_id = ShowLoadFileConfirmation::when([](const auto& event) {
+                nb::gil_scoped_acquire guard;
+                if (!g_show_load_file_confirmation_callback || g_show_load_file_confirmation_callback.is_none())
+                    return;
+                try {
+                    nb::list paths;
+                    for (const auto& path : event.paths)
+                        paths.append(lfs::core::path_to_utf8(path));
+                    if (g_show_load_file_confirmation_with_batch)
+                        g_show_load_file_confirmation_callback(paths, event.is_dataset, event.replace, event.user_batch);
+                    else
+                        g_show_load_file_confirmation_callback(paths, event.is_dataset, event.replace);
+                } catch (const std::exception& error) {
+                    LOG_ERROR("Load-file confirmation callback error: {}", error.what());
+                }
+            });
+        }
+
         nb::object
             g_stop_training_confirmation_callback;
         nb::object g_open_camera_preview_callback;
@@ -2710,6 +2744,8 @@ namespace lfs::python {
                         ci.is_submenu_item = nb::cast<bool>(d["is_submenu_item"]);
                     if (d.contains("is_active"))
                         ci.is_active = nb::cast<bool>(d["is_active"]);
+                    if (d.contains("icon"))
+                        ci.icon = nb::cast<std::string>(d["icon"]);
                     vec.push_back(std::move(ci));
                 }
 
@@ -3324,6 +3360,16 @@ namespace lfs::python {
             "Open a file dialog to select a LichtFeld project (.licht). Returns empty string if cancelled.");
 
         m.def(
+            "save_project_file_dialog",
+            [](const std::string& default_name, const std::string& start_dir) -> std::string {
+                const auto result = lfs::vis::gui::SaveProjectFileDialog(
+                    default_name, lfs::core::utf8_to_path(start_dir));
+                return result.empty() ? "" : lfs::core::path_to_utf8(result);
+            },
+            nb::arg("default_name") = "project.licht", nb::arg("start_dir") = "",
+            "Choose a destination for a new LichtFeld project. Returns empty string if cancelled.");
+
+        m.def(
             "open_ply_file_dialog",
             [](const std::string& start_dir) -> std::string {
                 std::filesystem::path start_path;
@@ -3482,6 +3528,15 @@ namespace lfs::python {
             },
             nb::arg("default_name") = "export",
             "Open a save file dialog for SPZ files. Returns empty string if cancelled.");
+
+        m.def(
+            "save_glb_file_dialog",
+            [](const std::string& default_name) -> std::string {
+                auto result = lfs::vis::gui::SaveGlbFileDialog(default_name);
+                return result.empty() ? "" : lfs::core::path_to_utf8(result);
+            },
+            nb::arg("default_name") = "export",
+            "Open a save file dialog for GLB (SPZ glTF) files. Returns empty string if cancelled.");
 
         m.def(
             "save_usd_file_dialog",
@@ -3808,7 +3863,8 @@ namespace lfs::python {
                                             path_to_utf8(
                                                 event.path),
                                         event.keep_asset_manager_open,
-                                        lfs::core::path_to_utf8(event.create_path));
+                                        lfs::core::path_to_utf8(event.create_path),
+                                        event.allow_existing_destination_replacement);
                                 } catch (
                                     const std::
                                         exception& error) {
@@ -3824,43 +3880,18 @@ namespace lfs::python {
 
         m.def(
             "on_show_load_file_confirmation",
-            [](nb::object callback) {
-                g_show_load_file_confirmation_callback =
-                    callback;
-                lfs::core::events::cmd::
-                    ShowLoadFileConfirmation::
-                        when([](const auto& event) {
-                            if (g_show_load_file_confirmation_callback &&
-                                !g_show_load_file_confirmation_callback
-                                     .is_none()) {
-                                nb::gil_scoped_acquire
-                                    guard;
-                                try {
-                                    nb::list paths;
-                                    for (const auto& path :
-                                         event.paths) {
-                                        paths.append(
-                                            lfs::core::
-                                                path_to_utf8(
-                                                    path));
-                                    }
-                                    g_show_load_file_confirmation_callback(
-                                        paths,
-                                        event.is_dataset,
-                                        event.replace);
-                                } catch (
-                                    const std::
-                                        exception& error) {
-                                    LOG_ERROR(
-                                        "Load-file confirmation callback error: {}",
-                                        error.what());
-                                }
-                            }
-                        });
-            },
+            [](nb::object callback) { register_load_file_confirmation(std::move(callback), false); },
             nb::arg("callback"),
             "Register callback for a load-file wipe confirmation "
             "(receives paths: list[str], is_dataset: bool, replace: bool)");
+
+        m.def(
+            "on_show_load_file_confirmation_with_batch",
+            [](nb::object callback) { register_load_file_confirmation(std::move(callback), true); },
+            nb::arg("callback"),
+            "Register a load-file confirmation callback with batch provenance "
+            "(receives paths: list[str], is_dataset: bool, replace: bool, user_batch: bool). "
+            "Replaces the callback registered through either load-file confirmation API.");
 
         m.def(
             "on_stop_training_confirmation",
@@ -3883,7 +3914,8 @@ namespace lfs::python {
                                                 event.path),
                                         event.discard_changes,
                                         event.keep_asset_manager_open,
-                                        lfs::core::path_to_utf8(event.create_path));
+                                        lfs::core::path_to_utf8(event.create_path),
+                                        event.allow_existing_destination_replacement);
                                 } catch (
                                     const std::
                                         exception& error) {
@@ -4335,6 +4367,97 @@ namespace lfs::python {
             "Apply the active crop tool primitive through the node-backed crop command path");
 
         m.def(
+            "can_apply_align",
+            []() -> bool {
+                const auto* scene = lfs::vis::services().sceneOrNull();
+                return scene &&
+                       lfs::vis::op::pointsAreNonDegenerate(lfs::vis::services().getAlignPickedPoints()) &&
+                       lfs::vis::op::resolveAlignSnapTargetWorld(*scene).has_value();
+            },
+            "True when the align tool has 3 non-degenerate points ready to apply");
+
+        m.def(
+            "apply_align",
+            []() -> bool {
+                if (lfs::vis::op::operators().activeModalId() !=
+                    lfs::vis::op::to_string(lfs::vis::op::BuiltinOp::AlignPickPoint)) {
+                    return false;
+                }
+                lfs::vis::services().requestAlignUiAction(lfs::vis::Services::AlignUiAction::Apply);
+                lfs::vis::op::ModalEvent evt{};
+                evt.type = lfs::vis::op::ModalEvent::Type::NONE;
+                lfs::vis::op::operators().dispatchModalEvent(evt);
+                return true;
+            },
+            "Request the running align modal to apply the current triangle");
+
+        m.def(
+            "clear_align_points",
+            []() {
+                if (lfs::vis::op::operators().activeModalId() !=
+                    lfs::vis::op::to_string(lfs::vis::op::BuiltinOp::AlignPickPoint)) {
+                    return;
+                }
+                lfs::vis::services().requestAlignUiAction(lfs::vis::Services::AlignUiAction::Clear);
+                lfs::vis::op::ModalEvent evt{};
+                evt.type = lfs::vis::op::ModalEvent::Type::NONE;
+                lfs::vis::op::operators().dispatchModalEvent(evt);
+            },
+            "Request the running align modal to clear all picked points");
+
+        m.def("get_align_preview", [] { return lfs::vis::services().getAlignPreviewEnabled(); }, "Whether the alignment result is being previewed");
+        m.def("toggle_align_preview", [] {
+            if (lfs::vis::op::operators().activeModalId() !=
+                lfs::vis::op::to_string(lfs::vis::op::BuiltinOp::AlignPickPoint)) {
+                return;
+            }
+            lfs::vis::services().requestAlignUiAction(lfs::vis::Services::AlignUiAction::TogglePreview);
+            lfs::vis::op::ModalEvent event{};
+            lfs::vis::op::operators().dispatchModalEvent(event); }, "Switch between the original scene and the alignment preview");
+
+        m.def(
+            "get_align_axis_snap",
+            []() -> bool { return lfs::vis::services().getAlignAxisSnapEnabled(); },
+            "Whether align plane-normal axis snap is enabled");
+
+        m.def(
+            "set_align_axis_snap",
+            [](const bool enabled) {
+                lfs::vis::services().setAlignAxisSnapEnabled(enabled);
+                if (lfs::vis::services().getAlignPreviewEnabled()) {
+                    lfs::vis::services().requestAlignUiAction(lfs::vis::Services::AlignUiAction::RefreshPreview);
+                    lfs::vis::op::ModalEvent event{};
+                    lfs::vis::op::operators().dispatchModalEvent(event);
+                }
+                if (auto* const rm = lfs::vis::services().renderingOrNull()) {
+                    rm->markDirty(lfs::vis::DirtyFlag::OVERLAY);
+                }
+            },
+            nb::arg("enabled"),
+            "Enable or disable align plane-normal axis snap (session lifetime)");
+
+        m.def(
+            "get_align_edge_to_axis",
+            []() -> bool { return lfs::vis::services().getAlignEdgeToAxisEnabled(); },
+            "Whether align edge-to-+X in-plane yaw is enabled");
+
+        m.def(
+            "set_align_edge_to_axis",
+            [](const bool enabled) {
+                lfs::vis::services().setAlignEdgeToAxisEnabled(enabled);
+                if (lfs::vis::services().getAlignPreviewEnabled()) {
+                    lfs::vis::services().requestAlignUiAction(lfs::vis::Services::AlignUiAction::RefreshPreview);
+                    lfs::vis::op::ModalEvent event{};
+                    lfs::vis::op::operators().dispatchModalEvent(event);
+                }
+                if (auto* const rm = lfs::vis::services().renderingOrNull()) {
+                    rm->markDirty(lfs::vis::DirtyFlag::OVERLAY);
+                }
+            },
+            nb::arg("enabled"),
+            "Enable or disable align edge-to-+X in-plane yaw (session lifetime)");
+
+        m.def(
             "fit_crop_tool",
             [](bool use_percentile) {
                 if (auto* const gui = lfs::python::get_gui_manager()) {
@@ -4689,6 +4812,9 @@ namespace lfs::python {
                 state["stage"] = export_state.stage;
                 state["outcome"] = export_state.outcome;
                 state["format"] = export_state.format;
+                state["path"] = export_state.path;
+                state["error"] = export_state.error;
+                state["commit_uuid"] = export_state.commit_uuid;
                 return state;
             },
             "Get current export progress state");
@@ -4718,6 +4844,11 @@ namespace lfs::python {
 
         m.def("dismiss_import", &dismiss_import,
               "Dismiss the import completion overlay");
+        m.def("cancel_gallery_import", [] { return invoke_on_viewer([] {
+                                                auto* gui = get_gui_manager();
+                                                return gui && gui->asyncTasks().requestGalleryImportCancel();
+                                            },
+                                                                    false); }, "Request gallery import cancellation without waiting for its worker");
 
         m.def(
             "get_video_export_state",
@@ -4757,6 +4888,11 @@ namespace lfs::python {
 
         m.def("has_keyframes", &has_keyframes,
               "Check if sequencer has any keyframes");
+
+        m.def("get_camera_path", []() { return nb::module_::import_("json").attr("loads")(get_camera_path_data()); }, "Get the native camera path with clip duration, loop mode and playback speed");
+        m.def("set_camera_path", [](nb::dict value) {
+            const auto json = nb::cast<std::string>(nb::module_::import_("json").attr("dumps")(value, nb::arg("allow_nan") = false));
+            return set_camera_path_data(json); }, nb::arg("value"), "Restore a native camera path including loop mode and playback speed");
 
         m.def("save_camera_path", &save_camera_path,
               nb::arg("path"),
@@ -5085,6 +5221,56 @@ namespace lfs::python {
             "Get the default WASD navigation speed");
 
         m.def(
+            "get_project_manager_preferences",
+            [] {
+                auto& preferences = vis::UserPreferences::instance();
+                nb::dict result;
+                result["defaultView"] = preferences.projectManagerDefaultView();
+                result["openAtStartup"] = preferences.openProjectManagerAtStartup();
+                result["rememberState"] = preferences.rememberProjectManagerState();
+                return result;
+            },
+            "Get Project Manager preferences from the canonical user preferences store");
+
+        m.def(
+            "set_project_manager_default_view",
+            [](const std::string& view) {
+                vis::UserPreferences::instance().setProjectManagerDefaultView(view);
+            },
+            nb::arg("view"), "Set the default Project Manager view");
+
+        m.def(
+            "set_project_manager_open_at_startup",
+            [](const bool enabled) {
+                vis::UserPreferences::instance().setOpenProjectManagerAtStartup(enabled);
+            },
+            nb::arg("enabled"), "Set whether Project Manager opens at application startup");
+
+        m.def(
+            "set_project_manager_remember_state",
+            [](const bool enabled) {
+                vis::UserPreferences::instance().setRememberProjectManagerState(enabled);
+            },
+            nb::arg("enabled"), "Set whether Project Manager layout state is remembered");
+
+        m.def(
+            "get_project_manager_state",
+            [] { return vis::UserPreferences::instance().projectManagerState(); },
+            "Get remembered Project Manager layout state as JSON");
+
+        m.def(
+            "set_project_manager_state",
+            [](const std::string& state) {
+                vis::UserPreferences::instance().setProjectManagerState(state);
+            },
+            nb::arg("state"), "Set remembered Project Manager layout state from JSON");
+
+        m.def(
+            "reset_project_manager_preferences",
+            [] { vis::UserPreferences::instance().resetProjectManagerPreferences(); },
+            "Reset Project Manager preferences and remembered layout state");
+
+        m.def(
             "get_scene_reconstruction_options",
             [] {
                 nb::list backends;
@@ -5162,6 +5348,10 @@ namespace lfs::python {
             },
             "Get effective MCP HTTP server preferences");
 
+        m.def("get_mcp_access_token", []() {
+            nb::gil_scoped_release release;
+            return mcp::mcpBearerToken(); }, "Get the local MCP network access token");
+
         m.def(
             "set_mcp_preferences",
             [](const bool enabled, const bool expose_network, const int port,
@@ -5222,6 +5412,8 @@ namespace lfs::python {
                 }
                 if (!result)
                     return std::string(result.error().user_message());
+                if (auto panel = vis::gui::PanelRegistry::instance().get_panel_instance("lfs.asset_manager"))
+                    panel->on_content_changed();
                 return {};
             },
             nb::arg("path"),
@@ -5232,6 +5424,8 @@ namespace lfs::python {
             [] {
                 nb::gil_scoped_release release;
                 vis::clearProjectLocationPreference();
+                if (auto panel = vis::gui::PanelRegistry::instance().get_panel_instance("lfs.asset_manager"))
+                    panel->on_content_changed();
             },
             "Clear the project location preference so the default is used.");
 
@@ -5299,6 +5493,9 @@ namespace lfs::python {
                     break;
                 case mcp::McpHttpErrorKind::ListenerFailed:
                     result["error_kind"] = "listener_failed";
+                    break;
+                case mcp::McpHttpErrorKind::CredentialFailed:
+                    result["error_kind"] = "credential_failed";
                     break;
                 }
                 result["error_address"] = status.error_address;
@@ -5390,6 +5587,8 @@ namespace lfs::python {
                 }
             },
             nb::arg("lang_code"), "Set language by code (e.g., 'en', 'de')");
+
+        m.def("resource_directory", []() { return lfs::core::path_to_utf8(lfs::core::getResourceBaseDir()); }, "Directory containing the bundled UI resources");
 
         m.def(
             "get_current_language",
@@ -5503,8 +5702,7 @@ namespace lfs::python {
             }
             g_project_switch_confirmation_callback =
                 nb::object();
-            g_show_load_file_confirmation_callback =
-                nb::object();
+            register_load_file_confirmation(nb::object(), false);
             g_stop_training_confirmation_callback =
                 nb::object();
             g_open_camera_preview_callback = nb::object();

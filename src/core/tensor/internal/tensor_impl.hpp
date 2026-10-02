@@ -596,10 +596,7 @@ namespace lfs::core {
         ///   flat-buffer consumer safe. storage_ptr() stays non-materializing
         ///   (allocation base for lifetime / sharing checks only).
         ///
-        /// Do not assign `contiguous()` back to `*this`: expand views
-        /// set is_view_=true, so operator= takes the view deep-copy path (copy_from),
-        /// which re-enters data_ptr() → infinite recursion. Rebind fields like
-        /// materialize_deferred_slow instead (implemented in tensor.cpp).
+        /// Rebind materialized storage at the raw-pointer escape boundary.
         void materialize_zero_stride_for_raw_ptr_escape();
         void materialize_zero_stride_for_raw_ptr_escape() const {
             // has_zero_stride is cheap; avoid a virtual-ish hop when dense.
@@ -1456,7 +1453,8 @@ namespace lfs::core {
         Tensor(void* data, TensorShape shape, Device device, DataType dtype,
                cudaStream_t home_stream = nullptr);
 
-        // Copy constructor and assignment - SHALLOW COPY (LibTorch behavior)
+        // Copy construction and assignment share storage, including for view destinations.
+        // Use copy_from() to write data into existing storage.
         Tensor(const Tensor& other);
         Tensor& operator=(const Tensor& other);
 
@@ -1546,6 +1544,10 @@ namespace lfs::core {
                             DataType dtype = DataType::Float32);
         static Tensor zeros_direct(TensorShape shape, size_t capacity, Device device = Device::CUDA,
                                    DataType dtype = DataType::Float32);
+        // Uninitialized CUDA storage of exactly the requested size, stream-ordered
+        // and outside the size buckets. For large buffers retained across steps,
+        // where bucket rounding would be permanent waste.
+        static Tensor empty_exact(TensorShape shape, DataType dtype = DataType::Float32);
         static Tensor ones(TensorShape shape, Device device = Device::CUDA,
                            DataType dtype = DataType::Float32);
         static Tensor full(TensorShape shape, float value, Device device = Device::CUDA,
@@ -1934,6 +1936,7 @@ namespace lfs::core {
             return storage_meta_ ? storage_meta_->exportable_bound_generation : 0u;
         }
         static std::string storage_memory_summary();
+        static std::size_t cuda_direct_storage_live_bytes();
         static void log_storage_memory();
         static void log_storage_memory(std::string_view label);
 
@@ -2306,7 +2309,7 @@ namespace lfs::core {
         const auto scalar_value = validated_scalar_operand(                                \
             other, #name, {DataType::Float32, DataType::Int32});                           \
         DataType result_dtype = promote_dtypes(dtype_, scalar_operand_dtype<T>());         \
-        if (true_division && result_dtype != DataType::Float32) {                          \
+        if constexpr (true_division) {                                                     \
             result_dtype = DataType::Float32;                                              \
         }                                                                                  \
         if (numel() == 0) {                                                                \
@@ -2343,7 +2346,7 @@ namespace lfs::core {
         const auto scalar_value = validated_scalar_operand(                                \
             other, #name, {DataType::Float32, DataType::Int32});                           \
         DataType result_dtype = promote_dtypes(dtype_, scalar_operand_dtype<T>());         \
-        if (true_division && result_dtype != DataType::Float32) {                          \
+        if constexpr (true_division) {                                                     \
             result_dtype = DataType::Float32;                                              \
         }                                                                                  \
         if (numel() == 0) {                                                                \
@@ -2662,21 +2665,24 @@ namespace lfs::core {
         }
 
         float mean_scalar() const {
-            if (device_ == Device::CUDA && dtype_ == DataType::Float32 && is_contiguous_) {
+            if (numel() > 0 && device_ == Device::CUDA && dtype_ == DataType::Float32 &&
+                is_contiguous_) {
                 return tensor_ops::direct_mean_scalar(ptr<float>(), numel(), stream());
             }
             return mean().item();
         }
 
         float min_scalar() const {
-            if (device_ == Device::CUDA && dtype_ == DataType::Float32 && is_contiguous_) {
+            if (numel() > 0 && device_ == Device::CUDA && dtype_ == DataType::Float32 &&
+                is_contiguous_) {
                 return tensor_ops::direct_min_scalar(ptr<float>(), numel(), stream());
             }
             return min().item();
         }
 
         float max_scalar() const {
-            if (device_ == Device::CUDA && dtype_ == DataType::Float32 && is_contiguous_) {
+            if (numel() > 0 && device_ == Device::CUDA && dtype_ == DataType::Float32 &&
+                is_contiguous_) {
                 return tensor_ops::direct_max_scalar(ptr<float>(), numel(), stream());
             }
             return max().item();

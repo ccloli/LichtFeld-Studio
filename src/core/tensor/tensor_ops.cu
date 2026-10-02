@@ -43,6 +43,7 @@ namespace lfs::core::tensor_ops {
 
     namespace {
         std::atomic_bool force_cub_workspace_failure{false};
+        std::atomic_bool force_nan_check_host_allocation_failure{false};
 
         struct ieee_round_float_op {
             __host__ __device__ float operator()(const float value) const {
@@ -110,6 +111,10 @@ namespace lfs::core::tensor_ops {
 
     void set_cub_workspace_failure_for_testing(const bool fail) {
         force_cub_workspace_failure.store(fail, std::memory_order_release);
+    }
+
+    void set_nan_check_host_allocation_failure_for_testing(const bool fail) {
+        force_nan_check_host_allocation_failure.store(fail, std::memory_order_release);
     }
 
     float direct_sum_scalar(const float* data, const size_t n, const cudaStream_t stream) {
@@ -379,6 +384,21 @@ namespace lfs::core::tensor_ops {
     struct ConvertFunctor {
         __device__ DstT operator()(SrcT x) const {
             return static_cast<DstT>(x);
+        }
+    };
+
+    // cvt.rzi maps NaN to INT64_MIN; tensor casts define NaN as zero.
+    template <>
+    struct ConvertFunctor<float, int64_t> {
+        __device__ int64_t operator()(float x) const {
+            return isnan(x) ? int64_t{0} : static_cast<int64_t>(x);
+        }
+    };
+
+    template <>
+    struct ConvertFunctor<__half, int64_t> {
+        __device__ int64_t operator()(__half x) const {
+            return __hisnan(x) ? int64_t{0} : static_cast<int64_t>(x);
         }
     };
 
@@ -3004,6 +3024,21 @@ namespace lfs::core::tensor_ops {
     template LFS_CORE_API void launch_binary_op_generic<int64_t, unsigned char, ops::not_equal_op>(
         const int64_t*, const int64_t*, unsigned char*, size_t, ops::not_equal_op, cudaStream_t);
 
+#define LFS_INSTANTIATE_UINT32_COMPARISON(OP)                                    \
+    template LFS_CORE_API void launch_binary_op_generic<uint32_t, unsigned char, \
+                                                        ops::OP>(                \
+        const uint32_t*, const uint32_t*, unsigned char*, size_t, ops::OP, cudaStream_t);
+    LFS_INSTANTIATE_UINT32_COMPARISON(greater_op)
+    LFS_INSTANTIATE_UINT32_COMPARISON(greater_equal_op)
+    LFS_INSTANTIATE_UINT32_COMPARISON(less_op)
+    LFS_INSTANTIATE_UINT32_COMPARISON(less_equal_op)
+    LFS_INSTANTIATE_UINT32_COMPARISON(equal_op)
+    LFS_INSTANTIATE_UINT32_COMPARISON(not_equal_op)
+    LFS_INSTANTIATE_UINT32_COMPARISON(logical_and_op)
+    LFS_INSTANTIATE_UINT32_COMPARISON(logical_or_op)
+    LFS_INSTANTIATE_UINT32_COMPARISON(logical_xor_op)
+#undef LFS_INSTANTIATE_UINT32_COMPARISON
+
     template LFS_CORE_API void launch_binary_op_generic<__half, unsigned char, ops::greater_op>(
         const __half*, const __half*, unsigned char*, size_t, ops::greater_op, cudaStream_t);
     template LFS_CORE_API void launch_binary_op_generic<__half, unsigned char, ops::greater_equal_op>(
@@ -3452,13 +3487,35 @@ namespace lfs::core::tensor_ops {
 
             void init() {
                 if (!initialized) {
-                    d_result = static_cast<int*>(
+                    int* next_device_result = static_cast<int*>(
                         CudaMemoryPool::instance().allocate(sizeof(int), nullptr));
-                    if (!d_result) {
+                    if (!next_device_result) {
                         LFS_CUDA_CHECK(cudaErrorMemoryAllocation);
                         return;
                     }
-                    LFS_CUDA_CHECK(cudaMallocHost(&h_result_pinned, sizeof(int))); // Pinned memory
+
+                    int* next_host_result = nullptr;
+                    // Publish the TLS cache only after both allocations succeed.
+                    // A checked CUDA call can throw even after assigning its output.
+                    try {
+                        LFS_ASSERT_MSG(
+                            !force_nan_check_host_allocation_failure.load(
+                                std::memory_order_acquire),
+                            "NaN check pinned allocation failure injected");
+                        LFS_CUDA_CHECK(cudaMallocHost(&next_host_result, sizeof(int)));
+                    } catch (...) {
+                        if (next_host_result) {
+                            const cudaError_t cleanup_status = cudaFreeHost(next_host_result);
+                            if (cleanup_status != cudaSuccess) {
+                                (void)cudaGetLastError();
+                            }
+                        }
+                        safe_cuda_pool_deallocate(next_device_result, nullptr);
+                        throw;
+                    }
+
+                    d_result = next_device_result;
+                    h_result_pinned = next_host_result;
                     initialized = true;
                 }
             }

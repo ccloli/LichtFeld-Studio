@@ -283,6 +283,10 @@ namespace lfs::vis::gui {
             return false;
 
         const float scroll_top = scroll_el_ ? scroll_el_->GetScrollTop() : 0.0f;
+        // The live resize target belongs to the current document. Never retain
+        // it across UnloadDocument(), where it immediately becomes dangling.
+        live_inspector_resize_target_ = nullptr;
+        resize_cursor_override_.clear();
         if (document_) {
             rml_context_->UnloadDocument(document_);
             rml_context_->Update();
@@ -305,6 +309,7 @@ namespace lfs::vis::gui {
             manager_->releaseCachedVulkanContext(direct_cache_);
         last_forwarded_mx_ = -1;
         last_forwarded_my_ = -1;
+        last_forwarded_mods_ = 0;
         last_hovered_ = false;
         manual_dropdown_hover_ = nullptr;
         manual_dropdown_mouse_captured_ = false;
@@ -590,6 +595,13 @@ namespace lfs::vis::gui {
             restoreScrollTop(saved_scroll);
         }
 
+        // A data-model update can move a resize handle without any physical
+        // mouse motion. Re-hit-test the settled layout so RmlUi republishes the
+        // cursor belonging to the element now under the pointer.
+        if (last_hovered_ && last_forwarded_mx_ >= 0 && last_forwarded_my_ >= 0)
+            rml_context_->ProcessMouseMove(last_forwarded_mx_, last_forwarded_my_,
+                                           last_forwarded_mods_);
+
         if (needs_post_layout_update)
             rml_context_->Update();
 
@@ -780,6 +792,7 @@ namespace lfs::vis::gui {
             return false;
         if (!document_ || !rml_context_ || last_fbo_w_ <= 0 || last_fbo_h_ <= 0)
             return false;
+        forwardInput(x, y);
         if (render_needed_ || content_dirty_ || animation_active_ || tooltip_.revealDue())
             return false;
         if (!has_theme_signature_ || rml_theme::currentThemeSignature() != last_theme_signature_)
@@ -919,6 +932,71 @@ namespace lfs::vis::gui {
             manual_dropdown_hover_->SetPseudoClass("hover", true);
     }
 
+    void RmlPanelHost::updateResizeCursorOverride(const bool pointer_over_panel) {
+        // RmlPanelHost can reuse a cached render while the pointer is still.
+        // Persist the resize request explicitly so the frame-level cursor reset
+        // cannot erase it after the single hover transition that selected it.
+        if (mouse_captured_[0] && !resize_cursor_override_.empty())
+            return;
+
+        resize_cursor_override_.clear();
+        if (!pointer_over_panel || !rml_context_)
+            return;
+
+        for (auto* element = rml_context_->GetHoverElement(); element;
+             element = element->GetParentNode()) {
+            const auto region = element->GetAttribute<Rml::String>("data-resize", "");
+            if (region.empty())
+                continue;
+            resize_cursor_override_ = region == "inspector-height"
+                                          ? "resize-vertical"
+                                          : "resize-horizontal";
+            return;
+        }
+    }
+
+    void RmlPanelHost::beginLiveInspectorResize(const float mouse_y) {
+        if (!rml_context_)
+            return;
+        for (auto* element = rml_context_->GetHoverElement(); element;
+             element = element->GetParentNode()) {
+            if (element->GetAttribute<Rml::String>("data-resize", "") != "inspector-height")
+                continue;
+            live_inspector_resize_target_ = document_
+                                                ? document_->GetElementById("asset-inspector")
+                                                : nullptr;
+            if (!live_inspector_resize_target_)
+                return;
+            live_inspector_resize_start_y_ = mouse_y;
+            live_inspector_resize_start_height_ =
+                live_inspector_resize_target_->GetBox().GetSize(Rml::BoxArea::Border).y;
+            return;
+        }
+    }
+
+    void RmlPanelHost::updateLiveInspectorResize(const float mouse_y,
+                                                 const bool mouse_down,
+                                                 const bool mouse_released) {
+        if (!live_inspector_resize_target_ || !rml_context_)
+            return;
+        if (mouse_down || mouse_released) {
+            const float dp_ratio = std::max(
+                rml_context_->GetDensityIndependentPixelRatio(), 0.01f);
+            const float minimum = 180.0f * dp_ratio;
+            const float maximum = std::max(minimum, rml_context_->GetDimensions().y * 0.5f);
+            const float height = std::clamp(
+                live_inspector_resize_start_height_ -
+                    (mouse_y - live_inspector_resize_start_y_),
+                minimum, maximum);
+            live_inspector_resize_target_->SetProperty(
+                "height", std::format("{:.1f}px", height));
+            render_needed_ = true;
+            direct_cache_dirty_ = true;
+        }
+        if (mouse_released || !mouse_down)
+            live_inspector_resize_target_ = nullptr;
+    }
+
     void RmlPanelHost::trackFrame(const float panel_x, const float panel_y) {
         if (!manager_ || !rml_context_ || !input_)
             return;
@@ -929,6 +1007,10 @@ namespace lfs::vis::gui {
                                     static_cast<int>(panel_y - input_->screen_y -
                                                      last_fbo_padding_),
                                     openDropdownBounds());
+        if (!resize_cursor_override_.empty()) {
+            if (auto* const system_interface = Rml::GetSystemInterface())
+                system_interface->SetMouseCursor(resize_cursor_override_);
+        }
     }
 
     void RmlPanelHost::applyHoverTooltip(const int pw, const float panel_y,
@@ -1054,6 +1136,13 @@ namespace lfs::vis::gui {
         if (!input_ || !manager_ || !manager_->getVulkanRenderInterface())
             return false;
 
+        if (manager_->routeInput(rml_context_, *input_, [this, panel_x, panel_y](const PanelInputState& event) {
+                const auto* saved = input_;
+                input_ = &event;
+                render_needed_ |= forwardInput(panel_x, panel_y);
+                input_ = saved;
+            }))
+            return false;
         bool had_input = false;
         const auto& input = *input_;
         auto* const text_input_handler = manager_ ? manager_->getTextInputHandler() : nullptr;
@@ -1067,46 +1156,35 @@ namespace lfs::vis::gui {
 
             has_text_focus_ = want_text;
         };
-        const auto flush_pending_text_input = [&]() {
-            if (!has_text_focus_)
+        const auto replay_keyboard_event = [&](const FrameInputEvent& event) {
+            if (!rml_input::hasFocusedKeyboardTarget(rml_context_->GetFocusElement()))
                 return;
-
-            auto* const focused = rml_context_->GetFocusElement();
-            const bool focused_editable = rml_input::isTextEditableElement(focused);
-
-            if (focused_editable && text_input_handler && input.has_text_editing) {
-                had_input |= text_input_handler->handleTextEditing(
-                    input.text_editing, input.text_editing_start, input.text_editing_length);
-            }
-
-            bool forward_text_codepoints = input.text_inputs.empty();
-            for (const auto& text_input : input.text_inputs) {
+            if (keyboard_handler_ && keyboard_handler_(event)) {
+                if (event.dispatch)
+                    event.dispatch->consumed = true;
                 had_input = true;
-                if (focused_editable && text_input_handler &&
-                    text_input_handler->handleTextInput(text_input)) {
-                    continue;
-                }
-                if (focused && rml_input::isCustomTextInputElement(focused)) {
-                    rml_context_->ProcessTextInput(text_input);
-                } else {
-                    forward_text_codepoints = true;
+                return;
+            }
+            const bool composing = text_input_handler && text_input_handler->isComposing();
+            if (event.kind == FrameInputEventKind::KeyDown &&
+                event.scancode == SDL_SCANCODE_ESCAPE &&
+                rml_input::shouldCancelOnEscape(rml_context_->GetFocusElement(), composing)) {
+                had_input |= rml_input::cancelFocusedElement(*rml_context_);
+            } else {
+                had_input |= rml_input::processKeyboardEvent(*rml_context_, event, text_input_handler);
+                if (!composing && event.kind == FrameInputEventKind::KeyDown &&
+                    (event.scancode == SDL_SCANCODE_RETURN || event.scancode == SDL_SCANCODE_KP_ENTER) &&
+                    rml_input::isSingleLineTextInput(rml_context_->GetFocusElement())) {
+                    rml_context_->GetFocusElement()->Blur();
                 }
             }
-
-            if (forward_text_codepoints) {
-                if (!input.text_codepoints.empty())
-                    had_input = true;
-                for (const uint32_t cp : input.text_codepoints)
-                    rml_context_->ProcessTextInput(static_cast<Rml::Character>(cp));
-            }
+            sync_text_focus();
         };
         const auto blur_focused_element = [&]() -> bool {
             auto* const focused = rml_context_->GetFocusElement();
             if (!focused)
                 return false;
 
-            if (rml_input::wantsTextInput(focused))
-                flush_pending_text_input();
             focused->Blur();
             sync_text_focus();
             return true;
@@ -1114,6 +1192,8 @@ namespace lfs::vis::gui {
 
         float local_x = mouse_x - panel_x + last_fbo_padding_;
         float local_y = mouse_y - panel_y + last_fbo_padding_;
+
+        updateLiveInspectorResize(mouse_y, input.mouse_down[0], input.mouse_released[0]);
 
         const float logical_w = static_cast<float>(last_fbo_w_);
         const float logical_h = static_cast<float>(last_fbo_h_);
@@ -1145,6 +1225,7 @@ namespace lfs::vis::gui {
             if (!effective_hovered) {
                 last_forwarded_mx_ = -1;
                 last_forwarded_my_ = -1;
+                last_forwarded_mods_ = 0;
                 setManualDropdownHover(nullptr);
                 manual_dropdown_mouse_captured_ = false;
                 rml_context_->ProcessMouseLeave();
@@ -1168,6 +1249,7 @@ namespace lfs::vis::gui {
 
         const int mods = sdlModsToRml(input.key_ctrl, input.key_shift,
                                       input.key_alt, input.key_super);
+        last_forwarded_mods_ = mods;
 
         const bool manual_dropdown_route = dropdown_hovered || manual_dropdown_mouse_captured_;
         Rml::Element* manual_dropdown_target =
@@ -1231,33 +1313,39 @@ namespace lfs::vis::gui {
         // SDL can deliver multiple button transitions before the next frame.
         // Replay each transition at its recorded position so a fast double click
         // is not collapsed onto the final cursor position.
-        const auto replay_button_events = [&]() {
-            bool replayed = false;
-            for (const auto& event : input.mouse_button_events) {
-                if (event.button >= 3)
-                    continue;
-
-                const float event_x = event.x - panel_x + last_fbo_padding_;
-                const float event_y = event.y - panel_y + last_fbo_padding_;
-                const bool event_hovered = hitTestPanelShape(
-                    event_x, event_y, logical_w, logical_h);
-                if (!event_hovered && !mouse_captured_[event.button])
-                    continue;
-
-                rml_context_->ProcessMouseMove(static_cast<int>(event_x),
-                                               static_cast<int>(event_y), mods);
-                if (event.down)
-                    deliver_button_down(event.button);
-                else
-                    deliver_button_up(event.button);
-                had_input = true;
-                replayed = true;
+        bool replayed_button_events = !input.mouse_button_events.empty();
+        const auto replay_button_event = [&](const FrameMouseButtonEvent& event) {
+            if (event.button >= 3)
+                return;
+            const float event_x = event.x - panel_x + last_fbo_padding_;
+            const float event_y = event.y - panel_y + last_fbo_padding_;
+            const bool event_hovered =
+                !manager_->activeOverlayOccludesContext(rml_context_, event.x, event.y) &&
+                (clip_y_min_ < 0 || clip_y_max_ <= clip_y_min_ ||
+                 (event.y >= clip_y_min_ && event.y <= clip_y_max_)) &&
+                hitTestPanelShape(event_x, event_y, logical_w, logical_h);
+            if (!event_hovered) {
+                if (event.down && event.button == 0)
+                    had_input |= blur_focused_element();
+                if (!mouse_captured_[event.button])
+                    return;
             }
-            return replayed;
+            rml_context_->ProcessMouseMove(static_cast<int>(event_x), static_cast<int>(event_y), mods);
+            if (event.down)
+                deliver_button_down(event.button);
+            else
+                deliver_button_up(event.button);
+            sync_text_focus();
+            had_input = true;
         };
-
-        const bool replayed_button_events =
-            !manual_dropdown_option_route && replay_button_events();
+        rml_input::replayInputEvents(input.input_events, input.mouse_button_events, [&](const FrameMouseButtonEvent& event) {
+                                        if (!manual_dropdown_option_route)
+                                            replay_button_event(event); }, replay_keyboard_event);
+        // Synthetic pointer-only callers can still supply canonical button events.
+        if (input.input_events.empty() && !manual_dropdown_option_route) {
+            for (const auto& event : input.mouse_button_events)
+                replay_button_event(event);
+        }
 
         if (manual_dropdown_option_route) {
             if (input.mouse_clicked[0]) {
@@ -1293,7 +1381,9 @@ namespace lfs::vis::gui {
             }
             if (input.mouse_clicked[0])
                 sync_text_focus();
-        } else if (input.mouse_clicked[0]) {
+            if (input.mouse_clicked[0])
+                beginLiveInspectorResize(mouse_y);
+        } else if (!replayed_button_events && input.mouse_clicked[0]) {
             had_input |= blur_focused_element();
         }
 
@@ -1322,6 +1412,8 @@ namespace lfs::vis::gui {
             }
         }
 
+        updateResizeCursorOverride(hovered);
+
         if (hovered) {
             if (auto* const hover = rml_context_->GetHoverElement())
                 tooltip_.setHover(resolveRmlTooltip(hover), hover);
@@ -1331,81 +1423,8 @@ namespace lfs::vis::gui {
             tooltip_.setHover({}, nullptr);
         }
 
-        if (input.viewport_keyboard_focus)
+        if (input.viewport_keyboard_focus && !replayed_button_events)
             had_input |= blur_focused_element();
-
-        bool forward_keys =
-            rml_input::hasFocusedKeyboardTarget(rml_context_->GetFocusElement()) &&
-            !input.viewport_keyboard_focus;
-        bool commit_requested = false;
-        bool escape_requested = false;
-        const bool composing = text_input_handler && text_input_handler->isComposing();
-        auto isNumpadTextKey = [](int sc) {
-            return (sc >= SDL_SCANCODE_KP_1 && sc <= SDL_SCANCODE_KP_0) ||
-                   sc == SDL_SCANCODE_KP_PERIOD;
-        };
-
-        if (forward_keys) {
-            const auto process_key_down = [&](const int sc) {
-                if (!composing && sc == SDL_SCANCODE_ESCAPE) {
-                    if (auto* const focused = rml_context_->GetFocusElement();
-                        focused && (rml_input::isTextEditableElement(focused) ||
-                                    rml_input::isSelectRelatedElement(focused))) {
-                        escape_requested = true;
-                        had_input = true;
-                        return;
-                    }
-                }
-                const bool is_submit_key =
-                    (sc == SDL_SCANCODE_RETURN || sc == SDL_SCANCODE_KP_ENTER);
-                if (composing && (is_submit_key || sc == SDL_SCANCODE_ESCAPE))
-                    return;
-                if (has_text_focus_ && isNumpadTextKey(sc))
-                    return;
-                auto rml_key = sdlScancodeToRml(static_cast<SDL_Scancode>(sc));
-                if (rml_key != Rml::Input::KI_UNKNOWN) {
-                    if (text_input_handler && text_input_handler->handleKeyDown(rml_key, mods)) {
-                        had_input = true;
-                        return;
-                    }
-                    rml_context_->ProcessKeyDown(rml_key, mods);
-                    had_input = true;
-                }
-                if (is_submit_key)
-                    commit_requested = true;
-            };
-
-            for (int sc : input.keys_pressed)
-                process_key_down(sc);
-            for (int sc : input.keys_repeated)
-                process_key_down(sc);
-            for (int sc : input.keys_released) {
-                if (escape_requested && sc == SDL_SCANCODE_ESCAPE)
-                    continue;
-                if (composing && (sc == SDL_SCANCODE_RETURN || sc == SDL_SCANCODE_KP_ENTER ||
-                                  sc == SDL_SCANCODE_ESCAPE))
-                    continue;
-                if (has_text_focus_ && isNumpadTextKey(sc))
-                    continue;
-                auto rml_key = sdlScancodeToRml(static_cast<SDL_Scancode>(sc));
-                if (rml_key != Rml::Input::KI_UNKNOWN) {
-                    rml_context_->ProcessKeyUp(rml_key, mods);
-                    had_input = true;
-                }
-            }
-        }
-
-        if (!composing && escape_requested) {
-            if (rml_input::cancelFocusedElement(*rml_context_)) {
-                sync_text_focus();
-                had_input = true;
-            }
-        }
-
-        if (!composing && commit_requested &&
-            rml_input::isSingleLineTextInput(rml_context_->GetFocusElement())) {
-            blur_focused_element();
-        }
 
         sync_text_focus();
 
@@ -1416,7 +1435,6 @@ namespace lfs::vis::gui {
 
         if (has_text_focus_) {
             s_frame_wants_text_input = true;
-            flush_pending_text_input();
         }
 
         return had_input;

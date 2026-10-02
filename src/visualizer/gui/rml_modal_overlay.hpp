@@ -64,6 +64,7 @@ namespace lfs::vis::gui {
         RmlModalOverlay& operator=(const RmlModalOverlay&) = delete;
 
         void enqueue(lfs::core::ModalRequest request);
+        void activatePending();
         void processInput(const PanelInputState& input);
         void render(int screen_w, int screen_h,
                     float screen_x, float screen_y,
@@ -76,6 +77,8 @@ namespace lfs::vis::gui {
         [[nodiscard]] std::optional<ModalSnapshot> current() const;
         [[nodiscard]] std::size_t pending_count() const;
         bool dismiss(const std::string& button_label);
+        bool updateForm(const std::string& key, const std::optional<std::string>& body_rml,
+                        const std::vector<lfs::core::ModalButtonSpec>& buttons);
         [[nodiscard]] bool hasPendingRequest() const;
         [[nodiscard]] bool hasPendingRenderWork() const;
         [[nodiscard]] bool needsAnimationFrame() const;
@@ -104,6 +107,7 @@ namespace lfs::vis::gui {
         void cacheElements();
 
         void showNext();
+        void updateButtons(const std::vector<lfs::core::ModalButtonSpec>& buttons);
         bool dismissFirstEnabledButton();
         void bindTextInputRevert();
         void cancel();

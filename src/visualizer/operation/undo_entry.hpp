@@ -53,6 +53,11 @@ namespace lfs::vis::op {
         using std::runtime_error::runtime_error;
     };
 
+    class LFS_VIS_API HistoryStaleEntryError : public HistoryCorruptionError {
+    public:
+        using HistoryCorruptionError::HistoryCorruptionError;
+    };
+
     struct SceneTopologyNodeProof {
         lfs::core::Uuid uuid;
         lfs::core::Uuid parent_uuid;
@@ -436,7 +441,7 @@ namespace lfs::vis::op {
         bool scoped_topology = false;
         // A missing allowlist preserves the legacy FULL capture behavior. An
         // engaged allowlist captures payloads only for these node UUIDs.
-        std::optional<std::vector<lfs::core::Uuid>> payload_uuids;
+        std::optional<std::vector<lfs::core::Uuid>> payload_uuids = std::nullopt;
     };
 
     struct SceneGraphCameraSnapshot {

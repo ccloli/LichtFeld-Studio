@@ -33,6 +33,7 @@
 #include "tools/tool_base.hpp"
 #include "tools/unified_tool_registry.hpp"
 #include "training/training_manager.hpp"
+#include "visualizer/gui/panel_registry.hpp"
 #include "visualizer/gui_capabilities.hpp"
 #include "visualizer/scene_coordinate_utils.hpp"
 #include "visualizer/visualizer.hpp"
@@ -60,7 +61,7 @@ namespace lfs::vis {
         void expandNodeWorldBounds(const core::Scene& scene, const core::SceneNode& node,
                                    glm::vec3& world_min, glm::vec3& world_max,
                                    bool use_percentile = false) {
-            glm::vec3 local_min, local_max;
+            glm::vec3 local_min{0.0f}, local_max{0.0f};
             bool have_local = false;
             if (use_percentile) {
                 if (node.model && node.model->size() > 0)
@@ -146,6 +147,7 @@ namespace lfs::vis {
                                  double x, double y, const bool over_gui) {
             op::ModalEvent evt{};
             evt.type = op::ModalEvent::Type::KEY;
+            evt.over_gui = over_gui;
             evt.data = KeyEvent{key, scancode, action, mods};
 
             if (op::operators().hasModalOperator()) {
@@ -171,6 +173,7 @@ namespace lfs::vis {
                                          double x, double y, const bool over_gui) {
             op::ModalEvent evt{};
             evt.type = op::ModalEvent::Type::MOUSE_BUTTON;
+            evt.over_gui = over_gui;
             evt.data = MouseButtonEvent{button, action, mods, {x, y}};
 
             if (op::operators().hasModalOperator()) {
@@ -196,6 +199,7 @@ namespace lfs::vis {
                                        [[maybe_unused]] int mods, const bool over_gui) {
             op::ModalEvent evt{};
             evt.type = op::ModalEvent::Type::MOUSE_MOVE;
+            evt.over_gui = over_gui;
             evt.data = MouseMoveEvent{{x, y}, {delta_x, delta_y}};
 
             if (op::operators().hasModalOperator()) {
@@ -220,6 +224,7 @@ namespace lfs::vis {
                                     [[maybe_unused]] int mods, const bool over_gui) {
             op::ModalEvent evt{};
             evt.type = op::ModalEvent::Type::MOUSE_SCROLL;
+            evt.over_gui = over_gui;
             evt.data = MouseScrollEvent{xoff, yoff};
 
             if (op::operators().hasModalOperator()) {
@@ -734,7 +739,10 @@ namespace lfs::vis {
             return;
         }
 
-        if (action == input::ACTION_PRESS) {
+        const bool selection_pointer_blocked =
+            op::operators().activeModalId() == op::to_string(op::BuiltinOp::SelectionStroke) &&
+            (over_gui || (!input_router_ && !isInViewport(x, y)));
+        if (!selection_pointer_blocked && action == input::ACTION_PRESS) {
             const auto mouse_btn = static_cast<input::MouseButton>(button);
             const auto tool_mode = getCurrentToolMode();
             auto modal_action = bindings_.getActionForMouseButton(tool_mode, mouse_btn, mods, false);
@@ -747,7 +755,8 @@ namespace lfs::vis {
         }
 
         // Dispatch to modal operators first - if consumed, don't continue
-        if (dispatchMouseButtonToModals(button, action, mods, x, y, over_gui_hover)) {
+        if (!selection_pointer_blocked &&
+            dispatchMouseButtonToModals(button, action, mods, x, y, over_gui_hover)) {
             return;
         }
 
@@ -992,49 +1001,8 @@ namespace lfs::vis {
                 const glm::vec3 new_pivot = unprojectScreenPoint(x, y, current_distance);
                 const glm::vec3 forward = lfs::rendering::cameraForward(target_viewport.camera.R);
 
-                glm::vec3 camera_offset(0.0f);
-
-                // In comparison split modes, offset camera so the pivot lands in the active panel center.
-                if (auto* const rendering = services().renderingOrNull();
-                    rendering && rendering->isSplitViewActive() && !rendering->isIndependentSplitViewActive()) {
-                    if (const auto divider_x = rendering->getSplitDividerScreenX(
-                            {viewport_bounds_.x, viewport_bounds_.y},
-                            {viewport_bounds_.width, viewport_bounds_.height})) {
-                        const float local_x = static_cast<float>(x) - viewport_bounds_.x;
-                        const float viewport_width = viewport_bounds_.width;
-                        const float viewport_height = viewport_bounds_.height;
-                        if (viewport_width <= 0.0f || viewport_height <= 0.0f) {
-                            break;
-                        }
-                        const float split_x = *divider_x - viewport_bounds_.x;
-
-                        // Determine which panel was clicked and its center
-                        float panel_center_x;
-                        if (local_x < split_x) {
-                            panel_center_x = split_x * 0.5f;
-                        } else {
-                            panel_center_x = split_x + (viewport_width - split_x) * 0.5f;
-                        }
-
-                        // Offset from viewport center to panel center (in pixels)
-                        const float viewport_center_x = viewport_width / 2.0f;
-                        const float dx = panel_center_x - viewport_center_x;
-
-                        // Convert screen offset to camera offset
-                        const float fov_y = glm::radians(services().renderingOrNull()->getFovDegrees());
-                        const float aspect = viewport_width / viewport_height;
-                        const float fov_x = 2.0f * std::atan(std::tan(fov_y / 2.0f) * aspect);
-                        const float fx = viewport_width / (2.0f * std::tan(fov_x / 2.0f));
-
-                        // Shift camera opposite to desired screen shift
-                        const float shift = -dx * current_distance / fx;
-                        const glm::vec3 right = lfs::rendering::cameraRight(target_viewport.camera.R);
-                        camera_offset = right * shift;
-                    }
-                }
-
                 target_viewport.camera.setPivot(new_pivot);
-                target_viewport.camera.startGlide(new_pivot - forward * current_distance + camera_offset);
+                target_viewport.camera.startGlide(new_pivot - forward * current_distance);
                 onCameraMovementStart();
                 publishCameraMove(&target_viewport);
                 break;
@@ -1088,14 +1056,15 @@ namespace lfs::vis {
                             }
                             // Operator is now modal, don't set drag mode - modal dispatch handles it
                         }
-                    } else if (align_tool_ && align_tool_->isEnabled()) {
+                    } else if (align_tool_ && align_tool_->isEnabled() &&
+                               !op::operators().hasModalOperator()) {
                         op::OperatorProperties props;
                         props.set("x", x);
                         props.set("y", y);
                         props.set("button", button);
                         props.set("modifiers", mods);
                         const auto result = op::operators().invoke(op::BuiltinOp::AlignPickPoint, &props);
-                        if (result.status != op::OperatorResult::CANCELLED) {
+                        if (result.status == op::OperatorResult::RUNNING_MODAL) {
                             return;
                         }
                     }
@@ -1112,14 +1081,15 @@ namespace lfs::vis {
 
             case input::Action::NONE:
             default:
-                if (align_tool_ && align_tool_->isEnabled() && tool_context_ && !over_gui) {
+                if (align_tool_ && align_tool_->isEnabled() && tool_context_ && !over_gui &&
+                    !op::operators().hasModalOperator()) {
                     op::OperatorProperties props;
                     props.set("x", x);
                     props.set("y", y);
                     props.set("button", button);
                     props.set("modifiers", mods);
                     const auto result = op::operators().invoke(op::BuiltinOp::AlignPickPoint, &props);
-                    if (result.status != op::OperatorResult::CANCELLED) {
+                    if (result.status == op::OperatorResult::RUNNING_MODAL) {
                         return;
                     }
                 }
@@ -1188,10 +1158,10 @@ namespace lfs::vis {
             if (press_consumed_camera_frustum) {
                 const double drag_dist = glm::length(glm::dvec2(x, y) - pressed_camera_frustum_pos);
                 const bool was_click = drag_dist < kCameraFrustumClickThreshold;
-                const auto tool_mode = getCurrentToolMode();
+                const auto release_tool_mode = getCurrentToolMode();
                 const bool allow_camera_frustum_pick =
-                    tool_mode == input::ToolMode::GLOBAL ||
-                    tool_mode == input::ToolMode::SELECTION;
+                    release_tool_mode == input::ToolMode::GLOBAL ||
+                    release_tool_mode == input::ToolMode::SELECTION;
                 if (allow_camera_frustum_pick &&
                     was_click && pressed_camera_frustum_id >= 0 &&
                     !over_gui && !over_transform_gizmo) {
@@ -1352,7 +1322,11 @@ namespace lfs::vis {
             over_gui = isPointerOverBlockingUi(x, y);
             over_gui_hover = isPointerOverUiHover(x, y);
         }
-        if (dispatchMouseMoveToModals(x, y, delta_x, delta_y, getModifierKeys(), over_gui_hover)) {
+        const bool selection_pointer_blocked =
+            op::operators().activeModalId() == op::to_string(op::BuiltinOp::SelectionStroke) &&
+            (over_gui || (!input_router_ && !isInViewport(x, y)));
+        if (!selection_pointer_blocked &&
+            dispatchMouseMoveToModals(x, y, delta_x, delta_y, getModifierKeys(), over_gui_hover)) {
             last_mouse_pos_ = current_pos;
             return;
         }
@@ -1649,7 +1623,7 @@ namespace lfs::vis {
     }
 
     void InputController::handleKey(const int physical_key, const int logical_key,
-                                    const int scancode, int action, [[maybe_unused]] int mods) {
+                                    const int scancode, int action, int mods, const bool owned_release, const bool gui_consumed) {
         // Track modifier keys (always, even if GUI has focus)
         if (physical_key == input::KEY_LEFT_CONTROL || physical_key == input::KEY_RIGHT_CONTROL) {
             key_ctrl_pressed_ = (action != input::ACTION_RELEASE);
@@ -1657,12 +1631,18 @@ namespace lfs::vis {
         if (physical_key == input::KEY_LEFT_ALT || physical_key == input::KEY_RIGHT_ALT) {
             key_alt_pressed_ = (action != input::ACTION_RELEASE);
         }
+        const bool wants_text_input = input_router_
+                                          ? input_router_->isTextInputActive()
+                                          : gui::guiFocusState().want_text_input;
         const bool is_modifier_key =
             physical_key == input::KEY_LEFT_SHIFT || physical_key == input::KEY_RIGHT_SHIFT ||
             physical_key == input::KEY_LEFT_CONTROL || physical_key == input::KEY_RIGHT_CONTROL ||
             physical_key == input::KEY_LEFT_ALT || physical_key == input::KEY_RIGHT_ALT ||
             physical_key == input::KEY_LEFT_SUPER || physical_key == input::KEY_RIGHT_SUPER;
-        if (!is_modifier_key && logical_key != input::KEY_UNKNOWN) {
+        if (wants_text_input && !bindings_.isCapturing()) {
+            // Text keys must not become viewport mouse/scroll chords either.
+            held_keys_.clear();
+        } else if (!is_modifier_key && logical_key != input::KEY_UNKNOWN) {
             if (action == input::ACTION_RELEASE) {
                 std::erase(held_keys_, logical_key);
             } else if (!std::ranges::contains(held_keys_, logical_key)) {
@@ -1695,9 +1675,19 @@ namespace lfs::vis {
         const bool is_mcp_runtime_action =
             bound_action == input::Action::TOGGLE_MCP_SERVER ||
             bound_action == input::Action::TOGGLE_MCP_BINDING;
-        if (lfs::python::has_keyboard_capture_request() && !is_mcp_runtime_action) {
+        if (lfs::python::has_keyboard_capture_request() && !is_mcp_runtime_action && !owned_release) {
             return;
         }
+
+        const bool project_save = logical_key == input::KEY_S && mods == input::KEYMOD_CTRL;
+        if (wants_text_input && !is_mcp_runtime_action && !owned_release) {
+            if (project_save && action == input::ACTION_PRESS)
+                cmd::ProjectSave{}.emit();
+            return;
+        }
+
+        if (gui_consumed && !is_mcp_runtime_action && !owned_release)
+            return;
 
         // Dispatch to modal operators first - if consumed, don't continue
         float mx_f, my_f;
@@ -1727,9 +1717,6 @@ namespace lfs::vis {
             }
         }
 
-        const bool wants_text_input = input_router_
-                                          ? input_router_->isTextInputActive()
-                                          : gui::guiFocusState().want_text_input;
         const bool viewport_keyboard_focus = input_router_
                                                  ? input_router_->isViewportKeyboardFocused()
                                                  : false;
@@ -1849,15 +1836,20 @@ namespace lfs::vis {
 
             case input::Action::CAMERA_NEXT_VIEW:
             case input::Action::CAMERA_PREV_VIEW: {
-                const auto* trainer = services().trainerOrNull();
-                if (trainer) {
-                    const int num_cams = static_cast<int>(trainer->getAllCamList().size());
-                    if (num_cams > 0) {
+                if (const auto* scene_manager = services().sceneOrNull()) {
+                    const auto& cameras = scene_manager->getScene().getAllCamerasCached();
+                    if (!cameras.empty()) {
+                        const auto* rendering = services().renderingOrNull();
+                        const int current_uid = rendering ? rendering->getCurrentCameraId() : last_camview_;
+                        const auto current = std::ranges::find_if(cameras, [current_uid](const auto& camera) {
+                            return camera->uid() == current_uid;
+                        });
+                        const int count = static_cast<int>(cameras.size());
                         const int delta = (bound_action == input::Action::CAMERA_NEXT_VIEW) ? 1 : -1;
-                        last_camview_ = (last_camview_ < 0)
-                                            ? (delta > 0 ? 0 : num_cams - 1)
-                                            : (last_camview_ + delta + num_cams) % num_cams;
-                        cmd::GoToCamView{.cam_id = last_camview_}.emit();
+                        const int index = current == cameras.end()
+                                              ? (delta > 0 ? 0 : count - 1)
+                                              : (static_cast<int>(std::distance(cameras.begin(), current)) + delta + count) % count;
+                        cmd::GoToCamView{.cam_id = cameras[index]->uid()}.emit();
                     }
                 }
                 return;
@@ -2397,7 +2389,7 @@ namespace lfs::vis {
 
         if (paths.size() == 1) {
             const std::filesystem::path dropped_path = lfs::core::utf8_to_path(paths.front());
-            auto extension = dropped_path.extension().string();
+            auto extension = lfs::core::path_to_utf8(dropped_path.extension());
             std::ranges::transform(
                 extension, extension.begin(),
                 [](const unsigned char character) {
@@ -2405,6 +2397,16 @@ namespace lfs::vis {
                         std::tolower(character));
                 });
             if (extension == ".licht") {
+                auto& panels = gui::PanelRegistry::instance();
+                if (panels.is_panel_enabled("lfs.asset_manager")) {
+                    if (const auto panel = panels.get_panel_instance("lfs.asset_manager");
+                        panel && panel->onViewportDrop(
+                                     "application/x-lichtfeld-project-file", paths.front())) {
+                        LOG_INFO("Added project to Asset Manager via drag-and-drop: {}",
+                                 lfs::core::path_to_utf8(dropped_path.filename()));
+                        return;
+                    }
+                }
                 // Unpublished *.tmp.licht names still emit ProjectOpen so
                 // lifecycle can reject with unpublishedLichtUserMessage.
                 cmd::ProjectOpen{.path = dropped_path}.emit();
@@ -2414,7 +2416,7 @@ namespace lfs::vis {
                         dropped_path.filename()));
                 return;
             }
-            if (lfs::io::video::is_supported_video_extension(dropped_path.extension().string())) {
+            if (lfs::io::video::is_supported_video_extension(extension)) {
                 cmd::ShowVideoExtractor{.video_path = dropped_path}.emit();
                 LOG_INFO("Opening video extractor via drag-and-drop: {}",
                          lfs::core::path_to_utf8(dropped_path.filename()));
@@ -2426,8 +2428,11 @@ namespace lfs::vis {
             std::filesystem::path filepath = lfs::core::utf8_to_path(path_str);
             LOG_DEBUG("Processing dropped file: {}", lfs::core::path_to_utf8(filepath));
 
-            auto ext = filepath.extension().string();
-            std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+            auto ext = lfs::core::path_to_utf8(filepath.extension());
+            std::ranges::transform(
+                ext, ext.begin(), [](const unsigned char character) {
+                    return static_cast<char>(std::tolower(character));
+                });
 
             if (ext == ".resume") {
                 cmd::ShowResumeCheckpointPopup{.checkpoint_path = filepath}.emit();
@@ -2456,8 +2461,11 @@ namespace lfs::vis {
                 splat_files.push_back(filepath);
             } else if (ext == ".bin" || ext == ".txt") {
                 // Check if this is a COLMAP file (cameras.bin, images.bin, etc.)
-                auto filename = filepath.filename().string();
-                std::transform(filename.begin(), filename.end(), filename.begin(), ::tolower);
+                auto filename = lfs::core::path_to_utf8(filepath.filename());
+                std::ranges::transform(
+                    filename, filename.begin(), [](const unsigned char character) {
+                        return static_cast<char>(std::tolower(character));
+                    });
                 if (filename == "cameras.bin" || filename == "cameras.txt" ||
                     filename == "images.bin" || filename == "images.txt") {
                     auto parent = filepath.parent_path();
@@ -2502,19 +2510,19 @@ namespace lfs::vis {
             cmd::ShowLoadFileConfirmation{
                 .paths = splat_files,
                 .is_dataset = false,
-                .replace = false}
+                .replace = false,
+                .user_batch = splat_files.size() > 1}
                 .emit();
             LOG_INFO(
                 "Requesting confirmation before loading {} dropped splat/mesh file(s)",
                 splat_files.size());
         } else {
-            for (const auto& splat : splat_files) {
-                auto event = cmd::LoadFile{};
-                event.path = splat;
-                event.is_dataset = false;
-                event.emit();
-                LOG_INFO("Loading {} via drag-and-drop: {}",
-                         lfs::core::path_to_utf8(splat.extension()), lfs::core::path_to_utf8(splat.filename()));
+            if (!splat_files.empty()) {
+                cmd::LoadFile{.path = splat_files.front(),
+                              .is_dataset = false,
+                              .paths = splat_files,
+                              .user_batch = splat_files.size() > 1}
+                    .emit();
             }
         }
 
@@ -2541,13 +2549,8 @@ namespace lfs::vis {
         auto& target_viewport = activeKeyboardViewport();
 
         std::shared_ptr<const lfs::core::Camera> cam_data;
-        if (auto* trainer = services().trainerOrNull()) {
-            cam_data = trainer->getCamById(event.cam_id);
-        }
-        if (!cam_data) {
-            if (auto* scene_mgr = services().sceneOrNull()) {
-                cam_data = scene_mgr->getScene().getCameraByUid(event.cam_id);
-            }
+        if (auto* scene_mgr = services().sceneOrNull()) {
+            cam_data = scene_mgr->getScene().getCameraByUid(event.cam_id);
         }
         if (!cam_data) {
             LOG_ERROR("Camera ID {} not found", event.cam_id);
@@ -3292,6 +3295,7 @@ namespace lfs::vis {
                     .focal_length_mm = focal_length_mm,
                     .orthographic = render_settings.orthographic,
                     .ortho_scale = ortho_scale,
+                    .panel = interaction->panel,
                 });
         }
         if (depth <= 0.0f) {
