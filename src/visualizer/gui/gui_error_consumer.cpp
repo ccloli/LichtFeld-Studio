@@ -90,7 +90,8 @@ namespace lfs::vis::gui {
                     return error.severity() == lfs::Severity::Warning ? Keys::EXPORT_WARNING
                                                                       : Keys::EXPORT_FAILED;
                 }
-                if (op == error_op::kNewProject || op == error_op::kProjectSettings) {
+                if (op == error_op::kNewProject || op == error_op::kProjectSettings || op == "enter_walk" ||
+                    op == "vr") {
                     return Keys::GENERIC;
                 }
                 return Keys::FILE_OPEN_FAILED;
@@ -147,8 +148,18 @@ namespace lfs::vis::gui {
             return pos == std::string_view::npos ? text : text.substr(0, pos);
         }
 
+        [[nodiscard]] std::string presentedMessage(const lfs::Error& error) {
+            for (const auto& frame : error.frames())
+                for (const auto& field : frame.fields.entries())
+                    if (field.key == "message_key")
+                        if (const auto* key = std::get_if<std::string>(&field.value);
+                            key && lfs::event::LocalizationManager::getInstance().hasKey(*key))
+                            return LOC(*key);
+            return std::string(error.user_message());
+        }
+
         [[nodiscard]] std::string bodyFor(const lfs::Error& error) {
-            const std::string_view message = error.user_message();
+            const std::string message = presentedMessage(error);
             if (isOutOfMemory(error)) {
                 std::string body = std::format(
                     "<div>{}</div>"
@@ -172,7 +183,7 @@ namespace lfs::vis::gui {
             request.body_rml = std::format(
                 "<div class=\"content-row\">{}</div>"
                 "<div class=\"details-block\">{}</div>",
-                escapeRmlText(error.user_message()),
+                escapeRmlText(presentedMessage(error)),
                 escapeRmlText(lfs::format_for_developer(error)));
             request.style = styleFor(error.severity());
             request.width_dp = 640;
@@ -232,7 +243,7 @@ namespace lfs::vis::gui {
                 if (sinks_.toast) {
                     sinks_.toast(ToastRequest{
                         .title = LOC(titleKeyFor(notification.error)),
-                        .message = std::string(notification.error.user_message()),
+                        .message = presentedMessage(notification.error),
                         .level = levelFor(notification.error.severity()),
                         .fingerprint = lfs::core::error_fingerprint(notification.error),
                     });
@@ -241,7 +252,7 @@ namespace lfs::vis::gui {
                 break; // no toast sink: fall back to the Modal path (never dropped)
             case lfs::ErrorSurface::StatusOnly:
                 if (sinks_.status) {
-                    sinks_.status(std::string(firstLine(notification.error.user_message())),
+                    sinks_.status(std::string(firstLine(presentedMessage(notification.error))),
                                   levelFor(notification.error.severity()));
                 }
                 return; // silent no-op without a status sink (Cancelled-class)

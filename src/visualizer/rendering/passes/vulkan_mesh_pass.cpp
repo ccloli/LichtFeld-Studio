@@ -3,8 +3,10 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "vulkan_mesh_pass.hpp"
+#include "collision_preview_upload.hpp"
 #include <algorithm>
 
+#include "core/collision.hpp"
 #include "core/logger.hpp"
 #include "core/material.hpp"
 #include "core/mesh_data.hpp"
@@ -15,6 +17,7 @@
 #include "window/vulkan_result.hpp"
 
 #include <array>
+#include <cstddef>
 #include <cstring>
 #include <format>
 #include <glm/gtc/matrix_transform.hpp>
@@ -26,7 +29,10 @@
 #include <vector>
 #include <vk_mem_alloc.h>
 
+#include "viewport/collision_overlay.frag.spv.h"
+#include "viewport/collision_overlay.vert.spv.h"
 #include "viewport/mesh.frag.spv.h"
+#include "viewport/mesh.geom.spv.h"
 #include "viewport/mesh.vert.spv.h"
 #include "viewport/mesh_shadow.frag.spv.h"
 #include "viewport/mesh_shadow.vert.spv.h"
@@ -87,12 +93,16 @@ namespace lfs::vis {
 
         struct LightUbo {
             float camera_pos[4];
-            float light_dir[4]; // xyz, w unused
-            float params[4];    // x = intensity, y = ambient, z = shadow_enabled
-            float selection[4]; // x = emphasized, y = dim others, z = flash intensity
-            float light_vp[16]; // light view-projection (column-major) for shadow sampling
+            float light_dir[4];      // xyz, w unused
+            float params[4];         // x = intensity, y = ambient, z = shadow_enabled
+            float selection[4];      // x = emphasized, y = dim others, z = panorama, w = reserved
+            float light_vp[16];      // light view-projection (column-major) for shadow sampling
+            float camera_forward[4]; // xyz = world-space view direction
+            float depth_view[4];     // x = enabled, y = near, z = far, w = grayscale
+            float view[16];
+            float projection[16];
         };
-        static_assert(sizeof(LightUbo) == 128, "LightUbo layout");
+        static_assert(sizeof(LightUbo) == 288, "LightUbo layout");
 
         struct MaterialUbo {
             float base_color[4];
@@ -112,6 +122,11 @@ namespace lfs::vis {
             float color[4];
         };
         static_assert(sizeof(WireframePush) == 80);
+        struct CollisionPush {
+            glm::mat4 clip_to_grid;
+            glm::vec4 pixel{0}, panorama{0};
+        };
+        static_assert(sizeof(CollisionPush) == 96);
 
     } // namespace
 
@@ -126,6 +141,8 @@ namespace lfs::vis {
         VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
         VkPipeline pipeline_cull = VK_NULL_HANDLE;    // backface culling (default)
         VkPipeline pipeline_no_cull = VK_NULL_HANDLE; // double-sided / culling off
+        VkPipeline pipeline_cull_blend = VK_NULL_HANDLE;
+        VkPipeline pipeline_no_cull_blend = VK_NULL_HANDLE;
 
         VkPipelineLayout shadow_pipeline_layout = VK_NULL_HANDLE;
         VkPipeline shadow_pipeline = VK_NULL_HANDLE;
@@ -135,11 +152,64 @@ namespace lfs::vis {
         VkPipeline wireframe_pipeline = VK_NULL_HANDLE;
         VkFormat color_format_cached = VK_FORMAT_UNDEFINED;
         VkFormat depth_format_cached = VK_FORMAT_UNDEFINED;
+        VkDescriptorSetLayout collision_layout = VK_NULL_HANDLE;
+        VkPipelineLayout collision_pipeline_layout = VK_NULL_HANDLE;
+        VkPipeline collision_pipeline = VK_NULL_HANDLE;
+        bool collision_pipeline_attempted = false;
+        // Published only after future.get() synchronizes the worker's pipeline
+        // and layout creation. Drawing never reads worker-owned handles early.
+        bool collision_pipeline_ready = false;
+        struct CollisionFrame {
+            VkDevice device = VK_NULL_HANDLE;
+            VmaAllocator allocator = VK_NULL_HANDLE;
+            std::shared_ptr<const core::CollisionVolume> owner;
+            VkBuffer buffer = VK_NULL_HANDLE;
+            VmaAllocation allocation = VK_NULL_HANDLE;
+            VkDescriptorPool pool = VK_NULL_HANDLE;
+            VkDescriptorSet descriptor = VK_NULL_HANDLE;
+            VkBuffer staging = VK_NULL_HANDLE;
+            VmaAllocation staging_allocation = VK_NULL_HANDLE;
+            VkFence pending_upload = VK_NULL_HANDLE;
+            VkCommandPool upload_pool = VK_NULL_HANDLE;
+            void release() {
+                if (pending_upload && vkGetFenceStatus(device, pending_upload) != VK_SUCCESS) {
+                    LOG_ERROR("Collision upload has not retired; retaining its buffers until device teardown");
+                    return;
+                }
+                if (pending_upload)
+                    vkDestroyFence(device, pending_upload, nullptr);
+                pending_upload = VK_NULL_HANDLE;
+                if (upload_pool)
+                    vkDestroyCommandPool(device, upload_pool, nullptr);
+                upload_pool = VK_NULL_HANDLE;
+                if (staging)
+                    vmaDestroyBuffer(allocator, staging, staging_allocation);
+                if (buffer)
+                    vmaDestroyBuffer(allocator, buffer, allocation);
+                if (pool)
+                    vkDestroyDescriptorPool(device, pool, nullptr);
+                staging = buffer = VK_NULL_HANDLE;
+                staging_allocation = allocation = VK_NULL_HANDLE;
+                pool = VK_NULL_HANDLE;
+            }
+            ~CollisionFrame() { release(); }
+        };
+        std::vector<std::vector<std::shared_ptr<CollisionFrame>>> collision_frames;
+        std::unordered_map<const core::CollisionVolume*, std::weak_ptr<CollisionFrame>> collision_cache;
+        // Weak source identities distinguish a regenerated volume even when
+        // its allocation reuses an old address. Redraws never retry failures.
+        std::unordered_map<const core::CollisionVolume*, std::weak_ptr<const core::CollisionVolume>> collision_failed;
+        detail::CollisionPreviewUploadJob<CollisionFrame> collision_upload;
+        // Bridge completion to the retired frame slot's shared ownership.
+        std::shared_ptr<CollisionFrame> collision_completed;
+        std::shared_ptr<CollisionFrame> collision_pending;
+        std::function<void()> collision_wake;
 
         VkSampler sampler = VK_NULL_HANDLE;
         VkSampler shadow_sampler = VK_NULL_HANDLE; // sampler2DShadow with comparison
         std::vector<VkDescriptorPool> material_descriptor_pools;
         VkCommandPool transfer_pool = VK_NULL_HANDLE;
+        mutable bool retain_transfer_pool = false;
         VkQueue graphics_queue = VK_NULL_HANDLE;
 
         struct LightDrawResources {
@@ -173,12 +243,24 @@ namespace lfs::vis {
             GpuTexture albedo{};
             GpuTexture normal{};
             GpuTexture metallic_roughness{};
+            lfs::core::AlphaMode alpha_mode = lfs::core::AlphaMode::Opaque;
         };
 
         struct GpuSubmesh {
             std::uint32_t start_index = 0;
             std::uint32_t index_count = 0;
             std::size_t material_index = 0;
+        };
+
+        struct GpuMesh;
+
+        struct TransparentDraw {
+            const GpuMesh* mesh = nullptr;
+            const GpuSubmesh* submesh = nullptr;
+            std::size_t item_index = 0;
+            std::size_t submesh_order = 0;
+            std::size_t draw_index = 0;
+            float view_depth = 0.0f;
         };
 
         struct ShadowTarget {
@@ -189,6 +271,16 @@ namespace lfs::vis {
             std::string vram_label;
         };
 
+        struct ShadowState {
+            ShadowTarget target{};
+            glm::mat4 cached_light_vp{1.0f};
+            bool cached_light_vp_valid = false;
+            glm::mat4 key_model{0.0f};
+            glm::vec3 key_light_dir{0.0f};
+            int key_resolution = -1;
+            std::uint32_t key_generation = std::numeric_limits<std::uint32_t>::max();
+        };
+
         struct GpuMesh {
             VkBuffer vertex_buffer = VK_NULL_HANDLE;
             VmaAllocation vertex_alloc = VK_NULL_HANDLE;
@@ -197,22 +289,14 @@ namespace lfs::vis {
             std::uint32_t total_index_count = 0;
             std::uint32_t generation = 0;
             std::uint64_t last_used_frame = 0;
+            std::size_t blend_submesh_count = 0;
             std::vector<GpuMaterial> materials;
             std::vector<GpuSubmesh> submeshes;
 
             glm::vec3 aabb_min{0.0f};
             glm::vec3 aabb_max{0.0f};
 
-            ShadowTarget shadow{};
-            glm::mat4 cached_light_vp{1.0f};
-            bool cached_light_vp_valid = false;
-
-            // Inputs the rendered shadow map depends on. The shadow is re-rendered (a
-            // blocking GPU submit) only when one of these changes.
-            glm::mat4 shadow_key_model{0.0f};
-            glm::vec3 shadow_key_light_dir{0.0f};
-            int shadow_key_resolution = -1;
-            std::uint32_t shadow_key_generation = std::numeric_limits<std::uint32_t>::max();
+            std::vector<ShadowState> shadows;
         };
 
         // Placeholder 1x1 shadow image bound when shadow_enabled=false; satisfies the
@@ -220,6 +304,7 @@ namespace lfs::vis {
         ShadowTarget shadow_dummy{};
 
         std::unordered_map<std::uint64_t, GpuMesh> mesh_cache;
+        std::vector<TransparentDraw> transparent_draws;
         std::uint64_t frame_counter = 0;
 
         ~Impl() { destroy(); }
@@ -273,7 +358,7 @@ namespace lfs::vis {
                    createDummyShadow() &&
                    createMainPipelines(color_format, depth_format) &&
                    createShadowPipeline(depth_format) &&
-                   createWireframePipeline(color_format, depth_format);
+                   createOverlayPipeline(color_format, depth_format);
         }
 
         VkCommandBuffer beginSingleTimeCommands() const {
@@ -320,7 +405,7 @@ namespace lfs::vis {
             return cb;
         }
 
-        bool endSingleTimeCommands(VkCommandBuffer cb) const {
+        bool endSingleTimeCommands(VkCommandBuffer cb, VkFence* pending = nullptr) const {
             VkResult r = vkEndCommandBuffer(cb);
             if (r != VK_SUCCESS) {
                 vkFreeCommandBuffers(device, transfer_pool, 1, &cb);
@@ -406,6 +491,11 @@ namespace lfs::vis {
                         formatWaitFailure(wait_outcome));
                 }
             }
+            if (submitted && !wait_ready) {
+                retain_transfer_pool = true;
+                if (pending)
+                    *pending = fence;
+            }
             // AMB-4: destroy fence/CB only when never submitted or wait Ready.
             if (fence != VK_NULL_HANDLE) {
                 if (!submitted || wait_ready) {
@@ -436,6 +526,14 @@ namespace lfs::vis {
         }
 
         void destroy() {
+            // Only device teardown joins the worker. Hiding/deleting a volume
+            // merely requests cancellation and keeps the GUI running.
+            collision_upload.finish();
+            collision_completed.reset();
+            collision_frames.clear();
+            collision_cache.clear();
+            collision_failed.clear();
+            collision_pending.reset();
             for (auto& [_, gpu] : mesh_cache) {
                 destroyMesh(gpu);
             }
@@ -457,13 +555,19 @@ namespace lfs::vis {
                 vkDestroyDescriptorPool(device, pool, nullptr);
             }
             material_descriptor_pools.clear();
-            for (VkPipeline* p : {&pipeline_cull, &pipeline_no_cull, &shadow_pipeline, &wireframe_pipeline}) {
+            for (VkPipeline* p : {&pipeline_cull,
+                                  &pipeline_no_cull,
+                                  &pipeline_cull_blend,
+                                  &pipeline_no_cull_blend,
+                                  &shadow_pipeline,
+                                  &wireframe_pipeline,
+                                  &collision_pipeline}) {
                 if (*p != VK_NULL_HANDLE) {
                     vkDestroyPipeline(device, *p, nullptr);
                     *p = VK_NULL_HANDLE;
                 }
             }
-            for (VkPipelineLayout* l : {&pipeline_layout, &shadow_pipeline_layout, &wireframe_pipeline_layout}) {
+            for (VkPipelineLayout* l : {&pipeline_layout, &shadow_pipeline_layout, &wireframe_pipeline_layout, &collision_pipeline_layout}) {
                 if (*l != VK_NULL_HANDLE) {
                     vkDestroyPipelineLayout(device, *l, nullptr);
                     *l = VK_NULL_HANDLE;
@@ -477,6 +581,10 @@ namespace lfs::vis {
                 vkDestroyDescriptorSetLayout(device, light_layout, nullptr);
                 light_layout = VK_NULL_HANDLE;
             }
+            if (collision_layout) {
+                vkDestroyDescriptorSetLayout(device, collision_layout, nullptr);
+                collision_layout = VK_NULL_HANDLE;
+            }
             if (sampler != VK_NULL_HANDLE) {
                 vkDestroySampler(device, sampler, nullptr);
                 sampler = VK_NULL_HANDLE;
@@ -485,7 +593,7 @@ namespace lfs::vis {
                 vkDestroySampler(device, shadow_sampler, nullptr);
                 shadow_sampler = VK_NULL_HANDLE;
             }
-            if (transfer_pool != VK_NULL_HANDLE) {
+            if (transfer_pool != VK_NULL_HANDLE && !retain_transfer_pool) {
                 vkDestroyCommandPool(device, transfer_pool, nullptr);
                 transfer_pool = VK_NULL_HANDLE;
             }
@@ -556,7 +664,10 @@ namespace lfs::vis {
             light_b[0].binding = 0;
             light_b[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
             light_b[0].descriptorCount = 1;
-            light_b[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+            light_b[0].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+            if (context->geometryShaderEnabled()) {
+                light_b[0].stageFlags |= VK_SHADER_STAGE_GEOMETRY_BIT;
+            }
             light_b[1].binding = 1;
             light_b[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
             light_b[1].descriptorCount = 1;
@@ -681,7 +792,8 @@ namespace lfs::vis {
             return createShadowTarget(1, shadow_dummy);
         }
 
-        bool createShadowTarget(int resolution, ShadowTarget& out) {
+        bool createShadowTarget(int resolution, ShadowTarget& out,
+                                std::uint64_t mesh_id = 0, std::size_t draw_group = 0) {
             if (resolution <= 0) {
                 return logVkFailure(std::format(
                     "Mesh shadow target resolution must be positive (observed_resolution={}, shadow_format={}, target_address={:#x}) ({}:{})",
@@ -733,7 +845,9 @@ namespace lfs::vis {
                                              "mesh.shadow.depth[{}]",
                                              resolution);
             }
-            out.vram_label = std::format("shadow:{}x{}@{}", resolution, resolution, static_cast<const void*>(&out));
+            out.vram_label = is_dummy ? std::format("shadow:dummy@{}", static_cast<const void*>(this))
+                                      : std::format("shadow:{}x{}@{}#{}:{}", resolution, resolution,
+                                                    static_cast<const void*>(this), mesh_id, draw_group);
             vmaSetAllocationName(allocator, out.alloc,
                                  is_dummy ? "Mesh shadow dummy depth" : "Mesh shadow depth");
             lfs::diagnostics::VramProfiler::instance().recordCurrentBytes(
@@ -1299,7 +1413,8 @@ namespace lfs::vis {
             for (auto& mat : m.materials) {
                 destroyMaterial(mat);
             }
-            destroyShadow(m.shadow);
+            for (auto& shadow : m.shadows)
+                destroyShadow(shadow.target);
             m = {};
         }
 
@@ -1307,25 +1422,38 @@ namespace lfs::vis {
             using namespace viewport_shaders;
 
             VkShaderModule vert = createShaderModule(device, kMeshVertSpv, "Mesh");
+            VkShaderModule geom = context->geometryShaderEnabled()
+                                      ? createShaderModule(device, kMeshGeomSpv, "Mesh")
+                                      : VK_NULL_HANDLE;
             VkShaderModule frag = createShaderModule(device, kMeshFragSpv, "Mesh");
-            if (vert == VK_NULL_HANDLE || frag == VK_NULL_HANDLE) {
+            if (vert == VK_NULL_HANDLE || frag == VK_NULL_HANDLE ||
+                (context->geometryShaderEnabled() && geom == VK_NULL_HANDLE)) {
                 if (vert)
                     vkDestroyShaderModule(device, vert, nullptr);
+                if (geom)
+                    vkDestroyShaderModule(device, geom, nullptr);
                 if (frag)
                     vkDestroyShaderModule(device, frag, nullptr);
                 LOG_ERROR("VulkanMeshPass: main shader module creation failed");
                 return false;
             }
 
-            std::array<VkPipelineShaderStageCreateInfo, 2> stages{};
+            std::array<VkPipelineShaderStageCreateInfo, 3> stages{};
             stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
             stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
             stages[0].module = vert;
             stages[0].pName = "main";
-            stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-            stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-            stages[1].module = frag;
-            stages[1].pName = "main";
+            std::uint32_t stage_count = 1;
+            if (geom != VK_NULL_HANDLE) {
+                stages[stage_count].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+                stages[stage_count].stage = VK_SHADER_STAGE_GEOMETRY_BIT;
+                stages[stage_count].module = geom;
+                stages[stage_count++].pName = "main";
+            }
+            stages[stage_count].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+            stages[stage_count].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+            stages[stage_count].module = frag;
+            stages[stage_count++].pName = "main";
 
             VkVertexInputBindingDescription binding{};
             binding.binding = 0;
@@ -1398,6 +1526,8 @@ namespace lfs::vis {
                 vkCreatePipelineLayout(device, &layout_info, nullptr, &pipeline_layout);
             if (layout_result != VK_SUCCESS) {
                 vkDestroyShaderModule(device, vert, nullptr);
+                if (geom)
+                    vkDestroyShaderModule(device, geom, nullptr);
                 vkDestroyShaderModule(device, frag, nullptr);
                 return reportVkFailure(
                     "vkCreatePipelineLayout(device, &layout_info, nullptr, &pipeline_layout)",
@@ -1425,7 +1555,17 @@ namespace lfs::vis {
             // Mesh vertices use the same GL-convention projection matrices as FastGS,
             // then receive a clip-space Y correction before Vulkan's positive-height
             // viewport. That preserves normal CCW winding for back-face culling.
-            const auto build = [&](VkCullModeFlags cull, VkPipeline& out) -> bool {
+            const auto build = [&](VkCullModeFlags cull,
+                                   const bool alpha_blend,
+                                   VkPipeline& out) -> bool {
+                depth.depthWriteEnable = alpha_blend ? VK_FALSE : VK_TRUE;
+                blend_attachment.blendEnable = alpha_blend ? VK_TRUE : VK_FALSE;
+                blend_attachment.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+                blend_attachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+                blend_attachment.colorBlendOp = VK_BLEND_OP_ADD;
+                blend_attachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+                blend_attachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+                blend_attachment.alphaBlendOp = VK_BLEND_OP_ADD;
                 VkPipelineRasterizationStateCreateInfo raster{};
                 raster.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
                 raster.polygonMode = VK_POLYGON_MODE_FILL;
@@ -1436,7 +1576,7 @@ namespace lfs::vis {
                 VkGraphicsPipelineCreateInfo pipeline_info{};
                 pipeline_info.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
                 pipeline_info.pNext = &rendering_info;
-                pipeline_info.stageCount = 2;
+                pipeline_info.stageCount = stage_count;
                 pipeline_info.pStages = stages.data();
                 pipeline_info.pVertexInputState = &vertex_input;
                 pipeline_info.pInputAssemblyState = &input_assembly;
@@ -1468,9 +1608,13 @@ namespace lfs::vis {
                 return true;
             };
 
-            const bool ok = build(VK_CULL_MODE_BACK_BIT, pipeline_cull) &&
-                            build(VK_CULL_MODE_NONE, pipeline_no_cull);
+            const bool ok = build(VK_CULL_MODE_BACK_BIT, false, pipeline_cull) &&
+                            build(VK_CULL_MODE_NONE, false, pipeline_no_cull) &&
+                            build(VK_CULL_MODE_BACK_BIT, true, pipeline_cull_blend) &&
+                            build(VK_CULL_MODE_NONE, true, pipeline_no_cull_blend);
             vkDestroyShaderModule(device, vert, nullptr);
+            if (geom)
+                vkDestroyShaderModule(device, geom, nullptr);
             vkDestroyShaderModule(device, frag, nullptr);
             if (!ok) {
                 return false;
@@ -1481,6 +1625,12 @@ namespace lfs::vis {
             context->setDebugObjectName(VK_OBJECT_TYPE_PIPELINE,
                                         pipeline_no_cull,
                                         "mesh.main.pipeline.no_cull");
+            context->setDebugObjectName(VK_OBJECT_TYPE_PIPELINE,
+                                        pipeline_cull_blend,
+                                        "mesh.main.pipeline.cull.blend");
+            context->setDebugObjectName(VK_OBJECT_TYPE_PIPELINE,
+                                        pipeline_no_cull_blend,
+                                        "mesh.main.pipeline.no_cull.blend");
             return true;
         }
 
@@ -1633,22 +1783,34 @@ namespace lfs::vis {
             return true;
         }
 
-        bool createWireframePipeline(VkFormat color_format, VkFormat depth_format) {
-            if (context == nullptr || !context->hasFillModeNonSolid()) {
+        bool createOverlayPipeline(VkFormat color_format, VkFormat depth_format, bool collision = false) {
+            if (collision) {
+                collision_pipeline_attempted = true;
+                VkDescriptorSetLayoutBinding binding{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+                const VkDescriptorSetLayoutCreateInfo descriptors{
+                    VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr, 0, 1, &binding};
+                if (!vk_try_bool(vkCreateDescriptorSetLayout(device, &descriptors, nullptr, &collision_layout),
+                                 "vkCreateDescriptorSetLayout", "Collision preview descriptor layout"))
+                    return false;
+            }
+            if (!collision && (context == nullptr || !context->hasFillModeNonSolid())) {
                 // VK_POLYGON_MODE_LINE is optional. Keep the pass usable on
                 // conformant devices that do not expose fillModeNonSolid; the UI
                 // reports the same capability and does not offer the overlay.
                 return true;
             }
             using namespace viewport_shaders;
-            VkShaderModule vert = createShaderModule(device, kMeshWireframeVertSpv, "Mesh");
-            VkShaderModule frag = createShaderModule(device, kMeshWireframeFragSpv, "Mesh");
+            const auto label = collision ? "Collision preview" : "Mesh wireframe";
+            auto& target_layout = collision ? collision_pipeline_layout : wireframe_pipeline_layout;
+            auto& target_pipeline = collision ? collision_pipeline : wireframe_pipeline;
+            const auto vert = createShaderModule(device, collision ? std::span<const uint32_t>(kCollisionOverlayVertSpv) : std::span<const uint32_t>(kMeshWireframeVertSpv), label);
+            const auto frag = createShaderModule(device, collision ? std::span<const uint32_t>(kCollisionOverlayFragSpv) : std::span<const uint32_t>(kMeshWireframeFragSpv), label);
             if (vert == VK_NULL_HANDLE || frag == VK_NULL_HANDLE) {
                 if (vert)
                     vkDestroyShaderModule(device, vert, nullptr);
                 if (frag)
                     vkDestroyShaderModule(device, frag, nullptr);
-                LOG_ERROR("VulkanMeshPass: wireframe shader module creation failed");
+                LOG_ERROR("{} shader module creation failed", label);
                 return false;
             }
 
@@ -1673,9 +1835,9 @@ namespace lfs::vis {
             attr.offset = offsetof(MeshVertex, position);
             VkPipelineVertexInputStateCreateInfo vertex_input{};
             vertex_input.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-            vertex_input.vertexBindingDescriptionCount = 1;
+            vertex_input.vertexBindingDescriptionCount = collision ? 0 : 1;
             vertex_input.pVertexBindingDescriptions = &binding;
-            vertex_input.vertexAttributeDescriptionCount = 1;
+            vertex_input.vertexAttributeDescriptionCount = collision ? 0 : 1;
             vertex_input.pVertexAttributeDescriptions = &attr;
 
             VkPipelineInputAssemblyStateCreateInfo input_assembly{};
@@ -1689,7 +1851,7 @@ namespace lfs::vis {
 
             VkPipelineRasterizationStateCreateInfo raster{};
             raster.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-            raster.polygonMode = VK_POLYGON_MODE_LINE;
+            raster.polygonMode = collision ? VK_POLYGON_MODE_FILL : VK_POLYGON_MODE_LINE;
             raster.cullMode = VK_CULL_MODE_NONE;
             raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
             raster.lineWidth = 1.0f;
@@ -1698,11 +1860,10 @@ namespace lfs::vis {
             multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
             multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
 
-            // Wireframe sits on top of the shaded mesh — depth test enabled with
-            // OP_LESS_OR_EQUAL but write disabled so the underlying mesh's depth wins.
+            // Wireframe tests the mesh depth; collision is a scene overlay. Neither writes depth.
             VkPipelineDepthStencilStateCreateInfo depth{};
             depth.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-            depth.depthTestEnable = VK_TRUE;
+            depth.depthTestEnable = !collision;
             depth.depthWriteEnable = VK_FALSE;
             depth.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
 
@@ -1710,7 +1871,11 @@ namespace lfs::vis {
             blend_attachment.colorWriteMask =
                 VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
                 VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-            blend_attachment.blendEnable = VK_FALSE;
+            blend_attachment.blendEnable = collision;
+            blend_attachment.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+            blend_attachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+            blend_attachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+            blend_attachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
 
             VkPipelineColorBlendStateCreateInfo blend{};
             blend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
@@ -1721,34 +1886,36 @@ namespace lfs::vis {
                 VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_LINE_WIDTH};
             VkPipelineDynamicStateCreateInfo dynamic{};
             dynamic.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-            dynamic.dynamicStateCount = static_cast<std::uint32_t>(dynamic_states.size());
+            dynamic.dynamicStateCount = collision ? 2 : static_cast<std::uint32_t>(dynamic_states.size());
             dynamic.pDynamicStates = dynamic_states.data();
 
             VkPushConstantRange push{};
-            push.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+            push.stageFlags = collision ? VK_SHADER_STAGE_FRAGMENT_BIT : VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
             push.offset = 0;
-            push.size = sizeof(WireframePush);
+            push.size = collision ? sizeof(CollisionPush) : sizeof(WireframePush);
 
             VkPipelineLayoutCreateInfo layout_info{};
             layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+            layout_info.setLayoutCount = collision ? 1 : 0;
+            layout_info.pSetLayouts = collision ? &collision_layout : nullptr;
             layout_info.pushConstantRangeCount = 1;
             layout_info.pPushConstantRanges = &push;
             const VkResult layout_result =
-                vkCreatePipelineLayout(device, &layout_info, nullptr, &wireframe_pipeline_layout);
+                vkCreatePipelineLayout(device, &layout_info, nullptr, &target_layout);
             if (layout_result != VK_SUCCESS) {
                 vkDestroyShaderModule(device, vert, nullptr);
                 vkDestroyShaderModule(device, frag, nullptr);
                 return reportVkFailure(
-                    "vkCreatePipelineLayout(device, &layout_info, nullptr, &wireframe_pipeline_layout)",
+                    "vkCreatePipelineLayout(device, &layout_info, nullptr, &target_layout)",
                     layout_result,
-                    std::format("Mesh wireframe pipeline-layout creation failed (device={:#x}, set_layout_count={}, push_constant_bytes={})",
-                                vkHandleValue(device),
+                    std::format("{} pipeline-layout creation failed (device={:#x}, set_layout_count={}, push_constant_bytes={})",
+                                label, vkHandleValue(device),
                                 layout_info.setLayoutCount,
                                 push.size));
             }
             context->setDebugObjectName(VK_OBJECT_TYPE_PIPELINE_LAYOUT,
-                                        wireframe_pipeline_layout,
-                                        "mesh.wireframe.pipeline.layout");
+                                        target_layout,
+                                        collision ? "collision.preview.pipeline.layout" : "mesh.wireframe.pipeline.layout");
 
             VkPipelineRenderingCreateInfo rendering_info{};
             rendering_info.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
@@ -1771,26 +1938,26 @@ namespace lfs::vis {
             pipeline_info.pDepthStencilState = &depth;
             pipeline_info.pColorBlendState = &blend;
             pipeline_info.pDynamicState = &dynamic;
-            pipeline_info.layout = wireframe_pipeline_layout;
+            pipeline_info.layout = target_layout;
 
             const VkResult result = vkCreateGraphicsPipelines(device, pipeline_cache, 1,
-                                                              &pipeline_info, nullptr, &wireframe_pipeline);
+                                                              &pipeline_info, nullptr, &target_pipeline);
             vkDestroyShaderModule(device, vert, nullptr);
             vkDestroyShaderModule(device, frag, nullptr);
             if (result != VK_SUCCESS) {
                 return reportVkFailure(
-                    "vkCreateGraphicsPipelines(device, pipeline_cache, 1, &pipeline_info, nullptr, &wireframe_pipeline)",
+                    "vkCreateGraphicsPipelines(device, pipeline_cache, 1, &pipeline_info, nullptr, &target_pipeline)",
                     result,
-                    std::format("Mesh wireframe graphics-pipeline creation failed (device={:#x}, pipeline_cache={:#x}, pipeline_layout={:#x}, color_format={}, depth_format={})",
-                                vkHandleValue(device),
+                    std::format("{} graphics-pipeline creation failed (device={:#x}, pipeline_cache={:#x}, pipeline_layout={:#x}, color_format={}, depth_format={})",
+                                label, vkHandleValue(device),
                                 vkHandleValue(pipeline_cache),
-                                vkHandleValue(wireframe_pipeline_layout),
+                                vkHandleValue(target_layout),
                                 static_cast<int>(color_format),
                                 static_cast<int>(depth_format)));
             }
             context->setDebugObjectName(VK_OBJECT_TYPE_PIPELINE,
-                                        wireframe_pipeline,
-                                        "mesh.wireframe.pipeline");
+                                        target_pipeline,
+                                        collision ? "collision.preview.pipeline" : "mesh.wireframe.pipeline");
             return true;
         }
 
@@ -1858,6 +2025,7 @@ namespace lfs::vis {
             const bool has_normal = uploadTextureFromMesh(mesh, mat.normal_tex, out.normal, "normal");
             const bool has_mr = uploadTextureFromMesh(mesh, mat.metallic_roughness_tex, out.metallic_roughness, "metallic_roughness");
             const bool has_vc = mesh.has_colors();
+            out.alpha_mode = mat.alpha_mode;
 
             MaterialUbo ubo{};
             ubo.base_color[0] = mat.base_color.r;
@@ -1873,6 +2041,8 @@ namespace lfs::vis {
             ubo.roughness_flags[2] = has_normal ? 1.0f : 0.0f;
             ubo.roughness_flags[3] = has_mr ? 1.0f : 0.0f;
             ubo.vertex_color_flags[0] = has_vc ? 1.0f : 0.0f;
+            ubo.vertex_color_flags[1] = mat.alpha_mode == lfs::core::AlphaMode::Mask ? 1.0f : 0.0f;
+            ubo.vertex_color_flags[2] = mat.alpha_cutoff;
             if (!writeBuffer(out.ubo_alloc, &ubo, sizeof(ubo))) {
                 destroyMaterial(out);
                 return false;
@@ -2215,7 +2385,6 @@ namespace lfs::vis {
                     return false;
                 }
             }
-
             // Submeshes — fall back to single submesh covering all indices
             if (!mesh.submeshes.empty()) {
                 gpu.submeshes.reserve(mesh.submeshes.size());
@@ -2226,6 +2395,17 @@ namespace lfs::vis {
                 }
             } else {
                 gpu.submeshes.push_back({0, gpu.total_index_count, 0});
+            }
+            gpu.blend_submesh_count = 0;
+            for (const auto& submesh : gpu.submeshes) {
+                const auto material_index = std::min(
+                    static_cast<std::size_t>(submesh.material_index),
+                    gpu.materials.size() - 1);
+                if (submesh.index_count != 0 &&
+                    gpu.materials[material_index].alpha_mode ==
+                        lfs::core::AlphaMode::Blend) {
+                    ++gpu.blend_submesh_count;
+                }
             }
 
             gpu.aabb_min = aabb_min;
@@ -2246,9 +2426,10 @@ namespace lfs::vis {
             ubo.camera_pos[1] = params.camera_position.y;
             ubo.camera_pos[2] = params.camera_position.z;
             ubo.camera_pos[3] = 1.0f;
-            ubo.light_dir[0] = item.light_dir.x;
-            ubo.light_dir[1] = item.light_dir.y;
-            ubo.light_dir[2] = item.light_dir.z;
+            const glm::vec3 light_dir = item.camera_relative_light ? params.camera_backward : item.light_dir;
+            ubo.light_dir[0] = light_dir.x;
+            ubo.light_dir[1] = light_dir.y;
+            ubo.light_dir[2] = light_dir.z;
             ubo.light_dir[3] = 0.0f;
             ubo.params[0] = item.light_intensity;
             ubo.params[1] = item.ambient;
@@ -2256,10 +2437,29 @@ namespace lfs::vis {
             ubo.params[3] = 0.0f;
             ubo.selection[0] = item.is_emphasized ? 1.0f : 0.0f;
             ubo.selection[1] = item.dim_non_emphasized ? 1.0f : 0.0f;
-            ubo.selection[2] = item.flash_intensity;
+            ubo.selection[2] = 0.0f;
             ubo.selection[3] = 0.0f;
             std::memcpy(ubo.light_vp, &light_vp[0][0], sizeof(ubo.light_vp));
-            return writeBuffer(resources.allocation, &ubo, sizeof(ubo));
+            ubo.camera_forward[0] = -params.camera_backward.x;
+            ubo.camera_forward[1] = -params.camera_backward.y;
+            ubo.camera_forward[2] = -params.camera_backward.z;
+            ubo.depth_view[0] = params.depth_view ? 1.0f : 0.0f;
+            ubo.depth_view[1] = params.depth_view_min;
+            ubo.depth_view[2] = params.depth_view_max;
+            ubo.depth_view[3] = params.depth_grayscale ? 1.0f : 0.0f;
+            const VulkanMeshViewportPanel* projection_state =
+                params.draw_group < params.panels.size() ? &params.panels[params.draw_group] : nullptr;
+            const bool equirectangular = projection_state && projection_state->equirectangular;
+            ubo.selection[2] = equirectangular ? 1.0f : 0.0f;
+            if (equirectangular) {
+                std::memcpy(ubo.view, &projection_state->view[0][0], sizeof(ubo.view));
+                glm::mat4 clip_y_flip(1.0f);
+                clip_y_flip[1][1] = -1.0f;
+                const glm::mat4 projection = clip_y_flip * projection_state->projection;
+                std::memcpy(ubo.projection, &projection[0][0], sizeof(ubo.projection));
+            }
+            const std::size_t upload_size = equirectangular ? sizeof(ubo) : offsetof(LightUbo, view);
+            return writeBuffer(resources.allocation, &ubo, upload_size);
         }
 
         void bindShadowMap(const LightDrawResources& resources, const ShadowTarget& target) const {
@@ -2312,32 +2512,30 @@ namespace lfs::vis {
             return light_proj * light_view;
         }
 
-        bool ensureShadowTarget(GpuMesh& gpu, int resolution) {
-            if (gpu.shadow.image != VK_NULL_HANDLE && gpu.shadow.resolution == resolution) {
+        bool ensureShadowTarget(ShadowState& state, int resolution,
+                                std::uint64_t mesh_id, std::size_t draw_group) {
+            if (state.target.image != VK_NULL_HANDLE && state.target.resolution == resolution) {
                 return true;
             }
             ShadowTarget replacement{};
-            if (!createShadowTarget(resolution, replacement)) {
+            if (!createShadowTarget(resolution, replacement, mesh_id, draw_group)) {
                 return false;
             }
             // The initialization submit above is ordered after all prior graphics work
             // and waited to completion, so the old target is no longer referenced.
-            destroyShadow(gpu.shadow);
-            gpu.shadow = std::move(replacement);
-            gpu.cached_light_vp_valid = false;
+            destroyShadow(state.target);
+            state.target = std::move(replacement);
+            state.cached_light_vp_valid = false;
             return true;
         }
 
-        bool recordShadowPass(GpuMesh& gpu, const glm::mat4& light_mvp) {
-            if (gpu.shadow.image == VK_NULL_HANDLE || shadow_pipeline == VK_NULL_HANDLE) {
-                return false;
-            }
-            VkCommandBuffer cb = beginSingleTimeCommands();
-            if (cb == VK_NULL_HANDLE) {
+        bool recordShadowPass(VkCommandBuffer cb, const GpuMesh& gpu,
+                              const ShadowTarget& shadow, const glm::mat4& light_mvp) {
+            if (cb == VK_NULL_HANDLE || shadow.image == VK_NULL_HANDLE || shadow_pipeline == VK_NULL_HANDLE) {
                 return false;
             }
 
-            cmdImageBarrier2(cb, gpu.shadow.image, depthAspectMask(shadow_format),
+            cmdImageBarrier2(cb, shadow.image, depthAspectMask(shadow_format),
                              VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
                              VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
                              VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT,
@@ -2348,7 +2546,7 @@ namespace lfs::vis {
             clear.depthStencil = {1.0f, 0};
             VkRenderingAttachmentInfo depth_attachment{};
             depth_attachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-            depth_attachment.imageView = gpu.shadow.view;
+            depth_attachment.imageView = shadow.view;
             depth_attachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
             depth_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
             depth_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
@@ -2357,8 +2555,8 @@ namespace lfs::vis {
             VkRenderingInfo rendering{};
             rendering.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
             rendering.renderArea.offset = {0, 0};
-            rendering.renderArea.extent = {static_cast<std::uint32_t>(gpu.shadow.resolution),
-                                           static_cast<std::uint32_t>(gpu.shadow.resolution)};
+            rendering.renderArea.extent = {static_cast<std::uint32_t>(shadow.resolution),
+                                           static_cast<std::uint32_t>(shadow.resolution)};
             rendering.layerCount = 1;
             rendering.pDepthAttachment = &depth_attachment;
             vkCmdBeginRendering(cb, &rendering);
@@ -2366,8 +2564,8 @@ namespace lfs::vis {
             VkViewport vp{};
             vp.x = 0.0f;
             vp.y = 0.0f;
-            vp.width = static_cast<float>(gpu.shadow.resolution);
-            vp.height = static_cast<float>(gpu.shadow.resolution);
+            vp.width = static_cast<float>(shadow.resolution);
+            vp.height = static_cast<float>(shadow.resolution);
             vp.minDepth = 0.0f;
             vp.maxDepth = 1.0f;
             VkRect2D sc{};
@@ -2389,18 +2587,276 @@ namespace lfs::vis {
 
             vkCmdEndRendering(cb);
 
-            cmdImageBarrier2(cb, gpu.shadow.image, depthAspectMask(shadow_format),
+            cmdImageBarrier2(cb, shadow.image, depthAspectMask(shadow_format),
                              VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
                              VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
                              VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
                              VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
                              VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT);
 
-            return endSingleTimeCommands(cb);
+            return true;
+        }
+
+        static bool collisionUploadRetired(const CollisionFrame& frame) {
+            return !frame.pending_upload || vkGetFenceStatus(frame.device, frame.pending_upload) == VK_SUCCESS;
+        }
+
+        void prepareCollision(const VulkanMeshPassParams& params) {
+            using UploadStatus = detail::CollisionUploadStatus;
+            if (auto completed = collision_upload.poll()) {
+                collision_pipeline_ready = collision_pipeline != VK_NULL_HANDLE;
+                const auto& resource = completed->resource;
+                if (completed->status == UploadStatus::Ready) {
+                    collision_cache[resource->owner.get()] = resource;
+                    collision_completed = resource;
+                } else if (completed->status != UploadStatus::Canceled) {
+                    LOG_ERROR("Collision preview upload failed; regenerate the volume to try again");
+                    collision_failed[resource->owner.get()] = resource->owner;
+                    if (!collisionUploadRetired(*resource))
+                        collision_pending = resource;
+                }
+            }
+            if (collision_pending && collisionUploadRetired(*collision_pending))
+                collision_pending.reset();
+            std::erase_if(collision_cache, [](const auto& entry) { return entry.second.expired(); });
+            std::erase_if(collision_failed, [](const auto& entry) { return entry.second.expired(); });
+            if (collision_frames.size() <= params.frame_slot)
+                collision_frames.resize(params.frame_slot + 1);
+            std::vector<std::shared_ptr<CollisionFrame>> resources;
+            const auto groups = params.draw_group_count >= 32 ? ~0u : (1u << params.draw_group_count) - 1u;
+            bool upload_visible = false;
+            for (const auto& item : params.items) {
+                if (!item.collision || !(item.collision_opacity > 0) || params.depth_view || !(item.panel_mask & groups))
+                    continue;
+                if (collision_upload.active() && collision_upload.resource()->owner == item.collision)
+                    upload_visible = true;
+                if (auto found = collision_cache.find(item.collision.get()); found != collision_cache.end()) {
+                    if (auto resource = found->second.lock()) {
+                        resources.push_back(std::move(resource));
+                        continue;
+                    }
+                }
+                if (collision_upload.active() || collision_pending || collision_failed.contains(item.collision.get()))
+                    continue;
+                auto resource = std::make_shared<CollisionFrame>();
+                resource->owner = item.collision;
+                try {
+                    auto upload = [this, color_format = color_format_cached,
+                                   depth_format = depth_format_cached](CollisionFrame& frame, std::stop_token stop) {
+                        auto status = UploadStatus::Failed;
+                        try {
+                            status = uploadCollision(frame, stop, color_format, depth_format);
+                        } catch (const std::exception& error) {
+                            LOG_ERROR("Collision preview upload failed: {}", error.what());
+                            if (!collisionUploadRetired(frame))
+                                status = UploadStatus::PendingFailure;
+                        } catch (...) {
+                            LOG_ERROR("Collision preview upload failed with an unknown exception");
+                            if (!collisionUploadRetired(frame))
+                                status = UploadStatus::PendingFailure;
+                        }
+                        if (status != UploadStatus::Ready && status != UploadStatus::PendingFailure)
+                            frame.release();
+                        return status;
+                    };
+                    collision_upload.start(resource, std::move(upload), collision_wake);
+                    upload_visible = true;
+                } catch (const std::exception& error) {
+                    LOG_ERROR("Could not start collision preview upload: {}", error.what());
+                    collision_failed[item.collision.get()] = item.collision;
+                }
+            }
+            // Replace only the retired slot; other in-flight frames retain their buffers.
+            collision_frames[params.frame_slot] = std::move(resources);
+            collision_completed.reset();
+            if (collision_upload.active() && !upload_visible)
+                collision_upload.cancel();
+        }
+
+        bool submitCollisionCopy(CollisionFrame& frame, VkDeviceSize offset, VkDeviceSize bytes) {
+            // The GUI's mesh transfer pool is externally synchronized and must
+            // never be recorded/reset by this worker. Each upload owns its pool.
+            const VkCommandPoolCreateInfo pool_info{
+                VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, nullptr,
+                VK_COMMAND_POOL_CREATE_TRANSIENT_BIT, context->graphicsQueueFamily()};
+            if (!frame.upload_pool) {
+                if (!vk_try_bool(vkCreateCommandPool(device, &pool_info, nullptr, &frame.upload_pool),
+                                 "vkCreateCommandPool", "Collision preview upload pool"))
+                    return false;
+            } else if (!vk_try_bool(vkResetCommandPool(device, frame.upload_pool, 0),
+                                    "vkResetCommandPool", "Retired collision preview upload pool")) {
+                return false;
+            }
+            const VkCommandBufferAllocateInfo allocation{
+                VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, nullptr,
+                frame.upload_pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1};
+            VkCommandBuffer commands = VK_NULL_HANDLE;
+            if (!vk_try_bool(vkAllocateCommandBuffers(device, &allocation, &commands),
+                             "vkAllocateCommandBuffers", "Collision preview upload command"))
+                return false;
+            const VkCommandBufferBeginInfo begin{
+                VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, nullptr,
+                VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, nullptr};
+            if (!vk_try_bool(vkBeginCommandBuffer(commands, &begin),
+                             "vkBeginCommandBuffer", "Collision preview upload begin"))
+                return false;
+            const VkBufferCopy copy{0, offset, bytes};
+            vkCmdCopyBuffer(commands, frame.staging, frame.buffer, 1, &copy);
+            const VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+                                          VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT};
+            vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                                 0, 1, &barrier, 0, nullptr, 0, nullptr);
+            if (!vk_try_bool(vkEndCommandBuffer(commands), "vkEndCommandBuffer", "Collision preview upload end"))
+                return false;
+            const VkFenceCreateInfo fence_info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+            VkFence fence = VK_NULL_HANDLE;
+            if (!vk_try_bool(vkCreateFence(device, &fence_info, nullptr, &fence),
+                             "vkCreateFence", "Collision preview upload fence"))
+                return false;
+            const VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr,
+                                      0, nullptr, nullptr, 1, &commands, 0, nullptr};
+            const auto submitted = lfs::rendering::vk_queue_submit_synced(graphics_queue, 1, &submit, fence);
+            if (!vk_try_bool(submitted, "vk_queue_submit_synced", "Collision preview upload submit")) {
+                vkDestroyFence(device, fence, nullptr);
+                return false;
+            }
+            frame.pending_upload = fence;
+            return true;
+        }
+
+        detail::CollisionUploadStatus uploadCollision(CollisionFrame& frame, std::stop_token stop,
+                                                      VkFormat color_format, VkFormat depth_format) {
+            using UploadStatus = detail::CollisionUploadStatus;
+            auto status = UploadStatus::Failed;
+            frame.device = device;
+            frame.allocator = allocator;
+            if (stop.stop_requested())
+                return status = UploadStatus::Canceled;
+            if (!collision_pipeline_attempted &&
+                !createOverlayPipeline(color_format, depth_format, true))
+                LOG_ERROR("Collision preview pipeline failed; other rendering is unaffected");
+            if (!collision_pipeline)
+                return status = UploadStatus::Failed;
+            if (stop.stop_requested())
+                return status = UploadStatus::Canceled;
+            const auto& volume = *frame.owner;
+            VkPhysicalDeviceProperties properties{};
+            vkGetPhysicalDeviceProperties(context->physicalDevice(), &properties);
+            const VkDeviceSize bytes = (volume.words.size() + 4) * sizeof(uint32_t);
+            if (bytes > properties.limits.maxStorageBufferRange) {
+                LOG_ERROR("Collision preview requires {} storage bytes; device limit is {}", bytes, properties.limits.maxStorageBufferRange);
+                return status = UploadStatus::Failed;
+            }
+            VkBufferCreateInfo buffer_info{};
+            buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+            buffer_info.size = bytes;
+            buffer_info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+            buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+            constexpr VkDeviceSize upload_chunk = 8 * 1024 * 1024;
+            const bool stream_upload = bytes > upload_chunk;
+            VmaAllocationCreateInfo allocation_info{};
+            allocation_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+            if (!stream_upload)
+                allocation_info.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+                                        VMA_ALLOCATION_CREATE_HOST_ACCESS_ALLOW_TRANSFER_INSTEAD_BIT;
+            if (!vk_try_bool(vmaCreateBuffer(allocator, &buffer_info, &allocation_info,
+                                             &frame.buffer, &frame.allocation, nullptr),
+                             "vmaCreateBuffer", "Collision preview storage buffer"))
+                return status;
+
+            VkMemoryPropertyFlags memory_properties{};
+            vmaGetAllocationMemoryProperties(allocator, frame.allocation, &memory_properties);
+            const bool direct_upload = !stream_upload &&
+                                       (memory_properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0;
+            VmaAllocation upload_allocation = frame.allocation;
+            if (!direct_upload) {
+                buffer_info.size = std::min(bytes, upload_chunk);
+                buffer_info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+                allocation_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+                allocation_info.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
+                if (!vk_try_bool(vmaCreateBuffer(allocator, &buffer_info, &allocation_info,
+                                                 &frame.staging, &frame.staging_allocation, nullptr),
+                                 "vmaCreateBuffer", "Collision preview staging chunk"))
+                    return status;
+                upload_allocation = frame.staging_allocation;
+            }
+
+            const std::array<uint32_t, 4> header{uint32_t(volume.dimensions.x), uint32_t(volume.dimensions.y),
+                                                 uint32_t(volume.dimensions.z), uint32_t(volume.edge)};
+            for (VkDeviceSize offset = 0; offset < bytes; offset += upload_chunk) {
+                if (stop.stop_requested())
+                    return status = UploadStatus::Canceled;
+                const auto count = std::min(upload_chunk, bytes - offset);
+                void* mapped = nullptr;
+                if (!vk_try_bool(vmaMapMemory(allocator, upload_allocation, &mapped),
+                                 "vmaMapMemory", "Collision preview chunk mapping"))
+                    return status;
+                // Direct uploads fit in one chunk. Staging always reuses the
+                // same small host buffer; its GPU copy supplies the destination
+                // offset. Header and payload retain their exact original bytes.
+                if (offset == 0) {
+                    std::memcpy(mapped, header.data(), sizeof(header));
+                    if (count > sizeof(header))
+                        std::memcpy(static_cast<std::byte*>(mapped) + sizeof(header),
+                                    volume.words.data(), static_cast<size_t>(count - sizeof(header)));
+                } else {
+                    std::memcpy(mapped,
+                                reinterpret_cast<const std::byte*>(volume.words.data()) + offset - sizeof(header),
+                                static_cast<size_t>(count));
+                }
+                const VkResult flushed = vmaFlushAllocation(allocator, upload_allocation, 0, count);
+                vmaUnmapMemory(allocator, upload_allocation);
+                if (!vk_try_bool(flushed, "vmaFlushAllocation", "Collision preview chunk flush"))
+                    return status;
+                if (direct_upload)
+                    continue;
+                if (!submitCollisionCopy(frame, offset, count))
+                    return status = frame.pending_upload ? UploadStatus::PendingFailure : UploadStatus::Failed;
+                // Wait only on the worker. Once this bounded copy retires, the
+                // ring buffer and private command pool can be reused safely.
+                lfs::rendering::WaitContext wait_context;
+                wait_context.fingerprint = "pass.collision.upload_wait";
+                const auto wait = lfs::rendering::wait_fence_bounded(
+                    device, frame.pending_upload, std::stop_token{},
+                    lfs::rendering::VulkanWaitPolicy{}, wait_context);
+                if (!wait || *wait != lfs::rendering::WaitOutcome::Ready)
+                    return status = UploadStatus::PendingFailure;
+                vkDestroyFence(device, frame.pending_upload, nullptr);
+                frame.pending_upload = VK_NULL_HANDLE;
+            }
+            if (frame.upload_pool) {
+                vkDestroyCommandPool(device, frame.upload_pool, nullptr);
+                frame.upload_pool = VK_NULL_HANDLE;
+            }
+            if (frame.staging) {
+                vmaDestroyBuffer(allocator, frame.staging, frame.staging_allocation);
+                frame.staging = VK_NULL_HANDLE;
+                frame.staging_allocation = VK_NULL_HANDLE;
+            }
+            if (stop.stop_requested())
+                return status = UploadStatus::Canceled;
+            const VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1};
+            const VkDescriptorPoolCreateInfo pool{
+                VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, nullptr, 0, 1, 1, &size};
+            if (!vk_try_bool(vkCreateDescriptorPool(device, &pool, nullptr, &frame.pool),
+                             "vkCreateDescriptorPool", "Collision preview descriptors"))
+                return status;
+            const VkDescriptorSetAllocateInfo allocation{
+                VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, nullptr, frame.pool, 1, &collision_layout};
+            if (!vk_try_bool(vkAllocateDescriptorSets(device, &allocation, &frame.descriptor),
+                             "vkAllocateDescriptorSets", "Collision preview descriptor"))
+                return status;
+            const VkDescriptorBufferInfo buffer{frame.buffer, 0, bytes};
+            const VkWriteDescriptorSet write{
+                VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, frame.descriptor, 0, 0, 1,
+                VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &buffer, nullptr};
+            vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
+            return status = UploadStatus::Ready;
         }
 
         void prepare(const VulkanMeshPassParams& params) {
             ++frame_counter;
+            prepareCollision(params);
             if (!params.items.empty() &&
                 params.draw_group_count > std::numeric_limits<std::size_t>::max() / params.items.size()) {
                 LOG_ERROR("VulkanMeshPass: draw resource count overflow");
@@ -2412,25 +2868,42 @@ namespace lfs::vis {
                           required_draw_resources);
                 return;
             }
+            std::size_t transparent_draw_capacity = 0;
             for (const auto& item : params.items) {
                 if (!item.mesh)
                     continue;
                 auto it = mesh_cache.find(item.mesh->id());
+                GpuMesh* prepared_mesh = nullptr;
                 if (it == mesh_cache.end()) {
                     GpuMesh gpu{};
                     if (uploadMesh(*item.mesh, gpu)) {
                         gpu.last_used_frame = frame_counter;
-                        mesh_cache.emplace(item.mesh->id(), std::move(gpu));
+                        const auto inserted = mesh_cache.emplace(item.mesh->id(), std::move(gpu)).first;
+                        prepared_mesh = &inserted->second;
                     }
                 } else if (it->second.generation != item.mesh->generation()) {
                     if (uploadMesh(*item.mesh, it->second)) {
                         it->second.last_used_frame = frame_counter;
                     }
+                    prepared_mesh = &it->second;
                 } else {
                     it->second.last_used_frame = frame_counter;
+                    prepared_mesh = &it->second;
+                }
+                if (prepared_mesh) {
+                    if (prepared_mesh->blend_submesh_count >
+                        std::numeric_limits<std::size_t>::max() - transparent_draw_capacity) {
+                        LOG_ERROR("VulkanMeshPass: transparent draw capacity overflow");
+                        return;
+                    }
+                    transparent_draw_capacity += prepared_mesh->blend_submesh_count;
                 }
             }
+            if (transparent_draw_capacity > transparent_draws.capacity()) {
+                transparent_draws.reserve(transparent_draw_capacity);
+            }
 
+            VkCommandBuffer shadow_cb = VK_NULL_HANDLE;
             for (const auto& item : params.items) {
                 if (!item.mesh || !item.shadow_enabled || item.shadow_map_resolution <= 0) {
                     continue;
@@ -2440,32 +2913,46 @@ namespace lfs::vis {
                     continue;
                 }
                 auto& gpu = it->second;
-                if (!ensureShadowTarget(gpu, item.shadow_map_resolution)) {
-                    continue;
+                if (gpu.shadows.size() < params.draw_group_count)
+                    gpu.shadows.resize(params.draw_group_count);
+                for (std::size_t group = 0; group < params.draw_group_count; ++group) {
+                    auto& shadow = gpu.shadows[group];
+                    if (!ensureShadowTarget(shadow, item.shadow_map_resolution,
+                                            item.mesh->id(), group))
+                        continue;
+                    const glm::vec3 light_dir = item.camera_relative_light
+                                                    ? (group < params.panels.size() ? params.panels[group].camera_backward
+                                                                                    : params.camera_backward)
+                                                    : item.light_dir;
+                    const bool shadow_dirty =
+                        !shadow.cached_light_vp_valid ||
+                        shadow.key_generation != gpu.generation ||
+                        shadow.key_resolution != item.shadow_map_resolution ||
+                        shadow.key_model != item.model ||
+                        shadow.key_light_dir != light_dir;
+                    if (!shadow_dirty)
+                        continue;
+                    if (shadow_cb == VK_NULL_HANDLE)
+                        shadow_cb = beginSingleTimeCommands();
+                    if (shadow_cb == VK_NULL_HANDLE)
+                        continue;
+                    const glm::mat4 light_vp = computeLightVp(gpu, item.model, light_dir);
+                    if (!recordShadowPass(shadow_cb, gpu, shadow.target, light_vp * item.model)) {
+                        shadow.cached_light_vp_valid = false;
+                        continue;
+                    }
+                    shadow.cached_light_vp = light_vp;
+                    shadow.cached_light_vp_valid = true;
+                    shadow.key_generation = gpu.generation;
+                    shadow.key_resolution = item.shadow_map_resolution;
+                    shadow.key_model = item.model;
+                    shadow.key_light_dir = light_dir;
                 }
-                // recordShadowPass does a blocking GPU submit; only pay it when an input
-                // the shadow map depends on actually changed. A static shadowed mesh then
-                // renders its shadow once instead of every frame.
-                const bool shadow_dirty =
-                    !gpu.cached_light_vp_valid ||
-                    gpu.shadow_key_generation != gpu.generation ||
-                    gpu.shadow_key_resolution != item.shadow_map_resolution ||
-                    gpu.shadow_key_model != item.model ||
-                    gpu.shadow_key_light_dir != item.light_dir;
-                if (!shadow_dirty) {
-                    continue;
-                }
-                const glm::mat4 light_vp = computeLightVp(gpu, item.model, item.light_dir);
-                if (!recordShadowPass(gpu, light_vp * item.model)) {
-                    gpu.cached_light_vp_valid = false;
-                    continue;
-                }
-                gpu.cached_light_vp = light_vp;
-                gpu.cached_light_vp_valid = true;
-                gpu.shadow_key_generation = gpu.generation;
-                gpu.shadow_key_resolution = item.shadow_map_resolution;
-                gpu.shadow_key_model = item.model;
-                gpu.shadow_key_light_dir = item.light_dir;
+            }
+            if (shadow_cb != VK_NULL_HANDLE && !endSingleTimeCommands(shadow_cb)) {
+                for (auto& [_, gpu] : mesh_cache)
+                    for (auto& shadow : gpu.shadows)
+                        shadow.cached_light_vp_valid = false;
             }
 
             constexpr std::uint64_t kEvictAfter = 120;
@@ -2538,9 +3025,7 @@ namespace lfs::vis {
             viewport.height = static_cast<float>(viewport_rect.extent.height);
             viewport.minDepth = 0.0f;
             viewport.maxDepth = 1.0f;
-            VkRect2D scissor{};
-            scissor.offset = viewport_rect.offset;
-            scissor.extent = viewport_rect.extent;
+            const VkRect2D scissor = params.scissor.value_or(viewport_rect);
             vkCmdSetViewport(cb, 0, 1, &viewport);
             vkCmdSetScissor(cb, 0, 1, &scissor);
 
@@ -2557,19 +3042,23 @@ namespace lfs::vis {
             }
             const std::size_t draw_base = params.draw_group * params.items.size();
             auto& frame = lightResourcesForFrame(params.frame_slot);
+            transparent_draws.clear();
             for (std::size_t item_index = 0; item_index < params.items.size(); ++item_index) {
                 const auto& item = params.items[item_index];
-                if (!item.mesh)
+                if (!item.mesh || params.draw_group >= 32 || !((item.panel_mask >> params.draw_group) & 1u))
                     continue;
                 auto it = mesh_cache.find(item.mesh->id());
                 if (it == mesh_cache.end() || it->second.vertex_buffer == VK_NULL_HANDLE) {
                     continue;
                 }
                 auto& gpu = it->second;
-
-                const bool shadow_active = item.shadow_enabled &&
-                                           gpu.shadow.image != VK_NULL_HANDLE &&
-                                           gpu.cached_light_vp_valid;
+                const ShadowState* shadow = params.draw_group < gpu.shadows.size()
+                                                ? &gpu.shadows[params.draw_group]
+                                                : nullptr;
+                const bool shadow_active = item.shadow_enabled && shadow &&
+                                           shadow->target.image != VK_NULL_HANDLE &&
+                                           shadow->target.resolution == item.shadow_map_resolution &&
+                                           shadow->cached_light_vp_valid;
                 const std::size_t draw_index = draw_base + item_index;
                 if (draw_index >= frame.draws.size()) {
                     throw std::logic_error(std::format(
@@ -2598,15 +3087,13 @@ namespace lfs::vis {
                 if (!writeLightUbo(draw,
                                    params,
                                    item,
-                                   shadow_active ? gpu.cached_light_vp : glm::mat4(1.0f),
+                                   shadow_active ? shadow->cached_light_vp : glm::mat4(1.0f),
                                    shadow_active)) {
                     LOG_ERROR("VulkanMeshPass: failed to prepare light state for draw {}", draw_index);
                     continue;
                 }
-                bindShadowMap(draw, shadow_active ? gpu.shadow : shadow_dummy);
+                bindShadowMap(draw, shadow_active ? shadow->target : shadow_dummy);
 
-                VkPipeline main_pipeline = item.backface_culling ? pipeline_cull : pipeline_no_cull;
-                vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, main_pipeline);
                 vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout,
                                         0, 1, &draw.descriptor, 0, nullptr);
 
@@ -2622,12 +3109,38 @@ namespace lfs::vis {
                 vkCmdBindVertexBuffers(cb, 0, 1, &vbuf, &voff);
                 vkCmdBindIndexBuffer(cb, gpu.index_buffer, 0, VK_INDEX_TYPE_UINT32);
 
-                for (const auto& sm : gpu.submeshes) {
+                VkPipeline bound_pipeline = VK_NULL_HANDLE;
+                for (std::size_t submesh_order = 0;
+                     submesh_order < gpu.submeshes.size(); ++submesh_order) {
+                    const auto& sm = gpu.submeshes[submesh_order];
                     if (sm.index_count == 0)
                         continue;
                     const std::size_t mat_idx = std::min(sm.material_index, gpu.materials.size() - 1);
                     const auto& mat = gpu.materials[mat_idx];
                     if (mat.descriptor == VK_NULL_HANDLE) {
+                        continue;
+                    }
+                    const VkPipeline main_pipeline = mat.alpha_mode == lfs::core::AlphaMode::Blend
+                                                         ? (item.backface_culling ? pipeline_cull_blend
+                                                                                  : pipeline_no_cull_blend)
+                                                         : (item.backface_culling ? pipeline_cull
+                                                                                  : pipeline_no_cull);
+                    if (bound_pipeline != main_pipeline) {
+                        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, main_pipeline);
+                        bound_pipeline = main_pipeline;
+                    }
+                    if (mat.alpha_mode == lfs::core::AlphaMode::Blend) {
+                        const glm::vec3 local_center = (gpu.aabb_min + gpu.aabb_max) * 0.5f;
+                        const glm::vec3 world_center = glm::vec3(item.model * glm::vec4(local_center, 1.0f));
+                        transparent_draws.push_back(TransparentDraw{
+                            .mesh = &gpu,
+                            .submesh = &sm,
+                            .item_index = item_index,
+                            .submesh_order = submesh_order,
+                            .draw_index = draw_index,
+                            .view_depth = glm::dot(world_center - params.camera_position,
+                                                   -params.camera_backward),
+                        });
                         continue;
                     }
                     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout,
@@ -2636,7 +3149,7 @@ namespace lfs::vis {
                 }
 
                 // Wireframe overlay drawn on top of the shaded mesh.
-                if (item.wireframe_overlay && wireframe_pipeline != VK_NULL_HANDLE) {
+                if (item.wireframe_overlay && !params.depth_view && wireframe_pipeline != VK_NULL_HANDLE) {
                     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, wireframe_pipeline);
                     const float line_width = context->hasWideLines()
                                                  ? std::clamp(item.wireframe_width,
@@ -2656,6 +3169,95 @@ namespace lfs::vis {
                     vkCmdDrawIndexed(cb, gpu.total_index_count, 1, 0, 0, 0);
                 }
             }
+
+            // Mesh-bound sorting is approximate for intersecting or deeply concave surfaces.
+            std::sort(transparent_draws.begin(), transparent_draws.end(),
+                      [](const TransparentDraw& lhs, const TransparentDraw& rhs) {
+                          if (lhs.view_depth != rhs.view_depth) {
+                              return lhs.view_depth > rhs.view_depth;
+                          }
+                          if (lhs.item_index != rhs.item_index) {
+                              return lhs.item_index < rhs.item_index;
+                          }
+                          return lhs.submesh_order < rhs.submesh_order;
+                      });
+            for (const auto& transparent : transparent_draws) {
+                const auto& item = params.items[transparent.item_index];
+                const auto& gpu = *transparent.mesh;
+                const auto& sm = *transparent.submesh;
+                const auto& mat = gpu.materials[std::min(sm.material_index, gpu.materials.size() - 1)];
+                auto& draw = frame.draws[transparent.draw_index];
+                const ShadowState* shadow = params.draw_group < gpu.shadows.size()
+                                                ? &gpu.shadows[params.draw_group]
+                                                : nullptr;
+                const bool shadow_active = item.shadow_enabled && shadow &&
+                                           shadow->target.image != VK_NULL_HANDLE &&
+                                           shadow->target.resolution == item.shadow_map_resolution &&
+                                           shadow->cached_light_vp_valid;
+                if (!writeLightUbo(draw,
+                                   params,
+                                   item,
+                                   shadow_active ? shadow->cached_light_vp : glm::mat4(1.0f),
+                                   shadow_active)) {
+                    LOG_ERROR("VulkanMeshPass: failed to prepare transparent light state for draw {}",
+                              transparent.draw_index);
+                    continue;
+                }
+                bindShadowMap(draw, shadow_active ? shadow->target : shadow_dummy);
+                const VkPipeline main_pipeline = item.backface_culling
+                                                     ? pipeline_cull_blend
+                                                     : pipeline_no_cull_blend;
+                vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, main_pipeline);
+                vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout,
+                                        0, 1, &draw.descriptor, 0, nullptr);
+                vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout,
+                                        1, 1, &mat.descriptor, 0, nullptr);
+                MeshPushConstants pc{};
+                const glm::mat4 mvp = view_projection * item.model;
+                std::memcpy(pc.mvp, &mvp[0][0], sizeof(pc.mvp));
+                std::memcpy(pc.model, &item.model[0][0], sizeof(pc.model));
+                vkCmdPushConstants(cb, pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT,
+                                   0, sizeof(pc), &pc);
+                VkBuffer vbuf = gpu.vertex_buffer;
+                const VkDeviceSize voff = 0;
+                vkCmdBindVertexBuffers(cb, 0, 1, &vbuf, &voff);
+                vkCmdBindIndexBuffer(cb, gpu.index_buffer, 0, VK_INDEX_TYPE_UINT32);
+                vkCmdDrawIndexed(cb, sm.index_count, 1, sm.start_index, 0, 0);
+            }
+            if (collision_pipeline_ready && !params.depth_view) {
+                for (const auto& item : params.items) {
+                    const auto found = collision_cache.find(item.collision.get());
+                    const auto resource = found == collision_cache.end() ? nullptr : found->second.lock();
+                    if (!resource || item.collision_opacity <= 0 || !resource->descriptor ||
+                        params.draw_group >= 32 || !((item.panel_mask >> params.draw_group) & 1u))
+                        continue;
+                    const auto& frame = *resource;
+                    const auto& volume = *item.collision;
+                    const auto model = glm::scale(glm::translate(item.model, volume.origin), glm::vec3(volume.settings.voxel_size));
+                    const auto grid_to_clip = view_projection * model;
+                    if (!std::isfinite(glm::determinant(grid_to_clip)) || glm::determinant(grid_to_clip) == 0) {
+                        LOG_ERROR("Collision preview requires an invertible node and projection transform");
+                        continue;
+                    }
+                    CollisionPush push{glm::inverse(grid_to_clip)};
+                    const auto* panel = params.draw_group < params.panels.size() ? &params.panels[params.draw_group] : nullptr;
+                    const auto rows = glm::transpose(view_projection);
+                    push.pixel.x = 2.0f / (viewport.height * glm::length(glm::vec3(rows[1])));
+                    push.pixel.y = glm::length(glm::vec3(rows[3])) == 0.0f;
+                    if (panel && panel->equirectangular) {
+                        push.clip_to_grid = glm::inverse(panel->view * model);
+                        push.panorama = {1, panel->projection[3][2] / panel->projection[2][2], 0, 0};
+                    }
+                    const glm::vec3 camera = glm::vec3(glm::inverse(model) * glm::vec4(panel ? panel->camera_position : params.camera_position, 1));
+                    push.panorama.w = glm::all(glm::greaterThanEqual(camera, glm::vec3(0))) &&
+                                      glm::all(glm::lessThan(camera, glm::vec3(volume.dimensions))) && volume.occupied(glm::ivec3(camera));
+                    push.panorama.z = item.collision_opacity;
+                    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, collision_pipeline);
+                    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, collision_pipeline_layout, 0, 1, &frame.descriptor, 0, nullptr);
+                    vkCmdPushConstants(cb, collision_pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
+                    vkCmdDraw(cb, 3, 1, 0, 0);
+                }
+            }
         }
     };
 
@@ -2664,10 +3266,11 @@ namespace lfs::vis {
     VulkanMeshPass::VulkanMeshPass(VulkanMeshPass&&) noexcept = default;
     VulkanMeshPass& VulkanMeshPass::operator=(VulkanMeshPass&&) noexcept = default;
 
-    bool VulkanMeshPass::init(VulkanContext& context, VkFormat color_format, VkFormat depth_stencil_format) {
+    bool VulkanMeshPass::init(VulkanContext& context, VkFormat color_format, VkFormat depth_stencil_format, std::function<void()> collision_wake) {
         if (!impl_) {
             impl_ = std::make_unique<Impl>();
         }
+        impl_->collision_wake = std::move(collision_wake);
         return impl_->init(context, color_format, depth_stencil_format);
     }
 

@@ -11,23 +11,35 @@
 #include "core/splat_data.hpp"
 #include "core/tensor.hpp"
 #include "io/video/video_export_options.hpp"
+#include "sequencer/timeline.hpp"
+#include "shaders/shader_service.hpp"
 #include <expected>
 #include <glm/glm.hpp>
 #include <memory>
 #include <optional>
 #include <vector>
 
+namespace lfs::rendering {
+    struct PointCloudFilterState;
+}
+
 namespace lfs::vis {
     class SceneManager;
-}
+    struct RenderSettings;
+    struct SceneRenderState;
+} // namespace lfs::vis
 
 namespace lfs::vis::gui {
 
     struct VideoExportMeshSnapshot {
         std::shared_ptr<lfs::core::MeshData> mesh;
+        const lfs::core::MeshData* borrowed_mesh = nullptr;
         lfs::core::NodeId node_id = lfs::core::NULL_NODE;
         glm::mat4 transform{1.0f};
         bool is_selected = false;
+        [[nodiscard]] const lfs::core::MeshData* meshData() const {
+            return borrowed_mesh ? borrowed_mesh : mesh.get();
+        }
     };
 
     struct VideoExportCropBoxSnapshot {
@@ -47,12 +59,24 @@ namespace lfs::vis::gui {
         glm::mat4 world_transform{1.0f};
     };
 
+    struct VideoExportCropPolygonSnapshot {
+        lfs::core::NodeId node_id = lfs::core::NULL_NODE;
+        lfs::core::NodeId parent_splat_id = lfs::core::NULL_NODE;
+        int parent_node_index = -1;
+        lfs::core::CropPolygonData data;
+        glm::mat4 world_transform{1.0f};
+    };
+
     struct VideoExportSceneSnapshot {
         std::shared_ptr<lfs::core::SplatData> combined_model;
+        // Valid only during the viewer-thread render that captured it.
+        const lfs::core::SplatData* borrowed_model = nullptr;
         std::shared_ptr<lfs::core::PointCloud> point_cloud;
+        const lfs::core::PointCloud* borrowed_point_cloud = nullptr;
         glm::mat4 point_cloud_transform{1.0f};
         std::vector<VideoExportMeshSnapshot> meshes;
         std::vector<glm::mat4> model_transforms;
+        shaders::EffectScene effect_scene; // of the model slots
         std::vector<int> node_active_sh_degrees;
         std::shared_ptr<lfs::core::Tensor> transform_indices;
         std::shared_ptr<lfs::core::Tensor> selection_mask;
@@ -61,16 +85,43 @@ namespace lfs::vis::gui {
         std::vector<VideoExportCropBoxSnapshot> cropboxes;
         int selected_cropbox_index = -1;
         std::optional<VideoExportEllipsoidSnapshot> active_ellipsoid;
+        // Every crop polygon filters its own splat; point clouds take the selected one, else the only enabled one.
+        std::vector<VideoExportCropPolygonSnapshot> crop_polygons;
+        int selected_crop_polygon_index = -1;
 
         [[nodiscard]] bool hasRenderableContent() const {
-            return (combined_model && combined_model->size() > 0) ||
-                   (point_cloud && point_cloud->size() > 0) ||
+            return (gaussianModel() && gaussianModel()->size() > 0) ||
+                   (pointCloud() && pointCloud()->size() > 0) ||
                    !meshes.empty();
+        }
+
+        [[nodiscard]] const lfs::core::SplatData* gaussianModel() const {
+            return borrowed_model ? borrowed_model : combined_model.get();
+        }
+        [[nodiscard]] const lfs::core::PointCloud* pointCloud() const {
+            return borrowed_point_cloud ? borrowed_point_cloud : point_cloud.get();
         }
     };
 
+    enum class VideoExportCapture { Owned,
+                                    ImmediateRender };
+
     LFS_VIS_API std::expected<VideoExportSceneSnapshot, std::string> captureVideoExportSceneSnapshot(
-        const lfs::vis::SceneManager& scene_manager);
+        const lfs::vis::SceneManager& scene_manager,
+        VideoExportCapture capture = VideoExportCapture::Owned);
+
+    // The crop volume of exported point-cloud frames: the selected or only enabled crop box, else the
+    // active ellipsoid, else the selected or only enabled crop polygon.
+    LFS_VIS_API void applyVideoExportPointCloudFilters(lfs::rendering::PointCloudFilterState& filters,
+                                                       const VideoExportSceneSnapshot& snapshot,
+                                                       const lfs::vis::RenderSettings& render_settings);
+
+    // The scene state exported splat frames render with at timeline `time`, crop volumes included, with
+    // the reveal of `reveal_clip` and the custom effect of `shader_snapshot` placed in the scene of the
+    // snapshot. It points into the snapshot.
+    LFS_VIS_API lfs::vis::SceneRenderState makeVideoExportGaussianSceneState(
+        const VideoExportSceneSnapshot& snapshot, const std::optional<lfs::sequencer::RevealClip>& reveal_clip,
+        const shaders::ShaderFrameSnapshot* shader_snapshot, float time);
 
     LFS_VIS_API void refreshVideoExportMeshTransforms(
         VideoExportSceneSnapshot& snapshot,

@@ -21,6 +21,7 @@
 #include "gui/error_event_bridge.hpp"
 #include "gui/native_panels.hpp"
 #include "gui/panel_registry.hpp"
+#include "gui/panels/python_console_panel.hpp"
 #include "gui/panels/tools_panel.hpp"
 #include "gui/panels/windows_console_utils.hpp"
 #include "gui/string_keys.hpp"
@@ -32,7 +33,9 @@
 #include "operation/undo_history.hpp"
 #include "operator/operator_registry.hpp"
 #include "operator/ops/align_ops.hpp"
+#include "operator/ops/crop_polygon_ops.hpp"
 #include "operator/ops/edit_ops.hpp"
+#include "operator/ops/scale_distance_ops.hpp"
 #include "operator/ops/scene_ops.hpp"
 #include "operator/ops/selection_ops.hpp"
 #include "operator/ops/transform_ops.hpp"
@@ -45,16 +48,21 @@
 #include "rendering/scene_upscaler_registry.hpp"
 #include "rendering/vksplat_viewport_renderer.hpp"
 #include "scene/scene_manager.hpp"
+#include "shaders/shader_service.hpp"
 #include "tools/align_tool.hpp"
 #include "tools/builtin_tools.hpp"
+#include "tools/scale_distance_tool.hpp"
 #include "tools/selection_tool.hpp"
 #include "tools/unified_tool_registry.hpp"
+#include "training/training_setup.hpp"
 #include "visualizer/app_store.hpp"
+#include "vr/openxr_service.hpp"
 #include "window/vulkan_context.hpp"
 #include <SDL3/SDL_events.h>
 #include <SDL3/SDL_messagebox.h>
 #include <SDL3/SDL_video.h>
 #include <algorithm>
+#include <bit>
 #include <cassert>
 #include <chrono>
 #include <cmath>
@@ -106,6 +114,12 @@ namespace lfs::vis {
             };
         }
 
+        lfs::ErrorNotification vrNotice(const lfs::ErrorCode code, std::string message,
+                                        const lfs::core::SourceSite site) {
+            return makeFrameNotification(code, lfs::ErrorDomain::App, lfs::Severity::Warning,
+                                         lfs::ErrorSurface::Toast, std::move(message), {}, {}, site, "vr");
+        }
+
         template <typename T>
         [[nodiscard]] lfs::Result<T> visualizerFailure(
             const lfs::ErrorCode code,
@@ -148,6 +162,46 @@ namespace lfs::vis {
 
         constexpr double kResizeSettleMinWaitSeconds = 0.001;
         constexpr double kArenaRetryPollSeconds = 0.004;
+        // The runtime reports session changes only through polled events.
+        constexpr double kVrSessionPollSeconds = 0.01;
+
+        [[nodiscard]] std::uint64_t viewInputFingerprint(const Viewport& viewport,
+                                                         const SceneManager* scene_manager,
+                                                         const RenderingManager* rendering_manager) {
+            std::uint64_t hash = 1469598103934665603ULL;
+            const auto append = [&hash](const std::uint64_t value) {
+                hash ^= value;
+                hash *= 1099511628211ULL;
+            };
+            for (int column = 0; column < 3; ++column) {
+                for (int row = 0; row < 3; ++row)
+                    append(std::bit_cast<std::uint32_t>(viewport.getRotationMatrix()[column][row]));
+            }
+            const auto translation = viewport.getTranslation();
+            for (int axis = 0; axis < 3; ++axis)
+                append(std::bit_cast<std::uint32_t>(translation[axis]));
+            append(static_cast<std::uint32_t>(viewport.windowSize.x));
+            append(static_cast<std::uint32_t>(viewport.windowSize.y));
+            append(static_cast<std::uint32_t>(viewport.frameBufferSize.x));
+            append(static_cast<std::uint32_t>(viewport.frameBufferSize.y));
+            // These generations cover inputs that do not live on Viewport:
+            // loaded/model data, selection, and render settings (including
+            // depth, split/GT comparison, and overlay toggles).
+            const auto& store = app_store();
+            append(store.scene_generation.get());
+            append(store.selection_generation.get());
+            append(store.render_settings_generation.get());
+            if (scene_manager) {
+                append(scene_manager->getScene().renderGeneration());
+                append(scene_manager->getScene().selectionGeneration());
+                append(scene_manager->selectionState().generation());
+            }
+            if (rendering_manager) {
+                const auto settings = rendering_manager->getSettings();
+                append(static_cast<std::uint64_t>(settings.split_view_mode));
+            }
+            return hash;
+        }
         constexpr double kTooltipRevealMinWaitSeconds = 0.001;
         constexpr double kScheduledRedrawMinWaitSeconds = 0.001;
         constexpr double kGuiScheduledUpdateMinWaitSeconds = 0.001;
@@ -168,7 +222,8 @@ namespace lfs::vis {
                    node.type == core::NodeType::POINTCLOUD ||
                    node.type == core::NodeType::SPLAT ||
                    node.type == core::NodeType::CROPBOX ||
-                   node.type == core::NodeType::ELLIPSOID;
+                   node.type == core::NodeType::ELLIPSOID ||
+                   node.type == core::NodeType::CROP_POLYGON;
         }
 
         [[nodiscard]] std::unordered_map<std::string, glm::mat4> collectResetTransforms(const core::Scene& scene) {
@@ -250,7 +305,8 @@ namespace lfs::vis {
           window_manager_(std::make_unique<WindowManager>(options.title, options.width, options.height,
                                                           options.monitor_x, options.monitor_y,
                                                           options.monitor_width, options.monitor_height,
-                                                          options.graphics_backend)) {
+                                                          options.graphics_backend)),
+          vr_(std::make_unique<vr::OpenXrService>()) {
         viewer_thread_id_ = std::this_thread::get_id();
 
         LOG_DEBUG("Creating visualizer with window size {}x{}", options.width, options.height);
@@ -270,6 +326,14 @@ namespace lfs::vis {
         rendering_manager_->setWakeCallback([this] {
             wakeMainLoop();
         });
+        shader_service_ = std::make_unique<shaders::ShaderService>(
+            scene_manager_->getScene(),
+            shaders::slangHostLinker(lfs::core::getResourceBaseDir() / "shaders" / "vulkan_rasterizer" / "user" /
+                                     "manifest.json"),
+            [this] { wakeMainLoop(); });
+        gui::panels::PythonConsoleState::getInstance().setShaderChanges(shader_service_->changes());
+        rendering_manager_->setShaderService(shader_service_.get());
+        gui_manager_->sequencer().setShaderService(shader_service_.get());
 
         // Set initial antialiasing
         RenderSettings initial_settings;
@@ -328,7 +392,9 @@ namespace lfs::vis {
         op::operators().setSceneManager(scene_manager_.get());
         op::registerTransformOperators();
         op::registerAlignOperators();
+        op::registerScaleDistanceOperators();
         op::registerSelectionOperators();
+        op::registerCropPolygonOperators();
         op::registerEditOperators();
         op::registerSceneOperators();
 
@@ -361,7 +427,9 @@ namespace lfs::vis {
         // Clear operator system
         op::unregisterEditOperators();
         op::unregisterSceneOperators();
+        op::unregisterCropPolygonOperators();
         op::unregisterSelectionOperators();
+        op::unregisterScaleDistanceOperators();
         op::unregisterAlignOperators();
         op::unregisterTransformOperators();
         op::operators().clear();
@@ -373,6 +441,7 @@ namespace lfs::vis {
         editor_context_.setActiveTool(ToolType::None);
         editor_context_.clearActiveOperator();
         trainer_manager_.reset();
+        training_memory_detail::shutdownHeapTrimWorker();
         tool_context_.reset();
         if (gui_manager_) {
             gui_manager_->shutdown();
@@ -420,6 +489,14 @@ namespace lfs::vis {
             input_controller_->setAlignTool(align_tool_);
         }
 
+        scale_distance_tool_ = std::make_shared<tools::ScaleDistanceTool>();
+        if (!scale_distance_tool_->initialize(*tool_context_)) {
+            LOG_ERROR("Failed to initialize scale distance tool");
+            scale_distance_tool_.reset();
+        } else if (input_controller_) {
+            input_controller_->setScaleDistanceTool(scale_distance_tool_);
+        }
+
         selection_tool_ = std::make_shared<tools::SelectionTool>();
         if (!selection_tool_->initialize(*tool_context_)) {
             LOG_ERROR("Failed to initialize selection tool");
@@ -455,6 +532,20 @@ namespace lfs::vis {
         });
         callback_cleanup_.add([] { python::set_scene_generation_callback(nullptr); });
         app_store().scene_generation.set(python::get_scene_generation());
+        // RuntimeState writes publish view inputs just like native edits. Drain
+        // these subscriptions before planning the frame, including Python writes.
+        const auto bind_view_input = [this](auto& signal, const DirtyMask flags, const FrameReason reason) {
+            auto token = std::make_shared<core::reactive::SubscriptionToken>(
+                signal.subscribe([this, flags, reason](const auto&) {
+                    rendering_manager_->markDirty(flags, reason, "runtime_state");
+                }));
+            callback_cleanup_.add([token] { token->reset(); });
+        };
+        // Scene publishes geometry invalidation directly. Its UI generation also
+        // changes for matrices, which must retain the resident splat inputs.
+        bind_view_input(app_store().scene_generation, DirtyFlag::MESH | DirtyFlag::OVERLAY, FrameReason::SceneChange);
+        bind_view_input(app_store().selection_generation, DirtyFlag::SELECTION | DirtyFlag::OVERLAY, FrameReason::Selection);
+        bind_view_input(app_store().render_settings_generation, DirtyFlag::ALL, FrameReason::SettingsChange);
         auto active_tool_poll_cache_token = std::make_shared<core::reactive::SubscriptionToken>(
             app_store().active_tool.subscribe([](const std::string&) {
                 gui::PanelRegistry::instance().invalidate_poll_cache();
@@ -561,6 +652,7 @@ namespace lfs::vis {
                 state.outcome = tasks.getExportOutcome();
                 state.path = core::path_to_utf8(tasks.getExportPath());
                 state.error = tasks.getExportError();
+                state.warning = app_store().export_progress_state.get().warning;
                 state.commit_uuid = tasks.getExportCommitUuid();
                 const auto fmt = tasks.getExportFormat();
                 state.format = fmt == core::ExportFormat::PLY                                                                                                                                              ? "PLY"
@@ -688,7 +780,8 @@ namespace lfs::vis {
             []() -> bool {
                 auto* gm = python::get_gui_manager();
                 return gm ? (gm->sequencer().timeline().realKeyframeCount() > 0 ||
-                             gm->sequencer().timeline().hasAnimationClip())
+                             gm->sequencer().timeline().hasAnimationClip() ||
+                             gm->sequencer().timeline().revealClip().has_value())
                           : false;
             },
             [](const std::string& path) -> bool {
@@ -709,7 +802,7 @@ namespace lfs::vis {
             },
             []() {
                 if (auto* gm = python::get_gui_manager()) {
-                    gm->sequencer().clear();
+                    gm->sequencer().clearKeyframes();
                     lfs::core::events::state::KeyframeListChanged{.count = 0}.emit();
                 }
             },
@@ -800,6 +893,12 @@ namespace lfs::vis {
                     state.equirectangular = s.equirectangular;
                 if (s.sequence_fps != last.sequence_fps)
                     state.sequence_fps = s.sequence_fps;
+                if ((s.camera_width != last.camera_width || s.camera_height != last.camera_height) &&
+                    s.camera_width >= 1 && s.camera_width <= 8192 && s.camera_height >= 1 && s.camera_height <= 8192) {
+                    state.camera_width = s.camera_width;
+                    state.camera_height = s.camera_height;
+                    projectMarkSessionChapterCommitted("SEQR");
+                }
             }
 
             s.show_camera_path = state.show_camera_path;
@@ -812,6 +911,11 @@ namespace lfs::vis {
             s.show_film_strip = state.show_film_strip;
             s.equirectangular = state.equirectangular;
             s.sequence_fps = state.sequence_fps;
+            s.camera_width = state.camera_width;
+            s.camera_height = state.camera_height;
+            s.framerate = state.framerate;
+            s.framerate_denominator = state.framerate_denominator;
+            s.export_fit = state.export_fit;
             const auto sel = gm->sequencer().selectedKeyframe();
             s.selected_keyframe = sel.has_value() ? static_cast<int>(*sel) : -1;
             if (!sequencer_ui_last_handed_out_)
@@ -1061,7 +1165,31 @@ namespace lfs::vis {
             if (!rendering_manager_)
                 return std::nullopt;
 
+            if (!window_manager_)
+                return std::nullopt;
+            ViewportRegion region;
+            if (gui_manager_) {
+                const auto pos = gui_manager_->getSceneRenderViewportPos();
+                const auto size = gui_manager_->getSceneRenderViewportSize();
+                region.x = pos.x;
+                region.y = pos.y;
+                region.width = size.x;
+                region.height = size.y;
+            }
+            const RenderingManager::RenderContext capture_context{
+                .viewport = viewport_,
+                .settings = rendering_manager_->getSettings(),
+                .screen_size_px = window_manager_->getFramebufferSize(),
+                .viewport_region = gui_manager_ ? &region : nullptr,
+                .scene_manager = scene_manager_.get(),
+                .vulkan_context = window_manager_->getVulkanContext(),
+                .deterministic_export = true};
+            const auto frame = rendering_manager_->renderVulkanFrame(capture_context);
+            if (!frame.rendered)
+                return std::nullopt;
             auto image = rendering_manager_->captureViewportImage();
+            // The next interactive frame resumes its normal transparency mode.
+            rendering_manager_->markDirty(DirtyFlag::CAMERA, FrameReason::AsyncCompletion);
             if (!image)
                 return std::nullopt;
 
@@ -1081,7 +1209,10 @@ namespace lfs::vis {
                 const std::string previous_upscaler = s.scene_upscaler;
                 const std::string previous_preset = s.scene_upscaler_preset;
                 vis::apply_proxy(s, proxy);
-                rendering_manager_->updateSettings(s);
+                if (const auto result = rendering_manager_->updateSettingsFromUser(s); !result) {
+                    wakeMainLoop();
+                    throw std::invalid_argument(std::string(result.error().user_message()));
+                }
                 const auto& applied = rendering_manager_->getSettings();
                 if (applied.scene_upscaler != previous_upscaler ||
                     applied.scene_upscaler_preset != previous_preset) {
@@ -1131,7 +1262,11 @@ namespace lfs::vis {
         main_loop_->setFrameErrorCallback([this](std::exception_ptr eptr) {
             handleFrameException(std::move(eptr));
         });
-        main_loop_->setFrameCompletedCallback([this]() { onFrameCompleted(); });
+        main_loop_->setFrameCompletedCallback([this]() {
+            onFrameCompleted();
+            if (window_manager_)
+                window_manager_->dispatchNativeDrags([this] { return main_loop_->runModalFrame(); });
+        });
     }
 
     void VisualizerImpl::handleFrameException(std::exception_ptr eptr) noexcept {
@@ -1220,7 +1355,7 @@ namespace lfs::vis {
                 .on_invoke = [this](lfs::OperationId) {
                     frame_state_.on_retry_action();
                     if (rendering_manager_)
-                        rendering_manager_->markDirty(DirtyFlag::ALL);
+                        rendering_manager_->markDirty(DirtyFlag::ALL, lfs::vis::FrameReason::SceneChange);
                     wakeMainLoop();
                 },
             });
@@ -1243,7 +1378,7 @@ namespace lfs::vis {
             .on_invoke = [this](lfs::OperationId) {
                 frame_state_.on_retry_action();
                 if (rendering_manager_)
-                    rendering_manager_->markDirty(DirtyFlag::ALL);
+                    rendering_manager_->markDirty(DirtyFlag::ALL, lfs::vis::FrameReason::SceneChange);
                 wakeMainLoop();
             },
         });
@@ -1317,6 +1452,7 @@ namespace lfs::vis {
     }
 
     void VisualizerImpl::beginShutdown([[maybe_unused]] const std::string_view reason) {
+        exitVr();
         std::vector<WorkItem> pending_work;
         std::vector<WorkItem> pending_render_work;
         {
@@ -1339,6 +1475,14 @@ namespace lfs::vis {
             if (work.cancel)
                 work.cancel();
         }
+        scene_capture_jobs_.cancelAll(true);
+        if (auto* const context = window_manager_ ? window_manager_->getVulkanContext() : nullptr)
+            context->cancelSceneCaptureRequest();
+        if (shader_service_)
+            shader_service_->stop();
+
+        if (gui_manager_)
+            gui_manager_->asyncTasks().shutdownAprilTagScan();
 
         std::function<void()> shutdown_callback;
         {
@@ -1361,6 +1505,22 @@ namespace lfs::vis {
 
         // NOTE: Training control and project-save commands
         // are now handled by TrainerManager::setupEventHandlers()
+
+        cmd::SetVrActive::when([this](const auto& command) {
+            vr_request_ = command.active;
+            wakeMainLoop();
+        });
+        cmd::RecenterVr::when([this](const auto&) { vr_->recenter(); });
+        cmd::SnapTurnVr::when([this](const auto& command) { vr_->snapTurn(command.direction); });
+        cmd::SetVrPreferences::when([this](const auto& command) {
+            auto& preferences = UserPreferences::instance();
+            preferences.setVrPreferences({.enabled = command.enabled,
+                                          .resolution_scale = command.resolution_scale,
+                                          .scene_units_per_meter = command.scene_units_per_meter,
+                                          .move_speed = command.move_speed},
+                                         command.persist);
+            vr_->setMoveSpeed(preferences.vrPreferences().move_speed);
+        });
 
         cmd::ResetTraining::when([this](const auto&) {
             if (!scene_manager_ || !scene_manager_->hasDataset()) {
@@ -1452,7 +1612,7 @@ namespace lfs::vis {
                         : ProjectSwitchDisposition::RequireClean,
                     command.stop_training,
                     command.allow_existing_destination_replacement);
-                last_project_create_succeeded_ = created.has_value();
+                last_project_create_succeeded_ = created.has_value() && !projectCreatePending();
             });
 
         cmd::SwitchToEditMode::when(
@@ -1545,10 +1705,13 @@ namespace lfs::vis {
                 if (path.empty()) {
                     return;
                 }
-                if (auto saved =
-                        command.path.empty()
-                            ? projectSaveAsFromDialog(path, true)
-                            : projectSaveAs(path, true);
+                if (auto saved = command.path.empty()
+                                     ? projectSaveAsFromDialog(
+                                           path, true,
+                                           command.fresh_training_start)
+                                     : projectSaveAs(
+                                           path, true,
+                                           command.fresh_training_start);
                     !saved) {
                     publish_project_error(
                         "Save Project As",
@@ -1871,7 +2034,7 @@ namespace lfs::vis {
         state::CombinedModelBuildReady::when([this](const auto& event) {
             postWork({.run = [this, scene = event.scene] {
                 if (scene_manager_ && scene == &scene_manager_->getScene() && rendering_manager_)
-                    rendering_manager_->markDirty(DirtyFlag::ALL);
+                    rendering_manager_->markDirty(DirtyFlag::ALL, lfs::vis::FrameReason::SceneChange);
             }});
         });
 
@@ -1884,6 +2047,17 @@ namespace lfs::vis {
                     event.mutation_flags);
             }
             wakeMainLoop();
+        });
+
+        state::SceneReplacing::when([this](const auto&) {
+            scene_capture_jobs_.cancelAll();
+            if (auto* const context = window_manager_ ? window_manager_->getVulkanContext() : nullptr)
+                context->cancelSceneCaptureRequest();
+        });
+        state::SceneCleared::when([this](const auto&) {
+            scene_capture_jobs_.cancelAll();
+            if (auto* const context = window_manager_ ? window_manager_->getVulkanContext() : nullptr)
+                context->cancelSceneCaptureRequest();
         });
 
         ui::PointCloudModeChanged::when([this](const auto&) {
@@ -1933,8 +2107,6 @@ namespace lfs::vis {
                 .enabled = false,
                 .voxel_size = 0.01f}
                 .emit();
-
-            LOG_INFO("Switched to splat rendering mode (training started)");
         });
 
         state::TrainingResumed::when([sync_viewer_mip_filter_with_training](const auto&) {
@@ -1971,7 +2143,8 @@ namespace lfs::vis {
             python::update_training_state(true, "running");
         });
 
-        state::TrainingPaused::when([](const auto&) {
+        state::TrainingPaused::when([this](const auto& event) {
+            training_progress_publisher_.publishFinal(event.iteration, trainer_manager_->getNumSplats());
             auto& store = app_store();
             lfs::core::reactive::BatchUpdate batch(store.store());
             store.training_running.set(false);
@@ -1987,7 +2160,8 @@ namespace lfs::vis {
             python::update_training_state(true, "running");
         });
 
-        state::TrainingCompleted::when([](const auto& event) {
+        state::TrainingCompleted::when([this](const auto& event) {
+            training_progress_publisher_.publishFinal(event.iteration, trainer_manager_->getNumSplats());
             const char* state = !event.success       ? "error"
                                 : event.user_stopped ? "stopped"
                                                      : "completed";
@@ -2050,9 +2224,15 @@ namespace lfs::vis {
         if (!window_initialized_) {
             {
                 LOG_TIMER("startup.window_manager.init"); // wraps Vulkan instance/device/swapchain bring-up
-                if (!window_manager_->init()) {
+                if (UserPreferences::instance().vrPreferences().enabled && !vr_->prepare())
+                    LOG_WARN("VR unavailable: {}", vr_->statusDetail());
+                const auto vr_hooks = vr_->available() ? std::optional(vr_->deviceHooks()) : std::nullopt;
+                if (!window_manager_->init(vr_hooks ? &*vr_hooks : nullptr)) {
                     return false;
                 }
+                if (vr_hooks && !window_manager_->deviceHooksError().empty())
+                    vr_->setUnavailable(window_manager_->deviceHooksError());
+                publishVrState();
             }
             window_initialized_ = true;
 
@@ -2139,14 +2319,16 @@ namespace lfs::vis {
     void VisualizerImpl::update() {
         const auto update_started_at = std::chrono::steady_clock::now();
         const bool preload_running_at_start = python::is_plugin_preload_running();
-        update_work_processed_ = false;
         window_manager_->updateWindowSize();
 
         // Completion and allocation validation must also run while minimized.
         if (gui_manager_ && gui_manager_->asyncTasks().hasPendingMainThreadCompletions())
             gui_manager_->asyncTasks().pollImportCompletion();
 
-        motion_only_wake_skipped_ = isMotionOnlyWake();
+        // Shader compiles and publications wake the loop without input.
+        rendering_manager_->syncCustomPrograms();
+
+        motion_only_wake_skipped_ = !vr_active_ && isMotionOnlyWake();
         if (motion_only_wake_skipped_)
             return;
 
@@ -2200,7 +2382,6 @@ namespace lfs::vis {
                 std::lock_guard lock(work_queue_mutex_);
                 work.swap(work_queue_);
             }
-            update_work_processed_ = !work.empty();
             runPostedWork(work, "viewer", viewer_thread_id_);
         }
         if (project_lifecycle_) {
@@ -2216,20 +2397,29 @@ namespace lfs::vis {
         }
         viewport_.frameBufferSize = window_manager_->getFramebufferSize();
 
+        updateVrSession();
+
         // Update editor context state from scene/trainer
         editor_context_.update(scene_manager_.get(), trainer_manager_.get());
+        if (trainer_manager_)
+            trainer_manager_->syncCropBox();
 
         if (pending_training_completion_refresh_frames_ > 0 &&
             (!trainer_manager_ || !trainer_manager_->isTrainingActive())) {
             --pending_training_completion_refresh_frames_;
             if (rendering_manager_) {
-                rendering_manager_->markDirty(DirtyFlag::ALL);
+                rendering_manager_->markDirty(DirtyFlag::ALL, lfs::vis::FrameReason::PythonFrameCallback);
             }
             wakeMainLoop();
         }
 
-        if (selection_tool_ && selection_tool_->isEnabled() && tool_context_) {
-            selection_tool_->update(*tool_context_);
+        if (tool_context_ && !vr_active_) {
+            if (selection_tool_ && selection_tool_->isEnabled())
+                selection_tool_->update(*tool_context_);
+            if (align_tool_ && align_tool_->isEnabled())
+                align_tool_->update(*tool_context_);
+            if (scale_distance_tool_ && scale_distance_tool_->isEnabled())
+                scale_distance_tool_->update(*tool_context_);
         }
 
         if (!gui_frame_rendered_) {
@@ -2242,13 +2432,16 @@ namespace lfs::vis {
             }
         } else if (!pending_dataset_path_.empty()) {
             auto path = std::exchange(pending_dataset_path_, {});
-            LOG_INFO("Queueing dataset import: {}", lfs::core::path_to_utf8(path));
             const auto& params = data_loader_->getParameters();
             cmd::LoadFile{
                 .path = path,
                 .is_dataset = true,
                 .output_path = params.dataset.output_path,
                 .init_path = params.init_path.value_or(std::string{}),
+                .add_splat_paths = params.add_splat_paths,
+                .add_splat_freeze = params.add_splat_freeze,
+                .freeze_lr_scale = params.freeze_lr_scale,
+                .exclude_frozen_add_splats_from_export = params.exclude_frozen_add_splats_from_export,
                 .centralize_dataset = params.dataset.centralize_dataset,
             }
                 .emit();
@@ -2307,6 +2500,8 @@ namespace lfs::vis {
     }
 
     bool VisualizerImpl::hasPendingWork() const {
+        if (scene_capture_jobs_.hasPending())
+            return true;
         std::lock_guard lock(work_queue_mutex_);
         return !work_queue_.empty();
     }
@@ -2382,22 +2577,49 @@ namespace lfs::vis {
     }
 
     VisualizerImpl::FrameDemand VisualizerImpl::collectFrameDemand(const bool viewport_export_locked,
-                                                                   const bool drained_store_dirty,
-                                                                   const bool consume_python_redraw) {
+                                                                   const bool drained_store_dirty) {
         FrameDemand demand;
         demand.viewport_export_locked = viewport_export_locked;
-        demand.scene_dirty = rendering_manager_ && rendering_manager_->pollDirtyState();
-        demand.continuous_input = input_controller_ && input_controller_->isContinuousInputActive();
+        demand.scene_dirty = (rendering_manager_ && rendering_manager_->pollDirtyState()) ||
+                             (vr_active_ && vr_->mirror().rendered);
+        demand.continuous_input = input_controller_ && input_controller_->needsCameraAnimationFrame();
         const bool plugin_preload_running = python::is_plugin_preload_running();
+        const bool scene_playback_active = gui_manager_ &&
+                                           gui_manager_->sequencerUI().controller().isPlaying();
         demand.python_animation = !plugin_preload_running &&
                                   (python::has_frame_callback() ||
-                                   python::has_scene_time_callback());
+                                   (scene_playback_active && python::has_scene_time_callback()));
         demand.python_overlay = !plugin_preload_running && python::has_viewport_draw_handlers();
-        demand.python_redraw = consume_python_redraw ? python::consume_redraw_request()
-                                                     : python::has_redraw_request();
+        demand.python_redraw = python::consume_redraw_request();
         demand.gui_animation = (gui_manager_ && gui_manager_->needsAnimationFrame()) || plugin_preload_running;
+        if (rendering_manager_) {
+            auto& ledger = rendering_manager_->frameDemandLedger();
+            if (demand.gui_animation && !gui_animation_demand_.active()) {
+                gui_animation_demand_ = ledger.hold(
+                    FrameReason::GuiAnimation, FrameScope::Gui, 0, 0, [this] {
+                        return (gui_manager_ && gui_manager_->needsAnimationFrame()) ||
+                               python::is_plugin_preload_running();
+                    },
+                    "visible_gui_animation");
+            } else if (!demand.gui_animation) {
+                gui_animation_demand_.release();
+            }
+            if (demand.python_animation && !python_animation_demand_.active()) {
+                python_animation_demand_ = ledger.hold(
+                    FrameReason::PythonFrameCallback, FrameScope::View, 1, DirtyFlag::ALL,
+                    [this] {
+                        const bool playing = gui_manager_ &&
+                                             gui_manager_->sequencerUI().controller().isPlaying();
+                        return python::has_frame_callback() ||
+                               (playing && python::has_scene_time_callback());
+                    },
+                    python::has_frame_callback() ? "python_frame_callback"
+                                                 : "python_scene_time_callback");
+            } else if (!demand.python_animation) {
+                python_animation_demand_.release();
+            }
+        }
         demand.input_event = inputFrameRequestsRender();
-        demand.posted_work = update_work_processed_;
         demand.render_work = hasPendingRenderWork();
         demand.store_dirty = drained_store_dirty || app_store().store().has_dirty();
         if (auto* vulkan_context = window_manager_ ? window_manager_->getVulkanContext() : nullptr) {
@@ -2418,7 +2640,7 @@ namespace lfs::vis {
         return demand;
     }
 
-    double VisualizerImpl::guiAnimationFrameInterval() const {
+    double VisualizerImpl::displayFrameInterval() const {
         const auto now = std::chrono::steady_clock::now();
         if (display_refresh_queried_at_ != std::chrono::steady_clock::time_point{} &&
             now - display_refresh_queried_at_ < std::chrono::seconds(1))
@@ -2429,38 +2651,78 @@ namespace lfs::vis {
         if (window_manager_ && window_manager_->getWindow()) {
             const SDL_DisplayID display_id = SDL_GetDisplayForWindow(window_manager_->getWindow());
             if (const SDL_DisplayMode* const mode = SDL_GetCurrentDisplayMode(display_id);
-                mode && mode->refresh_rate > 0.0f)
+                mode && std::isfinite(mode->refresh_rate) && mode->refresh_rate > 0.0f)
                 refresh_rate = mode->refresh_rate;
         }
         refresh_rate = std::clamp(refresh_rate, 30.0f, 240.0f);
         gui_animation_frame_interval_ = 1.0 / static_cast<double>(refresh_rate);
+        if (rendering_manager_) {
+            rendering_manager_->frameDemandLedger().setDisplayInterval(
+                std::chrono::duration_cast<FrameClock::duration>(
+                    std::chrono::duration<double>(gui_animation_frame_interval_)));
+        }
         return gui_animation_frame_interval_;
     }
 
-    void VisualizerImpl::waitForNextEvent(const bool is_training) {
+    void VisualizerImpl::waitForNextEvent(const bool is_training, const bool continuous_animation) {
         if (!window_manager_)
             return;
+        if (vr_active_ && vr_->running()) {
+            // xrWaitFrame paces the headset; desktop deadlines would cap it at the monitor rate.
+            window_manager_->pollEvents();
+            return;
+        }
 
-        auto wait_seconds = is_training ? 0.1 : 0.5;
-        std::string timeout_source = is_training ? "training_default" : "idle_default";
+        std::optional<double> wait_seconds;
+        std::string timeout_source = "event";
         const auto consider_timeout = [&wait_seconds, &timeout_source](
                                           const double candidate,
                                           const char* source) {
-            if (candidate < wait_seconds) {
+            if (std::isfinite(candidate) && candidate >= 0.0 &&
+                (!wait_seconds || candidate < *wait_seconds)) {
                 wait_seconds = candidate;
                 timeout_source = source;
             }
         };
+        // A wake for posted work can be consumed while a frame is paced.
+        if (hasPendingWork())
+            consider_timeout(0.0, "viewer_work");
+        if (continuous_animation) {
+            const double elapsed = std::chrono::duration<double>(
+                                       std::chrono::high_resolution_clock::now() - last_frame_time_)
+                                       .count();
+            consider_timeout(std::max(0.0, displayFrameInterval() - elapsed),
+                             "animation_cadence");
+        }
+        if (rendering_manager_) {
+            if (const auto deadline = rendering_manager_->fpsIdleDeadline())
+                consider_timeout(secondsUntilFrameDeadline(*deadline, FrameClock::now()), "fps_idle");
+            if (const auto deadline = rendering_manager_->frameDemandLedger().nextDeadline(
+                    std::chrono::steady_clock::now())) {
+                consider_timeout(secondsUntilFrameDeadline(*deadline, std::chrono::steady_clock::now()),
+                                 "frame_ledger");
+            }
+        }
         if (rendering_manager_ && rendering_manager_->hasPendingViewportResizeSettle()) {
             const double settle_wait = rendering_manager_->secondsUntilViewportResizeSettleReady();
             consider_timeout(std::max(kResizeSettleMinWaitSeconds, settle_wait), "resize_settle");
         }
         if (rendering_manager_ && rendering_manager_->hasParkedArenaRetry())
             consider_timeout(kArenaRetryPollSeconds, "arena_retry");
+        if (vr_active_)
+            consider_timeout(kVrSessionPollSeconds, "vr_session");
+        if (rendering_manager_ && trainer_manager_ && trainer_manager_->isRunning()) {
+            const double settle_wait = rendering_manager_->secondsUntilCameraSettle();
+            if (std::isfinite(settle_wait))
+                consider_timeout(std::max(kScheduledRedrawMinWaitSeconds, settle_wait), "camera_settle");
+        }
         if (rendering_manager_ && trainer_manager_ && trainer_manager_->isRunning())
             consider_timeout(std::max(kScheduledRedrawMinWaitSeconds,
                                       rendering_manager_->secondsUntilTrainingRefresh()),
                              "training_refresh");
+        if (rendering_manager_ && is_training)
+            consider_timeout(rendering_manager_->secondsUntilVksplatScratchRelease(),
+                             "scratch_release");
         if (const auto progress_wait =
                 training_progress_publisher_.secondsUntilDue(std::chrono::steady_clock::now()))
             consider_timeout(std::max(kScheduledRedrawMinWaitSeconds, *progress_wait),
@@ -2492,8 +2754,7 @@ namespace lfs::vis {
             const double flush_wait = std::chrono::duration<double>(
                                           *pipeline_cache_flush_due_ - std::chrono::steady_clock::now())
                                           .count();
-            wait_seconds = std::min(wait_seconds,
-                                    std::max(kScheduledRedrawMinWaitSeconds, flush_wait));
+            consider_timeout(std::max(kScheduledRedrawMinWaitSeconds, flush_wait), "pipeline_cache");
         }
 
         window_manager_->waitEvents(wait_seconds);
@@ -2501,15 +2762,124 @@ namespace lfs::vis {
         last_wake_timeout_source_ = window_manager_->frameInput().had_event ? "none" : timeout_source;
     }
 
+    void VisualizerImpl::publishVrState() {
+        app_store().vr_state.set({.available = vr_->available(), .active = vr_active_, .status_key = vr_->statusKey(), .status_detail = vr_->statusDetail()});
+    }
+
+    void VisualizerImpl::updateVrSession() {
+        const auto request = std::exchange(vr_request_, std::nullopt);
+        if (!vr_active_ && request != true)
+            return;
+        auto* const context = window_manager_ ? window_manager_->getVulkanContext() : nullptr;
+        const bool training = trainer_manager_ &&
+                              (trainer_manager_->isTrainingActive() || trainer_manager_->isCompletionPending());
+        const bool blocked = !context || context->rendererTerminalState() != RendererTerminalState::Running ||
+                             training || !scene_manager_ || scene_manager_->hasDataset() ||
+                             op::operators().hasModalOperator() ||
+                             (gui_manager_ && (gui_manager_->isViewportExportLocked() || gui_manager_->isModalWindowOpen()));
+        if (vr_active_) {
+            if (request == false || blocked || !vr_->active() ||
+                app_store().scene_generation.get() != vr_scene_generation_)
+                exitVr();
+        } else if (blocked || !hasRenderableGaussians(scene_manager_->getModelForRendering())) {
+            lfs::ErrorBus::instance().publish(vrNotice(
+                lfs::ErrorCode::FailedPrecondition,
+                LOC("vr.enter_blocked"),
+                LFS_SOURCE_SITE_CURRENT()));
+        } else {
+            enterVr();
+        }
+    }
+
+    void VisualizerImpl::enterVr() {
+        if (auto started = vr_->start(*window_manager_->getVulkanContext(), viewport_.getRotationMatrix(),
+                                      viewport_.getTranslation());
+            !started) {
+            lfs::ErrorBus::instance().publish(vrNotice(
+                lfs::ErrorCode::Unavailable, LOCF("vr.enter_failed", started.error().user_message()),
+                LFS_SOURCE_SITE_CURRENT()));
+            publishVrState();
+            return;
+        }
+        vr_active_ = true;
+        vr_scene_generation_ = app_store().scene_generation.get();
+        editor_context_.setVrViewing(true);
+        if (input_controller_)
+            input_controller_->setVrViewing(true);
+        vr_saved_settings_ = rendering_manager_->getSettings();
+        rendering_manager_->updateSettings(RenderingManager::vrRenderSettings(*vr_saved_settings_));
+        rendering_manager_->clearVulkanMeshFrame();
+        scene_capture_jobs_.cancelAll();
+        publishVrState();
+    }
+
+    void VisualizerImpl::exitVr() {
+        vr_->stop();
+        if (!vr_active_)
+            return;
+        vr_active_ = false;
+        editor_context_.setVrViewing(false);
+        if (input_controller_)
+            input_controller_->setVrViewing(false);
+        if (rendering_manager_) {
+            // The desktop scene image still points at the left eye.
+            rendering_manager_->viewportInterop().setSceneImage({}, {}, false, 0);
+            auto* const context = window_manager_ ? window_manager_->getVulkanContext() : nullptr;
+            if (context && context->rendererTerminalState() == RendererTerminalState::Running &&
+                context->waitForSubmittedFrames())
+                rendering_manager_->releaseVrResources();
+            if (vr_saved_settings_)
+                rendering_manager_->updateSettings(*vr_saved_settings_);
+            rendering_manager_->markDirty(DirtyFlag::ALL, FrameReason::SceneChange, "vr_exit");
+        }
+        vr_saved_settings_.reset();
+        last_presented_frame_start_.reset();
+        publishVrState();
+    }
+
+    bool VisualizerImpl::renderVrFrame() {
+        auto* const context = window_manager_->getVulkanContext();
+        const glm::vec3 move = input_controller_ ? input_controller_->vrMovement() : glm::vec3(0.0f);
+        const auto frame = vr_->frame(move, [&](const auto& views) {
+            return rendering_manager_->renderVrEyes(*context, *scene_manager_, views);
+        });
+        if (!frame) {
+            LOG_ERROR("VR frame failed: {}", frame.error().user_message());
+            lfs::ErrorBus::instance().publish(vrNotice(
+                lfs::ErrorCode::Unavailable, LOCF("vr.stopped", frame.error().user_message()),
+                LFS_SOURCE_SITE_CURRENT()));
+        }
+        if (!frame || !*frame)
+            exitVr();
+        publishVrState();
+        if (context->rendererTerminalState() != RendererTerminalState::Running) {
+            applyFrameStateEffects(frame_state_.on_renderer_terminal(context->rendererTerminalState()));
+            window_manager_->pollEvents();
+            return false;
+        }
+        // Headset frames run every loop; the desktop mirror and UI stay monitor-paced.
+        if (vr_active_ && last_presented_frame_start_ && !window_manager_->frameInput().hasUserInput() &&
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - *last_presented_frame_start_).count() <
+                displayFrameInterval()) {
+            window_manager_->pollEvents();
+            return false;
+        }
+        return true;
+    }
+
     void VisualizerImpl::render() {
 
         if (auto* const ctx = window_manager_ ? window_manager_->getVulkanContext() : nullptr)
             applyFrameStateEffects(frame_state_.on_renderer_terminal(ctx->rendererTerminalState()));
         if (frame_state_.state() == FrameStateMachine::State::RendererDead) {
+            exitVr();
             // Keep the CPU event and MCP queues responsive without issuing another GPU frame.
+            scene_capture_jobs_.cancelAll();
+            if (auto* const context = window_manager_ ? window_manager_->getVulkanContext() : nullptr)
+                context->cancelSceneCaptureRequest();
             processRenderWorkQueue();
             if (window_manager_)
-                window_manager_->waitEvents(0.1);
+                window_manager_->waitEvents();
             return;
         }
 
@@ -2518,6 +2888,31 @@ namespace lfs::vis {
             window_manager_->pollEvents();
             return;
         }
+        if (vr_active_ && !renderVrFrame())
+            return;
+
+        // Frames no input asked for (GUI animation, Python redraws, training updates) would run far
+        // above the display rate when presenting does not block. Wakes without input start at most
+        // one display interval after the last presented frame started; requests stay queued for this
+        // frame, and work posted meanwhile is picked up by the next wait.
+        // Stochastic refinement is finite work, not a periodic animation. Keep
+        // polling input between samples, but let available GPU slots advance it.
+        const bool refinement_pending = rendering_manager_ &&
+                                        rendering_manager_->frameDemandLedger().hasPendingRequest(
+                                            FrameReason::StochasticAccumulation);
+        if (!vr_active_ && last_presented_frame_start_ && !refinement_pending) {
+            const auto ready_at = *last_presented_frame_start_ +
+                                  std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                      std::chrono::duration<double>(displayFrameInterval()));
+            while (!window_manager_->frameInput().hasUserInput()) {
+                const double remaining =
+                    std::chrono::duration<double>(ready_at - std::chrono::steady_clock::now()).count();
+                if (remaining <= 0.0)
+                    break;
+                window_manager_->waitEvents(remaining);
+            }
+        }
+        const auto frame_started_at = std::chrono::steady_clock::now();
 
         auto now = std::chrono::high_resolution_clock::now();
         float delta_time = std::chrono::duration<float>(now - last_frame_time_).count();
@@ -2538,21 +2933,26 @@ namespace lfs::vis {
         if (!python::is_plugin_preload_running() && python::has_frame_callback()) {
             python::tick_frame_callback(delta_time);
             if (rendering_manager_) {
-                rendering_manager_->markDirty(DirtyFlag::ALL);
+                rendering_manager_->markDirty(DirtyFlag::ALL, lfs::vis::FrameReason::SceneChange);
             }
         }
 
         if (!python::is_plugin_preload_running()) {
-            if (python::has_scene_time_callback()) {
+            const bool scene_playback_active = gui_manager_ &&
+                                               gui_manager_->sequencerUI().controller().isPlaying();
+            if (scene_playback_active && python::has_scene_time_callback()) {
                 live_scene_clip_time_ += delta_time;
                 python::tick_scene_time_callback(live_scene_clip_time_);
                 if (rendering_manager_) {
-                    rendering_manager_->markDirty(DirtyFlag::ALL);
+                    rendering_manager_->markDirty(DirtyFlag::ALL, lfs::vis::FrameReason::Playback);
                 }
             } else {
                 live_scene_clip_time_ = 0.0f;
             }
         }
+
+        if (gui_manager_)
+            gui_manager_->prepareLayout();
 
         // Update input controller with viewport bounds
         if (gui_manager_) {
@@ -2578,6 +2978,9 @@ namespace lfs::vis {
                 input_controller_->update(delta_time);
             }
         }
+        // Event pumps may run more than once before an input update. Acknowledge
+        // navigation edges only here; diagnostics has its own consuming reader.
+        window_manager_->gamepads().consumeNavigationPresses();
 
         if (gui_manager_) {
             gui_manager_->updateInteractiveTransitions();
@@ -2610,14 +3013,16 @@ namespace lfs::vis {
         RenderingManager::RenderContext context{
             .viewport = viewport_,
             .settings = rendering_manager_->getSettings(),
-            .logical_screen_size = window_manager_->getWindowSize(),
+            .screen_size_px = window_manager_->getFramebufferSize(),
             .viewport_region = has_viewport_region ? &viewport_region : nullptr,
             .scene_manager = scene_manager_.get(),
-            .vulkan_context = window_manager_->getVulkanContext()};
+            .vulkan_context = window_manager_->getVulkanContext(),
+            .on_screen = true};
 
         if (gui_manager_) {
             rendering_manager_->setCropboxGizmoActive(gui_manager_->gizmo().isCropboxGizmoActive());
             rendering_manager_->setEllipsoidGizmoActive(gui_manager_->gizmo().isEllipsoidGizmoActive());
+            rendering_manager_->setCropPolygonGizmoActive(gui_manager_->gizmo().isCropPolygonGizmoActive());
         }
 
         bool store_dirty = false;
@@ -2630,14 +3035,78 @@ namespace lfs::vis {
         if (gui_manager_)
             gui_manager_->sequencerUI().tickPlaybackBeforeSceneRender();
 
+        if (scene_capture_jobs_.hasPending()) {
+            const bool has_mesh = scene_manager_ &&
+                                  !scene_manager_->getScene().getVisibleMeshes().empty();
+            if (scene_capture_jobs_.beginFrame(has_mesh)) {
+                context.deterministic_export = true;
+                rendering_manager_->markDirty(DirtyFlag::ALL, FrameReason::AsyncCompletion,
+                                              "viewport_capture");
+            }
+        }
+
         const bool is_training = trainer_manager_ && trainer_manager_->isTrainingActive();
         if (rendering_manager_) {
-            rendering_manager_->pollTrainingRefresh(trainer_manager_ && trainer_manager_->isRunning());
+            rendering_manager_->pollTrainingRefresh(
+                trainer_manager_ && trainer_manager_->isRunning(),
+                trainer_manager_ ? trainer_manager_->getCurrentIteration() : 0);
             rendering_manager_->pollParkedArenaRetry();
         }
         const FrameDemand frame_demand = collectFrameDemand(viewport_export_locked, store_dirty);
-        if (gui_frame_rendered_ && !frame_demand.shouldRenderFrame()) {
-            LOG_PERF("loop_idle skip_gui_render=true needs_render={} continuous_input={} py_anim={} py_overlay={} py_redraw={} gui_anim={} input_event={} posted_work={} render_work={} store_dirty={} swapchain_resize_pending={} swapchain_resize_ready={} window_resize_paint_pending={} viewport_resize_deferring={} viewport_resize_settle_ready={} wake_reason={} wake_timeout_source={}",
+        const std::uint64_t current_view_fingerprint =
+            viewInputFingerprint(viewport_, scene_manager_.get(), rendering_manager_.get());
+        // Reactive state updates can change view inputs without publishing a
+        // render event. Reconcile those inputs before planning the frame, while
+        // preserving existing surgical invalidations and deliberate deferrals.
+        if (has_rendered_view_fingerprint_ &&
+            current_view_fingerprint != last_rendered_view_fingerprint_ &&
+            rendering_manager_->pendingDirtyMask() == 0 &&
+            !frame_demand.viewport_export_locked && !frame_demand.viewport_resize_deferring) {
+            rendering_manager_->markDirty(DirtyFlag::ALL, FrameReason::SceneChange, "view_inputs_changed");
+        }
+        rendering_manager_->refreshIdleFps(FrameClock::now());
+        auto ledger_plan = rendering_manager_->frameDemandLedger().plan(
+            std::chrono::steady_clock::now());
+        if (!ledger_plan.present && frame_demand.shouldRenderFrame()) {
+            const auto reason = frame_demand.gui_animation                ? FrameReason::GuiAnimation
+                                : frame_demand.python_redraw              ? FrameReason::PythonRedraw
+                                : frame_demand.python_animation           ? FrameReason::PythonFrameCallback
+                                : frame_demand.input_event                ? FrameReason::Input
+                                : frame_demand.render_work                ? FrameReason::AsyncCompletion
+                                : frame_demand.store_dirty && is_training ? FrameReason::TrainingProgress
+                                : frame_demand.store_dirty                ? FrameReason::GuiLayout
+                                                                          : FrameReason::SceneChange;
+            const auto scope = frame_demand.scene_dirty || frame_demand.continuous_input ||
+                                       frame_demand.python_animation
+                                   ? FrameScope::View
+                                   : FrameScope::Gui;
+            rendering_manager_->frameDemandLedger().request(FrameRequest{
+                .reason = reason,
+                .scope = scope,
+                .views = 1,
+                .flags = scope == FrameScope::View ? rendering_manager_->pendingDirtyMask() : 0,
+                .detail = "frame_demand"});
+            ledger_plan = rendering_manager_->frameDemandLedger().plan(
+                std::chrono::steady_clock::now());
+        }
+        if (frame_demand.scene_dirty && ledger_plan.present && ledger_plan.render_views == 0) {
+            ledger_plan.render_views = 1;
+            ledger_plan.view_flags[0] |= rendering_manager_->pendingDirtyMask();
+            ledger_plan.reasons.set(static_cast<std::size_t>(FrameReason::SceneChange));
+        }
+        if (!vr_active_ && ledger_plan.render_views == 0 && rendering_manager_)
+            rendering_manager_->releaseIdleVksplatScratch(is_training);
+        if (has_rendered_view_fingerprint_ && ledger_plan.present &&
+            ledger_plan.render_views == 0 &&
+            !frame_demand.viewport_export_locked && !frame_demand.viewport_resize_deferring &&
+            current_view_fingerprint != last_rendered_view_fingerprint_) {
+            rendering_manager_->frameDemandLedger().countStaleView();
+            LOG_ERROR("stale view: view inputs changed without a view render");
+        }
+        if (gui_frame_rendered_ && !ledger_plan.present) {
+            if (scene_capture_jobs_.hasActive())
+                scene_capture_jobs_.cancelActive();
+            LOG_PERF("loop_idle skip_gui_render=true needs_render={} continuous_input={} py_anim={} py_overlay={} py_redraw={} gui_anim={} input_event={} render_work={} store_dirty={} swapchain_resize_pending={} swapchain_resize_ready={} window_resize_paint_pending={} viewport_resize_deferring={} viewport_resize_settle_ready={} wake_reason={} wake_timeout_source={}",
                      frame_demand.scene_dirty,
                      frame_demand.continuous_input,
                      frame_demand.python_animation,
@@ -2645,7 +3114,6 @@ namespace lfs::vis {
                      frame_demand.python_redraw,
                      frame_demand.gui_animation,
                      frame_demand.input_event,
-                     frame_demand.posted_work,
                      frame_demand.render_work,
                      frame_demand.store_dirty,
                      frame_demand.swapchain_resize_pending,
@@ -2658,16 +3126,48 @@ namespace lfs::vis {
             if (!python::is_plugin_preload_running()) {
                 python::flush_signals();
             }
-            if (rendering_manager_) {
-                rendering_manager_->noteVksplatIdleFrame(is_training);
-            }
             waitForNextEvent(is_training);
             return;
         }
 
+        const auto camera_frame_started = std::chrono::steady_clock::now();
+        const DirtyMask pending_dirty = rendering_manager_->pendingDirtyMask();
+        const bool camera_frame = input_controller_ && input_controller_->isCameraNavigating() &&
+                                  (frame_demand.continuous_input || (pending_dirty & DirtyFlag::CAMERA));
+        const auto& input = window_manager_->frameInput();
+        const bool discrete_input = input.window_event || !input.mouse_button_events.empty() ||
+                                    !input.input_events.empty() || !input.keys_pressed.empty() ||
+                                    input.mouse_wheel != 0.0f || input.mouse_wheel_x != 0.0f;
+        const bool camera_animation_only = frame_demand.continuous_input && !input.mouse_moved && !discrete_input &&
+                                           !(pending_dirty & ~(DirtyFlag::CAMERA | DirtyFlag::OVERLAY)) &&
+                                           !frame_demand.viewport_export_locked && !frame_demand.python_animation &&
+                                           !frame_demand.python_overlay && !frame_demand.python_redraw &&
+                                           !frame_demand.render_work && !frame_demand.store_dirty &&
+                                           !frame_demand.swapchain_resize_pending && !frame_demand.window_resize_paint_pending &&
+                                           !frame_demand.viewport_resize_deferring && !frame_demand.viewport_resize_settle_ready &&
+                                           !interactive_transition_settling;
+        if (gui_frame_rendered_ && camera_animation_only) {
+            const double wait = camera_animation_cadence_.secondsUntilReady(camera_frame_started, displayFrameInterval());
+            if (wait > 0.0) {
+                if (scene_capture_jobs_.hasActive())
+                    scene_capture_jobs_.cancelActive();
+                // MAILBOX does not pace autonomous camera motion. Keep its
+                // invalidation until the next display interval. Fresh pointer
+                // and keyboard input bypass this wait and render immediately.
+                window_manager_->waitEvents(std::max(0.001, wait));
+                last_wake_reason_ = window_manager_->frameInput().had_event ? "event" : "timeout";
+                last_wake_timeout_source_ = "camera_animation";
+                return;
+            }
+        }
+        if (camera_frame)
+            camera_animation_cadence_.startFrame(camera_frame_started);
+
+        rendering_manager_->sampleFrameRates(ledger_plan);
         std::optional<std::chrono::steady_clock::time_point>
             project_frame_started;
-        if (!viewport_export_locked && !interactive_transition_settling &&
+        bool capture_view_rendered = false;
+        if (ledger_plan.render_views != 0 && !viewport_export_locked && !interactive_transition_settling &&
             !frame_state_.scene_render_suspended()) {
             if (!python::is_plugin_preload_running() && frame_demand.python_redraw && gui_manager_)
                 gui_manager_->syncVisiblePanelsBeforeSceneRender();
@@ -2677,10 +3177,18 @@ namespace lfs::vis {
             const bool preview_refresh_only =
                 gui_frame_rendered_ && frame_demand.onlySceneDirty() &&
                 rendering_manager_->pendingDirtyMask() == DirtyFlag::SPLATS;
-            const auto vulkan_frame = rendering_manager_->renderVulkanFrame(context);
+            const auto vulkan_frame = vr_active_ ? vr_->mirror() : rendering_manager_->renderVulkanFrame(context);
+            capture_view_rendered = vulkan_frame.rendered;
+            rendering_manager_->retainVksplatScratch();
+            if (vulkan_frame.rendered)
+                rendering_manager_->countViewRendered(ledger_plan);
+            last_rendered_view_fingerprint_ = current_view_fingerprint;
+            has_rendered_view_fingerprint_ = true;
             // A preview refresh parked until training frees the shared scratch
             // changed nothing on screen; present once it has rendered.
             if (preview_refresh_only && rendering_manager_->hasParkedArenaRetry()) {
+                if (scene_capture_jobs_.hasActive())
+                    scene_capture_jobs_.cancelActive();
                 waitForNextEvent(is_training);
                 return;
             }
@@ -2744,18 +3252,49 @@ namespace lfs::vis {
                       frame_demand.store_dirty);
         }
         bool presented_gui_frame = false;
+        if (!capture_view_rendered && scene_capture_jobs_.hasActive())
+            scene_capture_jobs_.cancelActive();
         if (gui_manager_) {
             LOG_TIMER("VisualizerImpl::render.gui_frame_total_with_swapchain_wait");
             window_manager_->updateWindowSize("pre_gui_render");
             presented_gui_frame = gui_manager_->render();
+            if (presented_gui_frame)
+                last_presented_frame_start_ = frame_started_at;
             window_manager_->refreshResizeCursor();
-            // Count presented frames (GUI-only included). Scene FPS still comes
-            // from framerate_controller_ inside renderVulkanFrame; this is
-            // measurement-only and does not affect pacing.
+            // Count only successful presents, including GUI-only frames.
             if (presented_gui_frame && rendering_manager_) {
-                rendering_manager_->notePresentedFrame();
+                rendering_manager_->countPresentedFrame(ledger_plan);
+                std::string reasons;
+                std::string details;
+                DirtyMask flags = 0;
+                for (std::size_t i = 0; i < ledger_plan.reasons.size(); ++i) {
+                    if (!ledger_plan.reasons.test(i))
+                        continue;
+                    if (!reasons.empty())
+                        reasons += ',';
+                    reasons += frameReasonName(static_cast<FrameReason>(i));
+                }
+                for (const auto view_flags : ledger_plan.view_flags)
+                    flags |= view_flags;
+                for (const auto& detail : ledger_plan.details) {
+                    if (!details.empty())
+                        details += ',';
+                    details += detail;
+                }
+                const auto snapshot = rendering_manager_->frameDemandLedger().snapshot();
+                if (ledger_plan.reasons.none())
+                    LOG_ERROR("Presented GUI frame without a frame-demand reason");
+                LOG_PERF("frame #{} reasons={} views=0x{:x} flags=0x{:x} details={} holders={} wait={}",
+                         snapshot.frames_presented,
+                         reasons.empty() ? "none" : reasons,
+                         ledger_plan.render_views,
+                         flags,
+                         details.empty() ? "none" : details,
+                         snapshot.live_holders.size(),
+                         last_wake_reason_);
             }
         } else {
+            completeSceneCaptureFrame(false);
             processRenderWorkQueue();
         }
         if (project_frame_started && project_lifecycle_) {
@@ -2783,108 +3322,25 @@ namespace lfs::vis {
             vksplat_spirv_preload_future_ = std::async(
                 std::launch::async, [] { preloadVkSplatSpirvFiles(); });
         }
-        update_work_processed_ = false;
-
-        // Render-on-demand: VSync handles frame pacing, waitEvents saves CPU when idle
+        // Render-on-demand: demand owns cadence; MAILBOX only retires GPU work.
         // The demand walk is the expensive part of the frame loop (notably the
         // visible Python panel traversal). Reuse the demand collected before the
         // render and refresh only the cheap flags that can be created by the
         // just-finished presentation.
         FrameDemand next_demand = frame_demand;
         next_demand.python_redraw = python::has_redraw_request();
-        next_demand.render_work = hasPendingRenderWork();
+        next_demand.render_work = hasPendingRenderWork() || scene_capture_jobs_.hasPending();
         next_demand.store_dirty = app_store().store().has_dirty();
         last_frame_demand_ = next_demand;
         has_last_frame_demand_ = true;
 
-        // Continuous demand that is only python_redraw and/or gui_animation — pace it
-        // so GUI-only animation does not free-run against a MAILBOX swapchain.
-        const bool gui_only_animation =
-            next_demand.needsContinuousLoop() &&
-            !(gui_manager_ && gui_manager_->needsImmediateAnimationFrame()) &&
-            !python::is_plugin_preload_running() &&
-            !next_demand.scene_dirty && !next_demand.continuous_input &&
-            !next_demand.python_animation && !next_demand.python_overlay &&
-            !next_demand.input_event && !next_demand.posted_work &&
-            !next_demand.render_work && !next_demand.store_dirty &&
-            !next_demand.swapchain_resize_pending && !next_demand.swapchain_resize_ready &&
-            !next_demand.window_resize_paint_pending && !next_demand.viewport_resize_deferring &&
-            !next_demand.viewport_resize_settle_ready && !next_demand.viewport_export_locked;
-
-        const auto py_redraw_due = python::seconds_until_scheduled_redraw();
-        const double py_redraw_due_in = py_redraw_due ? *py_redraw_due : -1.0;
-        const auto poll_time = window_manager_->frameInput().poll_time;
-        const double input_age_ms =
-            poll_time == std::chrono::steady_clock::time_point{}
-                ? 0.0
-                : std::chrono::duration<double, std::milli>(
-                      std::chrono::steady_clock::now() - poll_time)
-                      .count();
-
-        LOG_PERF("loop_end needs_render={} continuous_input={} py_anim={} py_overlay={} py_redraw={} gui_anim={} input_event={} posted_work={} render_work={} store_dirty={} swapchain_resize_pending={} swapchain_resize_ready={} window_resize_paint_pending={} viewport_resize_deferring={} viewport_resize_settle_ready={} gui_only_throttle={} py_redraw_due_in={:.4f} gui_anim_sources={} wake_reason={} wake_timeout_source={} input_age_ms={:.2f}",
-                 next_demand.scene_dirty,
-                 next_demand.continuous_input,
-                 next_demand.python_animation,
-                 next_demand.python_overlay,
-                 next_demand.python_redraw,
-                 next_demand.gui_animation,
-                 next_demand.input_event,
-                 next_demand.posted_work,
-                 next_demand.render_work,
-                 next_demand.store_dirty,
-                 next_demand.swapchain_resize_pending,
-                 next_demand.swapchain_resize_ready,
-                 next_demand.window_resize_paint_pending,
-                 next_demand.viewport_resize_deferring,
-                 next_demand.viewport_resize_settle_ready,
-                 gui_only_animation,
-                 py_redraw_due_in,
-                 gui_manager_ ? gui_manager_->describeAnimationDemand() : std::string{"none"},
-                 last_wake_reason_,
-                 last_wake_timeout_source_,
-                 input_age_ms);
-
-        if (next_demand.needsContinuousLoop()) {
-            if (gui_only_animation) {
-                // GUI-only animation must not free-run against a MAILBOX swapchain.
-                // Cap at the display interval; waitEvents still wakes instantly on input.
-                const double gui_animation_frame_interval = guiAnimationFrameInterval();
-                if (presented_gui_frame) {
-                    if (auto* const vulkan_context = window_manager_->getVulkanContext())
-                        static_cast<void>(vulkan_context->waitForNextFrameSlot());
-                }
-                const double elapsed = std::chrono::duration<double>(
-                                           std::chrono::high_resolution_clock::now() - last_frame_time_)
-                                           .count();
-                if (elapsed >= gui_animation_frame_interval) {
-                    window_manager_->pollEvents();
-                    last_wake_reason_ = window_manager_->frameInput().had_event ? "event" : "poll";
-                    last_wake_timeout_source_ = "none";
-                } else {
-                    window_manager_->waitEvents(gui_animation_frame_interval - elapsed);
-                    last_wake_reason_ = window_manager_->frameInput().had_event ? "event" : "timeout";
-                    last_wake_timeout_source_ = window_manager_->frameInput().had_event
-                                                    ? "none"
-                                                    : "gui_animation_paced";
-                }
-            } else {
-                if (presented_gui_frame) {
-                    if (auto* const vulkan_context = window_manager_->getVulkanContext())
-                        static_cast<void>(vulkan_context->waitForNextFrameSlot());
-                }
-                window_manager_->pollEvents();
-                last_wake_reason_ = window_manager_->frameInput().had_event ? "event" : "poll";
-                last_wake_timeout_source_ = "none";
-            }
-        } else {
-            // Idle: wait to minimize CPU/GPU work. Mouse-motion-only viewport wakes
-            // are filtered at the top of the next loop without presenting a GUI frame.
-            if (presented_gui_frame) {
-                if (auto* const vulkan_context = window_manager_->getVulkanContext())
-                    static_cast<void>(vulkan_context->waitForNextFrameSlot());
-            }
-            waitForNextEvent(is_training);
+        // Every autonomous frame waits for its actual animation cadence. Input and
+        // worker events wake the same blocking wait immediately.
+        if (presented_gui_frame && !vr_active_) {
+            if (auto* const vulkan_context = window_manager_->getVulkanContext())
+                static_cast<void>(vulkan_context->waitForNextFrameSlot());
         }
+        waitForNextEvent(is_training, next_demand.needsContinuousLoop());
     }
 
     bool VisualizerImpl::allowclose() {
@@ -3053,6 +3509,9 @@ namespace lfs::vis {
     }
 
     void VisualizerImpl::shutdown() {
+        // On every quit path, before the MCP server joins its handlers: their shader waits end.
+        if (shader_service_)
+            shader_service_->stop();
         if (trainer_manager_ &&
             (trainer_manager_->isTrainingActive() || trainer_manager_->isCompletionPending())) {
             LOG_CRITICAL("Shutdown reached before the training worker was reaped");
@@ -3064,6 +3523,7 @@ namespace lfs::vis {
         if (trainer_manager_) {
             trainer_manager_.reset();
         }
+        training_memory_detail::shutdownHeapTrimWorker();
 
         // Clean up tool context
         tool_context_.reset();
@@ -3079,7 +3539,7 @@ namespace lfs::vis {
         }
         op::undoHistory().undo();
         if (rendering_manager_) {
-            rendering_manager_->markDirty(DirtyFlag::ALL);
+            rendering_manager_->markDirty(DirtyFlag::ALL, lfs::vis::FrameReason::SceneChange);
         }
     }
 
@@ -3089,7 +3549,7 @@ namespace lfs::vis {
         }
         op::undoHistory().redo();
         if (rendering_manager_) {
-            rendering_manager_->markDirty(DirtyFlag::ALL);
+            rendering_manager_->markDirty(DirtyFlag::ALL, lfs::vis::FrameReason::SceneChange);
         }
     }
 
@@ -3127,14 +3587,7 @@ namespace lfs::vis {
         if (trainer_manager_ &&
             (trainer_manager_->isTrainingActive() ||
              trainer_manager_->isCompletionPending())) {
-            cmd::LoadFile{
-                .path = path,
-                .is_dataset = false,
-                .stop_training = true,
-                .discard_changes = true,
-                .replace = true}
-                .emit();
-            return {};
+            return std::unexpected("Cannot replace the scene until training has stopped.");
         }
         return data_loader_->loadPLY(path);
     }
@@ -3159,6 +3612,23 @@ namespace lfs::vis {
         }
 
         LOG_INFO("Loading dataset: {}", lfs::core::path_to_utf8(path));
+        if (trainer_manager_ &&
+            (trainer_manager_->isTrainingActive() ||
+             trainer_manager_->isCompletionPending())) {
+            return std::unexpected("Cannot replace the scene until training has stopped.");
+        }
+        if (project_lifecycle_ &&
+            project_lifecycle_->hasSourcePath() &&
+            !project_lifecycle_->isBlankProject()) {
+            // Keep invalid imports from discarding the current project. The
+            // loader below still reports validation failures through its events.
+            auto params = data_loader_->getParameters();
+            params.dataset.data_path = path;
+            if (lfs::training::validateDatasetPath(params) &&
+                !resetUntitledSessionForReplaceLoad()) {
+                return std::unexpected("Failed to reset the project for dataset replacement.");
+            }
+        }
         return data_loader_->loadDataset(path);
     }
 
@@ -3188,6 +3658,12 @@ namespace lfs::vis {
             return std::unexpected("No data loader available");
         }
 
+        if (scene_manager_ && scene_manager_->canClearScene() && gui_manager_ &&
+            gui_manager_->asyncTasks().deferSceneReplacement([this] {
+                if (auto result = clearScene(); !result)
+                    LOG_ERROR("Deferred scene clear failed: {}", result.error());
+            }))
+            return {};
         if (scene_manager_ && scene_manager_->canClearScene()) {
             data_loader_->cancelPendingImports();
             if (gui_manager_)
@@ -3380,7 +3856,8 @@ namespace lfs::vis {
                 lfs::core::events::cmd::
                     ShowProjectSwitchConfirmation{
                         .new_project = true,
-                        .path = {}}
+                        .path = {},
+                        .stop_training = stop_training}
                         .emit();
                 return;
             }
@@ -3415,7 +3892,7 @@ namespace lfs::vis {
         }
         if (gui_manager_) {
             if (data_loader_)
-                data_loader_->cancelPendingImports();
+                data_loader_->rejectPendingImports(LOC("file_drop.cancelled_by_new_project"));
             gui_manager_->asyncTasks().cancelImport(false);
         }
 
@@ -3513,7 +3990,8 @@ namespace lfs::vis {
                     .path = {},
                     .create_path = path,
                     .allow_existing_destination_replacement =
-                        allow_existing_destination_replacement}
+                        allow_existing_destination_replacement,
+                    .stop_training = stop_training}
                     .emit();
                 return preflight;
             }
@@ -3547,7 +4025,7 @@ namespace lfs::vis {
         }
         if (gui_manager_) {
             if (data_loader_)
-                data_loader_->cancelPendingImports();
+                data_loader_->rejectPendingImports(LOC("file_drop.cancelled_by_project_switch"));
             gui_manager_->asyncTasks().cancelImport(false);
         }
         pending_view_paths_.clear();
@@ -3631,7 +4109,8 @@ namespace lfs::vis {
                         .new_project = false,
                         .path = path,
                         .keep_asset_manager_open =
-                            keep_asset_manager_open}
+                            keep_asset_manager_open,
+                        .stop_training = stop_training}
                         .emit();
                 return;
             }
@@ -3718,6 +4197,8 @@ namespace lfs::vis {
     }
 
     void VisualizerImpl::resetProjectState(const bool reset_panel_registry) {
+        if (input_controller_)
+            input_controller_->setNavigationUpAxis(NavigationUpAxis::LegacyY);
         if (trainer_manager_) {
             trainer_manager_->clearRestoredProjectMetrics();
         }
@@ -3748,6 +4229,8 @@ namespace lfs::vis {
         hydration_terminal_restore_ticket_.reset();
         retained_project_session_ = {};
         camera_bookmarks_.clear();
+        if (shader_service_)
+            shader_service_->clear();
         if (reset_panel_registry) {
             gui::PanelRegistry::instance()
                 .reset_project_state();
@@ -3780,7 +4263,7 @@ namespace lfs::vis {
     void VisualizerImpl::
         tryApplyProjectSessionRestore() {
         auto prepared =
-            gui_session_restore_.takeReady();
+            gui_session_restore_.takeReady(hydration_terminal_restore_ticket_ && gui_session_restore_.isCurrent(*hydration_terminal_restore_ticket_));
         if (!prepared)
             return;
         auto retained = prepared->chapters;
@@ -3795,8 +4278,13 @@ namespace lfs::vis {
                       gui_manager_->panelLayout()
                           .getLeftDockPreferredWidth())
                 : std::nullopt;
+        const bool was_applying_session_restore =
+            applying_project_session_restore_.exchange(
+                true, std::memory_order_acq_rel);
         project::applyGuiSession(
             *this, *prepared, camera_bookmarks_);
+        applying_project_session_restore_.store(
+            was_applying_session_restore, std::memory_order_release);
         if (keep_asset_manager_open) {
             if (asset_manager_width && gui_manager_) {
                 gui_manager_->panelLayout()
@@ -3837,7 +4325,12 @@ namespace lfs::vis {
         pending_project_tools_restore_.reset();
         editor_context_.update(
             scene_manager_.get(), trainer_manager_.get());
+        const bool was_applying_session_restore =
+            applying_project_session_restore_.exchange(
+                true, std::memory_order_acq_rel);
         project::applyGuiSessionTools(*this, prepared);
+        applying_project_session_restore_.store(
+            was_applying_session_restore, std::memory_order_release);
     }
 
     void VisualizerImpl::noteHydrationTerminalForRestoreTicket(
@@ -3845,6 +4338,7 @@ namespace lfs::vis {
         if (ticket == 0)
             return;
         hydration_terminal_restore_ticket_ = ticket;
+        tryApplyProjectSessionRestore();
         tryApplyProjectSessionTools(ticket);
     }
 
@@ -3918,6 +4412,30 @@ namespace lfs::vis {
         return true;
     }
 
+    bool VisualizerImpl::postSceneCaptureWork(WorkItem work) {
+        if (!acceptsPostedWork())
+            return false;
+        if (!scene_capture_jobs_.post(std::move(work)))
+            return false;
+        wakeMainLoop();
+        return true;
+    }
+
+    void VisualizerImpl::completeSceneCaptureFrame(const bool frame_recorded) {
+        if (!scene_capture_jobs_.hasWork())
+            return;
+        if (scene_capture_jobs_.hasActive()) {
+            if (!frame_recorded)
+                scene_capture_jobs_.cancelActive();
+            else {
+                scene_capture_jobs_.completeFrame();
+                rendering_manager_->markDirty(DirtyFlag::CAMERA, FrameReason::AsyncCompletion);
+            }
+        }
+        if (scene_capture_jobs_.hasPending())
+            wakeMainLoop();
+    }
+
     bool VisualizerImpl::acceptsPostedWork() const {
         std::lock_guard lock(work_queue_mutex_);
         return accepting_work_;
@@ -3967,6 +4485,10 @@ namespace lfs::vis {
     }
 
     std::expected<void, std::string> VisualizerImpl::startTraining() {
+        if (project_lifecycle_ && project_lifecycle_->isOpenPending())
+            return std::unexpected("Wait for project opening before starting training.");
+        if (isTrainingStartPending())
+            return {};
         if (!trainer_manager_)
             return std::unexpected("Trainer manager not initialized");
         if (project_lifecycle_ &&
@@ -3995,12 +4517,18 @@ namespace lfs::vis {
                         !policy.at_step_boundaries) {
                         if (auto prepared =
                                 project_lifecycle_
-                                    ->prepareTrainingStartProject();
+                                    ->prepareTrainingStartProjectAsync([this]() -> lfs::Result<void> {
+                                        if (trainer_manager_->isPaused()) {
+                                            trainer_manager_->resumeTraining();
+                                        }
+                                        return {};
+                                    });
                             !prepared) {
                             return std::unexpected(
                                 lfs::format_for_developer(
                                     prepared.error()));
                         }
+                        return {};
                     }
                 }
             }
@@ -4031,12 +4559,21 @@ namespace lfs::vis {
         if (project_lifecycle_) {
             if (auto prepared =
                     project_lifecycle_
-                        ->prepareTrainingStartProject();
+                        ->prepareTrainingStartProjectAsync([this]() -> lfs::Result<void> {
+                            if (!trainer_manager_->startTraining()) {
+                                return visualizerFailure<void>(
+                                    lfs::ErrorCode::FailedPrecondition,
+                                    "The training manager rejected the start request.",
+                                    "Training start rejected after project preparation", "training.start");
+                            }
+                            return {};
+                        });
                 !prepared) {
                 return std::unexpected(
                     lfs::format_for_developer(
                         prepared.error()));
             }
+            return {};
         }
         if (!trainer_manager_->startTraining())
             return std::unexpected("The training manager rejected the start request");
@@ -4070,6 +4607,14 @@ namespace lfs::vis {
     VisualizerImpl::projectSaveAs(
         const std::filesystem::path& path,
         const bool regenerate_preview) {
+        return projectSaveAs(path, regenerate_preview, false);
+    }
+
+    lfs::Result<void>
+    VisualizerImpl::projectSaveAs(
+        const std::filesystem::path& path,
+        const bool regenerate_preview,
+        const bool fresh_training_start) {
         if (!project_lifecycle_) {
             return visualizerFailure<void>(
                 lfs::ErrorCode::Unavailable,
@@ -4078,7 +4623,8 @@ namespace lfs::vis {
                 "project.lifecycle");
         }
         return project_lifecycle_->saveAs(
-            path, regenerate_preview);
+            path, regenerate_preview, false,
+            fresh_training_start);
     }
 
     lfs::Result<void>
@@ -4116,7 +4662,8 @@ namespace lfs::vis {
     lfs::Result<void>
     VisualizerImpl::projectSaveAsFromDialog(
         const std::filesystem::path& path,
-        const bool regenerate_preview) {
+        const bool regenerate_preview,
+        const bool fresh_training_start) {
         if (!project_lifecycle_) {
             return visualizerFailure<void>(
                 lfs::ErrorCode::Unavailable,
@@ -4125,7 +4672,8 @@ namespace lfs::vis {
                 "project.lifecycle");
         }
         return project_lifecycle_->saveAs(
-            path, regenerate_preview, true);
+            path, regenerate_preview, true,
+            fresh_training_start);
     }
 
     bool VisualizerImpl::projectContainsEmbeddedSecrets()
@@ -4275,6 +4823,23 @@ namespace lfs::vis {
         return project_lifecycle_->info();
     }
 
+    void VisualizerImpl::projectMarkSessionChapterCommitted(
+        const std::string_view chapter) {
+        if (project_lifecycle_ &&
+            !applying_project_session_restore_.load(
+                std::memory_order_acquire)) {
+            project_lifecycle_->markSessionChapterCommitted(chapter);
+        }
+    }
+
+    void VisualizerImpl::recoverDeferredProjectPayloadsAfterUndo(
+        std::vector<lfs::core::Uuid> node_uuids) {
+        if (project_lifecycle_) {
+            project_lifecycle_->recoverDeferredPayloadsAfterUndo(
+                std::move(node_uuids));
+        }
+    }
+
     ProjectDisplayInfo VisualizerImpl::projectGetDisplayInfo() {
         return project_lifecycle_ ? project_lifecycle_->displayInfo()
                                   : ProjectDisplayInfo{};
@@ -4343,6 +4908,18 @@ namespace lfs::vis {
         return project_lifecycle_->pollWrite();
     }
 
+    lfs::Result<ProjectTrainingSource>
+    VisualizerImpl::projectTrainingSource() {
+        if (!project_lifecycle_) {
+            return visualizerFailure<ProjectTrainingSource>(
+                lfs::ErrorCode::Unavailable,
+                "Project lifecycle is unavailable.",
+                "The visualizer did not initialize its project lifecycle service",
+                "project.lifecycle");
+        }
+        return project_lifecycle_->trainingSource();
+    }
+
     bool VisualizerImpl::consumeProjectSaveStarted() {
         return project_save_started_.exchange(false);
     }
@@ -4354,6 +4931,12 @@ namespace lfs::vis {
     bool VisualizerImpl::projectCreatePending() const {
         return pending_training_action_ ==
                PendingTrainingAction::CreateProject;
+    }
+
+    bool VisualizerImpl::projectOpenPending() const {
+        return (project_lifecycle_ && project_lifecycle_->isOpenPending()) ||
+               (gui_manager_ && gui_manager_->asyncTasks().sceneReplacementPending()) ||
+               pending_training_action_ == PendingTrainingAction::OpenProject;
     }
 
     void VisualizerImpl::projectWaitWrite() {
@@ -4459,7 +5042,8 @@ namespace lfs::vis {
         const auto preserved_camera = viewport_.camera;
         const auto preserved_transforms = collectResetTransforms(scene_manager_->getScene());
 
-        const auto& init_path = data_loader_->getParameters().init_path;
+        const auto& previous_params = data_loader_->getParameters();
+        const auto& init_path = previous_params.init_path;
         std::optional<lfs::core::param::TrainingParameters> reset_params;
         if (auto* const param_mgr = services().paramsOrNull(); param_mgr && param_mgr->ensureLoaded()) {
             reset_params = param_mgr->createForDataset(path, {});
@@ -4467,6 +5051,10 @@ namespace lfs::vis {
                 reset_params->dataset = trainer_manager_->getEditableDatasetParams();
                 reset_params->dataset.data_path = path;
                 reset_params->init_path = init_path;
+                reset_params->add_splat_paths = previous_params.add_splat_paths;
+                reset_params->add_splat_freeze = previous_params.add_splat_freeze;
+                reset_params->freeze_lr_scale = previous_params.freeze_lr_scale;
+                reset_params->exclude_frozen_add_splats_from_export = previous_params.exclude_frozen_add_splats_from_export;
             }
             data_loader_->setParameters(*reset_params);
         }
@@ -4518,19 +5106,20 @@ namespace lfs::vis {
     }
 
     void VisualizerImpl::handleLoadConfigFile(const std::filesystem::path& path) {
-        auto result = lfs::core::param::read_optim_params_from_json(path);
+        const bool dataset_editable = !trainer_manager_ || trainer_manager_->isDatasetEditable();
+        auto result = parameter_manager_->importConfigFile(path, dataset_editable);
         if (!result) {
-            state::ConfigLoadFailed{.path = path, .error = result.error()}.emit();
+            state::ConfigLoadFailed{.path = path, .error = std::string(result.error().detail())}.emit();
             return;
         }
-        result->apply_step_scaling();
-        parameter_manager_->importParams(*result);
-        parameter_manager_->markDirty();
 
         // Bump scene generation so all panels (e.g. training panel) pick up
         // the new parameter values.  Without this, importing a config after a
         // dataset is already loaded leaves the UI showing stale defaults.
         python::bump_scene_generation();
+        // The scene generation is a view input: refresh it once after import.
+        if (rendering_manager_)
+            rendering_manager_->markDirty(DirtyFlag::ALL, FrameReason::SceneChange);
     }
 
     void VisualizerImpl::handleTrainingCompleted([[maybe_unused]] const state::TrainingCompleted& event) {
@@ -4544,7 +5133,7 @@ namespace lfs::vis {
 
         pending_training_completion_refresh_frames_ = 3;
         if (rendering_manager_) {
-            rendering_manager_->markDirty(DirtyFlag::ALL);
+            rendering_manager_->markDirty(DirtyFlag::ALL, lfs::vis::FrameReason::SceneChange);
         }
         wakeMainLoop();
         schedulePendingTrainingAction();
@@ -4586,6 +5175,7 @@ namespace lfs::vis {
             if (!path.empty()) {
                 const auto created = performCreateProject(
                     path, disposition, allow_existing);
+                last_project_create_succeeded_ = created.has_value() && !projectCreatePending();
                 if (!created) {
                     pending_load_files_.clear();
                     pending_project_dataset_embed_ = false;

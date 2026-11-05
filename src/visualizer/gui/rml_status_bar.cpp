@@ -18,8 +18,12 @@
 #include "gui/rmlui/rmlui_manager.hpp"
 #include "gui/rmlui/sdl_rml_key_mapping.hpp"
 #include "gui/status_bar_mining.hpp"
+#include "gui/status_bar_progress.hpp"
+#include "gui/status_bar_tessle.hpp"
+#include "gui/status_bar_training.hpp"
 #include "gui/string_keys.hpp"
 #include "gui/ui_context.hpp"
+#include "gui/utils/summary_labels.hpp"
 #include "internal/resource_paths.hpp"
 #include "preferences.hpp"
 #include "python_runtime.hpp"
@@ -32,8 +36,10 @@
 
 #include <RmlUi/Core.h>
 #include <RmlUi/Core/Element.h>
+#include <RmlUi/Core/FontEngineInterface.h>
 #include <SDL3/SDL_clipboard.h>
 #include <SDL3/SDL_video.h>
+#include <algorithm>
 #include <cassert>
 #include <chrono>
 #include <cmath>
@@ -118,15 +124,8 @@ namespace lfs::vis::gui {
             return std::format("{}:{:02d}", m, s);
         }
 
-        std::string stripColon(const std::string& s) {
-            auto end = s.find_last_not_of(": ");
-            if (end == std::string::npos)
-                return s;
-            return s.substr(0, end + 1);
-        }
-
         std::string formatStepLabel(const size_t step) {
-            return std::format("{} {}", stripColon(LOC(lichtfeld::Strings::Status::STEP)), lfs::core::format_count(step));
+            return std::format("{} {}", stripLabelColon(LOC(lichtfeld::Strings::Status::STEP)), lfs::core::format_count(step));
         }
 
         // Width the element's content box would need to show everything on one line.
@@ -164,89 +163,6 @@ namespace lfs::vis::gui {
             const float own_width =
                 children_width > 0.0f ? children_width : element->GetBox().GetSize().x;
             return own_width + overflow_width;
-        }
-
-        struct ProgressMarkerRenderState {
-            bool dragging = false;
-            bool adding = false;
-            size_t original_step = 0;
-            size_t preview_step = 0;
-            size_t hover_step = 0;
-        };
-
-        void appendProgressMarkerRml(std::string& markers,
-                                     const size_t step,
-                                     const int total_iterations,
-                                     const bool past,
-                                     const bool hovered,
-                                     const bool preview,
-                                     const bool miner) {
-            const float left_pct = std::clamp(
-                100.0f * static_cast<float>(step) / static_cast<float>(total_iterations),
-                0.5f,
-                99.5f);
-
-            std::string classes = "progress-marker";
-            if (past)
-                classes += " is-past";
-            if (hovered)
-                classes += " is-hovered";
-            if (preview)
-                classes += " is-preview";
-
-            if (miner) {
-                markers += std::format(
-                    "<img class=\"{}\" src=\"../icon/mining/{}\" style=\"left:{:.3f}%;\"/>",
-                    classes,
-                    past ? "gem-collected.png" : "gem.png",
-                    left_pct);
-            } else {
-                markers += std::format(
-                    "<div class=\"{}\" style=\"left:{:.3f}%;\"></div>",
-                    classes,
-                    left_pct);
-            }
-        }
-
-        std::string buildProgressMarkersRml(std::vector<size_t> save_steps,
-                                            const int total_iterations,
-                                            const int current_iteration,
-                                            const ProgressMarkerRenderState& state,
-                                            const bool miner) {
-            if (total_iterations <= 0)
-                return {};
-
-            std::ranges::sort(save_steps);
-            save_steps.erase(std::ranges::unique(save_steps).begin(), save_steps.end());
-
-            std::string markers;
-            markers.reserve((save_steps.size() + 1) * 136);
-            for (const size_t save_step : save_steps) {
-                if (save_step == 0 || save_step > static_cast<size_t>(total_iterations))
-                    continue;
-                if (state.dragging && !state.adding && save_step == state.original_step)
-                    continue;
-
-                appendProgressMarkerRml(markers,
-                                        save_step,
-                                        total_iterations,
-                                        save_step <= static_cast<size_t>(std::max(0, current_iteration)),
-                                        !state.dragging && save_step == state.hover_step,
-                                        false,
-                                        miner);
-            }
-
-            if (state.dragging && state.preview_step > 0 &&
-                state.preview_step <= static_cast<size_t>(total_iterations)) {
-                appendProgressMarkerRml(markers,
-                                        state.preview_step,
-                                        total_iterations,
-                                        false,
-                                        true,
-                                        true,
-                                        miner);
-            }
-            return markers;
         }
 
         struct FramebufferBlitRect {
@@ -389,6 +305,9 @@ namespace lfs::vis::gui {
         ctor.Bind("mode_color", &model_.mode_color);
         ctor.Bind("show_training", &model_.show_training);
         ctor.Bind("progress_miner", &model_.progress_miner);
+        ctor.Bind("progress_tessle", &model_.progress_tessle);
+        ctor.Bind("tessle_left", &model_.tessle_left);
+        ctor.Bind("tessle_sprite", &model_.tessle_sprite);
         ctor.Bind("miner_raised", &model_.miner_raised);
         ctor.Bind("miner_step_a", &model_.miner_step_a);
         ctor.Bind("miner_strike", &model_.miner_strike);
@@ -436,6 +355,9 @@ namespace lfs::vis::gui {
         ctor.Bind("gpu_mem_text", &model_.gpu_mem_text);
         ctor.Bind("gpu_mem_color", &model_.gpu_mem_color);
         ctor.Bind("fps_value", &model_.fps_value);
+        ctor.Bind("fps_view_value", &model_.fps_view_value);
+        ctor.Bind("fps_ui_label", &model_.fps_ui_label);
+        ctor.Bind("fps_view_label", &model_.fps_view_label);
         ctor.Bind("fps_color", &model_.fps_color);
         ctor.Bind("fps_label", &model_.fps_label);
         ctor.Bind("preview_reduced", &model_.preview_reduced);
@@ -495,6 +417,7 @@ namespace lfs::vis::gui {
     }
 
     void RmlStatusBar::shutdown() {
+        tooltip_ = {};
         if (document_registered_)
             lfs::python::unregister_rml_document("status_bar");
         document_registered_ = false;
@@ -531,6 +454,7 @@ namespace lfs::vis::gui {
     }
 
     void RmlStatusBar::reloadResources() {
+        tooltip_ = {};
         if (!rml_context_)
             return;
 
@@ -593,9 +517,8 @@ namespace lfs::vis::gui {
             }));
         };
 
-        // Step, loss and splat count change with every training step and FPS with
-        // every frame. The periodic refresh reads them, so they never force a
-        // redraw of their own.
+        // Published training progress wakes the GUI; read its latest values on
+        // that frame. FPS is measurement only and never publishes store changes.
         bind(store.total_iterations);
         bind(store.max_gaussians);
         bind(store.training_running);
@@ -606,10 +529,6 @@ namespace lfs::vis::gui {
         bind(store.eval_lpips);
         bind(store.scene_generation);
         bind(store.selection_generation);
-        subscriptions_.push_back(store.fps.subscribe([this](const float& fps) {
-            reactive_fps_available_ = true;
-            reactive_fps_value_ = fps;
-        }));
         bind(store.mode_text);
         subscriptions_.push_back(store.perf_hud.subscribe([this](const lfs::vis::AppStore::PerfHud& state) {
             setModelBool("gpu_panel_active", model_.gpu_panel_active, state.visible);
@@ -1129,16 +1048,11 @@ namespace lfs::vis::gui {
         }
     }
 
-    bool RmlStatusBar::updateContent(const PanelDrawContext& ctx, const bool force_refresh) {
+    bool RmlStatusBar::updateContent(const PanelDrawContext& ctx) {
         if (!document_)
             return false;
 
         const auto now = std::chrono::steady_clock::now();
-        if (!force_refresh && next_refresh_at_ != std::chrono::steady_clock::time_point{} &&
-            now < next_refresh_at_) {
-            return false;
-        }
-
         model_dirty_ = false;
 
         const auto& p = lfs::vis::theme().palette;
@@ -1243,7 +1157,10 @@ namespace lfs::vis::gui {
         std::string mode_rml;
         std::string mode_color;
 
-        if (content_type == SceneManager::ContentType::Empty) {
+        if (viewer && viewer->isTrainingStartPending()) {
+            mode_rml = LOC("training_panel.preparing_training");
+            mode_color = colorToRml(p.info);
+        } else if (content_type == SceneManager::ContentType::Empty) {
             mode_rml = LOC("mode.empty");
             mode_color = colorToRml(p.text_dim);
         } else if (content_type == SceneManager::ContentType::SplatFiles) {
@@ -1289,13 +1206,18 @@ namespace lfs::vis::gui {
                 break;
             }
             case TrainingState::Starting:
-                mode_rml = LOC("runtime.task_starting_ellipsis") + suffix;
+                mode_rml = LOC("training_panel.preparing_training");
                 mode_color = colorToRml(p.warning);
                 break;
-            case TrainingState::Finished:
-                mode_rml = LOC(lichtfeld::Strings::Status::COMPLETE) + suffix;
-                mode_color = colorToRml(p.success);
+            case TrainingState::Finished: {
+                const auto reason = tm
+                                        ? tm->getStateMachine().getFinishReason()
+                                        : FinishReason::None;
+                const auto status = finishedTrainingStatus(reason, p);
+                mode_rml = LOC(status.label_key) + suffix;
+                mode_color = colorToRml(status.color);
                 break;
+            }
             case TrainingState::Stopping:
                 mode_rml = LOC(lichtfeld::Strings::Status::STOPPING) + suffix;
                 mode_color = colorToRml(p.text_dim);
@@ -1310,23 +1232,28 @@ namespace lfs::vis::gui {
         setModelString("mode_color", model_.mode_color, std::move(mode_color));
 
         // Training section
-        bool show_training = content_type == SceneManager::ContentType::Dataset &&
-                             (training_state == TrainingState::Running ||
-                              training_state == TrainingState::Paused);
-        setModelBool("show_training", model_.show_training, show_training);
         if (progress_style_checked_at_ == std::chrono::steady_clock::time_point{} ||
             now - progress_style_checked_at_ >= std::chrono::seconds(1)) {
             progress_style_checked_at_ = now;
-            progress_miner_pref_ = loadProgressBarStylePreference() == "miner";
+            const auto style = loadProgressBarStylePreference();
+            setModelBool("progress_miner", model_.progress_miner, style == "miner");
+            setModelBool("progress_tessle", model_.progress_tessle, style == "tessle");
         }
-        setModelBool("progress_miner", model_.progress_miner, progress_miner_pref_);
+        // Keep the completed progress display consistent across all styles.
+        const bool completed = tm &&
+                               training_state == TrainingState::Finished &&
+                               tm->getStateMachine().getFinishReason() == FinishReason::Completed;
+        const bool show_training = content_type == SceneManager::ContentType::Dataset &&
+                                   (training_state == TrainingState::Running ||
+                                    training_state == TrainingState::Paused || completed);
+        setModelBool("show_training", model_.show_training, show_training);
         const bool running = training_state == TrainingState::Running;
         const auto animation_ms =
             std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
         const auto swing_phase_ms = animation_ms % 550;
         const bool strike_phase = running && swing_phase_ms >= 350;
         const int walk_phase = static_cast<int>((animation_ms / 275) % 4);
-        const bool miner_running = progress_miner_pref_ && show_training && running;
+        const bool miner_running = model_.progress_miner && show_training && running;
         setModelBool("miner_raised", model_.miner_raised,
                      miner_running && !strike_phase && walk_phase != 0 && walk_phase != 2);
         setModelBool("miner_step_a", model_.miner_step_a,
@@ -1337,7 +1264,7 @@ namespace lfs::vis::gui {
         setModelString("step_label", model_.step_label, LOC(lichtfeld::Strings::Status::STEP));
         setModelString("loss_label", model_.loss_label, LOC(lichtfeld::Strings::Status::LOSS));
         setModelString("gaussians_label", model_.gaussians_label,
-                       stripColon(LOC(lichtfeld::Strings::Status::GAUSSIANS)));
+                       stripLabelColon(LOC(lichtfeld::Strings::Status::GAUSSIANS)));
         setModelString("eta_label", model_.eta_label, LOC(lichtfeld::Strings::Status::ETA));
 
         if (show_training && tm) {
@@ -1374,20 +1301,29 @@ namespace lfs::vis::gui {
                         text_width_dp = measured_width_dp;
                 }
             }
-            const float text_left_dp = progress_miner_pref_
-                                           ? mining::miningProgressTextLeftDp(progress * bar_dp, bar_dp,
-                                                                              text_width_dp)
-                                           : 0.0f;
-            setModelString("progress_text_left", model_.progress_text_left,
-                           std::format("{:.2f}dp", text_left_dp));
-
-            if (progress_miner_pref_) {
+            float text_left_dp = 0.0f;
+            if (model_.progress_tessle) {
+                const auto frame = tessle::buildFrame(progress, bar_dp, static_cast<int64_t>(elapsed * 1000.0f));
+                // Prefer the cleared trail, leaving the leaves ahead unobstructed.
+                const float desired = frame.left_dp >= text_width_dp + 8.0f
+                                          ? frame.left_dp - text_width_dp - 8.0f
+                                          : frame.left_dp + 18.0f;
+                text_left_dp = std::clamp(desired, 0.0f, std::max(0.0f, bar_dp - text_width_dp - 6.0f));
+                setModelString("tessle_left", model_.tessle_left, std::format("{:.2f}dp", frame.left_dp));
+                setModelString("tessle_sprite", model_.tessle_sprite, frame.sprite);
+                setProgressWallRml(frame.scenery_rml);
+                setProgressDebrisRml("");
+                mining_scene_ = {};
+            } else if (model_.progress_miner) {
+                text_left_dp = mining::miningProgressTextLeftDp(progress * bar_dp, bar_dp, text_width_dp);
                 updateMiningScene(progress, now, training_state == TrainingState::Paused);
             } else {
                 setProgressWallRml("");
                 setProgressDebrisRml("");
                 mining_scene_ = {};
             }
+            setModelString("progress_text_left", model_.progress_text_left,
+                           std::format("{:.2f}dp", text_left_dp));
             const ProgressMarkerRenderState marker_state{
                 .dragging = save_step_interaction_.dragging,
                 .adding = save_step_interaction_.adding,
@@ -1395,8 +1331,10 @@ namespace lfs::vis::gui {
                 .preview_step = save_step_interaction_.preview_step,
                 .hover_step = save_step_interaction_.hover_step,
             };
-            setProgressMarkersRml(buildProgressMarkersRml(tm->getSaveSteps(), total, cur, marker_state,
-                                                          progress_miner_pref_));
+            const auto marker_style = model_.progress_tessle  ? ProgressMarkerStyle::Tessle
+                                      : model_.progress_miner ? ProgressMarkerStyle::Miner
+                                                              : ProgressMarkerStyle::Classic;
+            setProgressMarkersRml(buildProgressMarkersRml(tm->getSaveSteps(), total, cur, marker_state, marker_style));
             setModelString("step_value", model_.step_value, std::format("{}/{}", lfs::core::format_count(cur), lfs::core::format_count(total)));
             setModelString("loss_value", model_.loss_value, std::format("{:.4f}", loss));
             setModelString("gaussians_value", model_.gaussians_value,
@@ -1438,7 +1376,7 @@ namespace lfs::vis::gui {
             setModelString("eta_value", model_.eta_value, "");
         }
 
-        const bool miner_smoke = progress_miner_pref_ && show_training &&
+        const bool miner_smoke = model_.progress_miner && show_training &&
                                  training_state == TrainingState::Paused &&
                                  mining_scene_.pause_started !=
                                      std::chrono::steady_clock::time_point{};
@@ -1468,7 +1406,7 @@ namespace lfs::vis::gui {
         if (show_splats) {
             auto splat_rml = std::format("{} {}",
                                          fmtCount(static_cast<int64_t>(total_gaussians)),
-                                         stripColon(LOC(lichtfeld::Strings::Status::GAUSSIANS)));
+                                         stripLabelColon(LOC(lichtfeld::Strings::Status::GAUSSIANS)));
             setModelString("splat_text", model_.splat_text, std::move(splat_rml));
             setModelString("splat_color", model_.splat_color, colorToRml(p.text));
         } else {
@@ -1487,7 +1425,9 @@ namespace lfs::vis::gui {
             split_enabled = split_info_cache_.enabled;
             if (split_enabled) {
                 split_mode_rml = split_info_cache_.mode_label;
-                split_detail_rml = split_info_cache_.detail_label;
+                // Model names are already shown inside their comparison panels.
+                if (!splitViewUsesPLYComparison(rm->getSettings().split_view_mode))
+                    split_detail_rml = split_info_cache_.detail_label;
             }
         }
         setModelBool("show_split", model_.show_split, split_enabled);
@@ -1507,7 +1447,7 @@ namespace lfs::vis::gui {
 
         if (wasd_visible) {
             auto wasd_rml = std::format("{}: {:.0f}",
-                                        stripColon(LOC(lichtfeld::Strings::Controls::WASD)),
+                                        stripLabelColon(LOC(lichtfeld::Strings::Controls::WASD)),
                                         wasd_speed);
             setModelBool("show_wasd", model_.show_wasd, true);
             setModelString("wasd_text", model_.wasd_text, std::move(wasd_rml));
@@ -1523,7 +1463,7 @@ namespace lfs::vis::gui {
 
         if (zoom_visible) {
             auto zoom_rml = std::format("{}: {:.0f}",
-                                        stripColon(LOC(lichtfeld::Strings::Controls::ZOOM)),
+                                        stripLabelColon(LOC(lichtfeld::Strings::Controls::ZOOM)),
                                         zoom_speed);
             setModelBool("show_zoom", model_.show_zoom, true);
             setModelString("zoom_text", model_.zoom_text, std::move(zoom_rml));
@@ -1562,9 +1502,13 @@ namespace lfs::vis::gui {
         setModelBool("gpu_panel_active", model_.gpu_panel_active,
                      lfs::vis::app_store().perf_hud.get().visible);
         setModelString("lfs_mem_text", model_.lfs_mem_text,
-                       std::format("LFS {}{} GiB", mem.process_estimated ? "≤" : "",
-                                   formatGpuGiB(mem.process_used)));
-        setModelString("lfs_mem_color", model_.lfs_mem_color, colorToRml(p.info));
+                       mem.process_valid
+                           ? std::format("LFS {} GiB{}", formatGpuGiB(mem.process_used),
+                                         mem.process_over_budget
+                                             ? std::format(" ({})", LOC("ui.vram_over_budget"))
+                                             : "")
+                           : "LFS —");
+        setModelString("lfs_mem_color", model_.lfs_mem_color, colorToRml(mem.process_over_budget ? p.error : p.info));
         setModelBool("show_gpu_model", model_.show_gpu_model, !mem.device_name.empty());
         setModelString("gpu_model_text", model_.gpu_model_text, mem.device_name);
         setModelString("gpu_mem_text", model_.gpu_mem_text,
@@ -1574,31 +1518,24 @@ namespace lfs::vis::gui {
         setModelString("gpu_mem_color", model_.gpu_mem_color, colorToRml(mem_color));
         if (document_) {
             if (auto* element = document_->GetElementById("lfs-mem"))
-                element->SetAttribute("title", LOC(mem.process_estimated
-                                                       ? "ui.vram_process_estimate_tooltip"
-                                                       : "ui.vram_process_nvml_tooltip"));
+                element->SetAttribute("title", LOC(mem.process_valid
+                                                       ? "ui.vram_process_nvml_tooltip"
+                                                       : "ui.vram_process_unavailable_tooltip"));
             if (auto* element = document_->GetElementById("gpu-mem"))
                 element->SetAttribute("title", LOC(mem.device_estimated
                                                        ? "ui.vram_device_cuda_tooltip"
                                                        : "ui.vram_device_nvml_tooltip"));
         }
 
-        // FPS: prefer scene-render rate when scene frames are in the measurement
-        // window; when only GUI frames are presented, show that rate as ui-fps
-        // so a GUI-only spin is not invisible. True idle (no samples) stays a dim 0.
-        const float scene_fps = reactive_fps_available_ ? reactive_fps_value_
-                                                        : (rm ? rm->getAverageFPS() : 0.0f);
-        const float presented_fps = rm ? rm->getPresentedAverageFPS() : 0.0f;
-        const bool ui_only_fps = scene_fps <= 0.0f && presented_fps > 0.0f;
-        const float fps = std::round(ui_only_fps ? presented_fps : scene_fps);
-        ThemeColor fps_col = ui_only_fps || fps <= 0.0f
-                                 ? p.text_dim
-                                 : (fps >= 30.0f ? p.success : (fps >= 15.0f ? p.warning : p.error));
-        setModelString("fps_value", model_.fps_value, std::format("{:.0f}", fps));
-        setModelString("fps_color", model_.fps_color, colorToRml(fps_col));
-        setModelString("fps_label", model_.fps_label,
-                       ui_only_fps ? std::format(" {}", LOC("status_bar.ui_fps"))
-                                   : std::format(" {}", LOC(lichtfeld::Strings::Status::FPS)));
+        const auto rates = rm ? rm->guiFrameRates() : FrameRates{};
+        const float scene_fps = rates.view;
+        const float presented_fps = rates.ui;
+        setModelString("fps_value", model_.fps_value, std::format("{:.0f}", presented_fps));
+        setModelString("fps_view_value", model_.fps_view_value, std::format("{:.0f}", scene_fps));
+        setModelString("fps_ui_label", model_.fps_ui_label, LOC("status_bar.ui"));
+        setModelString("fps_view_label", model_.fps_view_label, "3D");
+        setModelString("fps_color", model_.fps_color, colorToRml(p.text));
+        setModelString("fps_label", model_.fps_label, LOC(lichtfeld::Strings::Status::FPS));
         setModelString("git_commit", model_.git_commit, GIT_COMMIT_HASH_SHORT);
 
         section_signature_ =
@@ -1612,16 +1549,14 @@ namespace lfs::vis::gui {
             (model_.show_status_message ? uint32_t{1} << 6 : 0) |
             (model_.show_gpu_model ? uint32_t{1} << 7 : 0);
 
-        // A paused trainer has a static progress display. Keep the miner's
-        // periodic refresh armed only while its particles actually advance.
-        const bool miner_visible = progress_miner_pref_ && show_training &&
-                                   training_state == TrainingState::Running;
+        // Freeze themed progress animations while training is paused.
+        const bool progress_animation_visible = (model_.progress_miner || model_.progress_tessle) && show_training &&
+                                                training_state == TrainingState::Running;
         model_animation_active_ = wasd_visible || zoom_visible || status_msg.visible ||
-                                  miner_visible;
+                                  progress_animation_visible;
         animation_active_ = model_animation_active_ || rml_animation_active_;
-        next_refresh_at_ = now + (miner_visible && training_state == TrainingState::Running
+        next_refresh_at_ = now + (progress_animation_visible
                                       ? kBusyRefreshInterval
-                                  : miner_visible           ? kMiningRefreshInterval
                                   : model_animation_active_ ? kAnimatedRefreshInterval
                                   : ctx.is_training         ? kBusyRefreshInterval
                                                             : kIdleRefreshInterval);
@@ -1638,11 +1573,14 @@ namespace lfs::vis::gui {
                           bar_y - overlay_height - input.screen_y);
         const float local_x = input.mouse_x - bar_x;
         const float local_y = input.mouse_y - (bar_y - overlay_height);
+        tooltip_mouse_x_ = static_cast<int>(local_x);
+        tooltip_mouse_y_ = static_cast<int>(input.mouse_y - bar_y);
         const bool is_inside = local_x >= 0.0f && local_x < bar_w &&
                                local_y >= 0.0f && local_y < bar_h + overlay_height;
         if (!is_inside && !input.mouse_released[0] && !input.mouse_released[1] &&
             !save_step_interaction_.dragging) {
             clearSaveStepHover();
+            clearTooltip();
             return;
         }
 
@@ -1651,6 +1589,9 @@ namespace lfs::vis::gui {
         const int mods = sdlModsToRml(input.key_ctrl, input.key_shift,
                                       input.key_alt, input.key_super);
         rml_context_->ProcessMouseMove(static_cast<int>(local_x), static_cast<int>(local_y), mods);
+        auto* hover = rml_context_->GetHoverElement();
+        tooltip_.setHover(is_inside ? resolveRmlTooltip(hover) : std::string{},
+                          is_inside ? hover : nullptr);
 
         if (is_inside && input.mouse_clicked[0])
             rml_context_->ProcessMouseButtonDown(0, mods);
@@ -1663,12 +1604,22 @@ namespace lfs::vis::gui {
     }
 
     float RmlStatusBar::overlayHeight() const {
+        float tooltip_height = 0.0f;
+        if (tooltip_.hasActiveState() && document_) {
+            if (auto* const element = document_->GetElementById("frame-tooltip");
+                element && element->IsVisible()) {
+                // Match the tooltip's 10px cursor gap and 4px edge margin.
+                // Pending tooltips need no surface until apply() lays them out.
+                tooltip_height = std::min(tooltip_max_overlay_height_,
+                                          std::ceil(element->GetOffsetHeight() + 14.0f));
+            }
+        }
         if (!model_.mcp_details_expanded)
-            return 0.0f;
+            return tooltip_height;
         const float dp_ratio = rml_context_
                                    ? rml_context_->GetDensityIndependentPixelRatio()
                                    : 1.0f;
-        const float fallback_height = 150.0f * dp_ratio;
+        const float fallback_height = std::max(150.0f * dp_ratio, tooltip_height);
         if (!document_)
             return fallback_height;
 
@@ -1752,43 +1703,39 @@ namespace lfs::vis::gui {
         });
     }
 
-    void RmlStatusBar::renderCached(const PanelDrawContext& ctx, const float x, const float y,
-                                    const float w_px, const float h_px,
-                                    const int screen_w, const int screen_h) {
-        if (!rml_context_ || !document_)
-            return;
-        if (w_px <= 0.0f || h_px <= 0.0f || screen_w <= 0 || screen_h <= 0)
-            return;
-
-        const float overlay_height = overlayHeight();
-        const int render_w = static_cast<int>(w_px);
-        const int render_h = static_cast<int>(h_px + overlay_height);
-        const float dp_ratio = rml_context_->GetDensityIndependentPixelRatio();
-        const bool dp_changed = dp_ratio != last_dp_ratio_;
-        const bool theme_current =
-            has_theme_signature_ && rml_theme::currentThemeSignature() == last_theme_signature_;
-        const auto now = std::chrono::steady_clock::now();
-        const auto runtime_revision = lfs::vis::runtimeServiceRevision();
-        if (runtime_revision != last_runtime_service_revision_) {
-            last_runtime_service_revision_ = runtime_revision;
-            model_dirty_ = true;
+    void RmlStatusBar::updateFpsReservedWidths() {
+        // Reserve three digits in the actual font, rather than a fixed dp width.
+        if (auto* engine = Rml::GetFontEngineInterface()) {
+            for (const char* id : {"fps-value", "fps-view-value"}) {
+                if (auto* value = document_->GetElementById(id)) {
+                    const auto face = value->GetFontFaceHandle();
+                    if (!face)
+                        continue;
+                    int width = 0;
+                    const Rml::TextShapingContext shaping{Rml::String{}};
+                    for (char digit = '0'; digit <= '9'; ++digit)
+                        width = std::max(width, engine->GetStringWidth(face, std::string(3, digit), shaping));
+                    value->SetProperty("min-width", std::format("{}px", width));
+                }
+            }
+            rml_context_->Update();
         }
-        const bool refresh_due =
-            next_refresh_at_ == std::chrono::steady_clock::time_point{} ||
-            now >= next_refresh_at_;
-        const bool can_reuse = theme_current && !dp_changed && !model_dirty_ && !refresh_due &&
-                               render_w == last_render_w_ &&
-                               render_h == last_render_h_;
-        if (!can_reuse) {
-            render(ctx, x, y, w_px, h_px, screen_w, screen_h);
+    }
+
+    void RmlStatusBar::positionTooltip(const float previous_overlay, const float overlay_height,
+                                       const bool place_above) {
+        auto* const element = document_->GetElementById("frame-tooltip");
+        if (!element || !element->IsVisible())
             return;
-        }
-
-        trackRenderedContextFrame(x, y, overlay_height);
-
-        queueCachedVulkanContext(x, y - overlay_height, w_px, h_px + overlay_height,
-                                 screen_w, screen_h,
-                                 render_w, render_h, direct_cache_.texture == 0);
+        // apply() has written the final position, but layout may still expose
+        // the offscreen measurement position. Read the pending pixel property.
+        const auto* const pending_top = element->GetLocalProperty(Rml::PropertyId::Top);
+        const float current_top = pending_top ? pending_top->Get<float>() : element->GetOffsetTop();
+        const float top = place_above
+                              ? std::max(4.0f, overlay_height + tooltip_mouse_y_ -
+                                                   10.0f - element->GetOffsetHeight())
+                              : current_top + overlay_height - previous_overlay;
+        element->SetProperty(Rml::PropertyId::Top, Rml::Property(top, Rml::Unit::PX));
     }
 
     void RmlStatusBar::render(const PanelDrawContext& ctx, const float x, const float y,
@@ -1811,22 +1758,47 @@ namespace lfs::vis::gui {
             return;
         }
 
-        const float overlay_height = overlayHeight();
+        tooltip_max_overlay_height_ = std::max(0.0f, static_cast<float>(screen_h) - h_px);
         const int render_w = static_cast<int>(w_px);
-        const int render_h = static_cast<int>(h_px + overlay_height);
-        const bool size_changed = (render_w != last_render_w_ || render_h != last_render_h_);
         const float dp_ratio = rml_context_->GetDensityIndependentPixelRatio();
         const bool dp_changed = dp_ratio != last_dp_ratio_;
         const bool had_pending_model_dirty = model_dirty_;
         const bool theme_changed = updateTheme();
         const auto now = std::chrono::steady_clock::now();
+        const auto refresh_at = next_refresh_at_;
+        const bool content_changed = updateContent(ctx);
+        const bool section_signature_changed = section_signature_ != last_section_signature_;
+
+        if (tooltip_.hasActiveState() &&
+            (render_w != last_render_w_ || dp_changed || theme_changed)) {
+            rml_context_->SetDimensions({render_w, std::max(last_render_h_, static_cast<int>(h_px))});
+            rml_context_->Update();
+        }
+
+        // Reveal and measure in the existing surface before sizing the cache.
+        // The tooltip controller lays out new text even when the strip is short.
+        const float previous_overlay = std::max(0.0f, last_render_h_ - h_px);
+        const bool tooltip_changed = tooltip_.apply(document_->GetElementById("body"),
+                                                    tooltip_mouse_x_,
+                                                    tooltip_mouse_y_ + static_cast<int>(previous_overlay),
+                                                    render_w, static_cast<int>(h_px + previous_overlay));
+        const float overlay_height = overlayHeight();
+        const int render_h = static_cast<int>(h_px + overlay_height);
+        const bool size_changed = (render_w != last_render_w_ || render_h != last_render_h_);
         const bool refresh_due =
             size_changed || dp_changed || theme_changed || had_pending_model_dirty ||
-            next_refresh_at_ == std::chrono::steady_clock::time_point{} ||
-            now >= next_refresh_at_;
-        const bool content_changed = updateContent(ctx, refresh_due);
-        const bool section_signature_changed = section_signature_ != last_section_signature_;
-        const bool needs_render = size_changed || dp_changed || theme_changed || had_pending_model_dirty ||
+            refresh_at == std::chrono::steady_clock::time_point{} ||
+            now >= refresh_at;
+        if (tooltip_.hasActiveState() && (tooltip_changed || size_changed || dp_changed || theme_changed)) {
+            // Revealing from the strip needs a new position after measurement.
+            // Preserve below-cursor placement when the MCP popup already provided space.
+            const bool place_above = (tooltip_changed && previous_overlay <= 0.0f) ||
+                                     ((dp_changed || theme_changed) && tooltip_mouse_y_ >= 0);
+            positionTooltip(previous_overlay, overlay_height, place_above);
+        }
+        rml_manager_->setContextNeedsPassiveMouseMoveFrames(rml_context_, tooltip_.hasActiveState());
+        rml_manager_->setContextTooltipRevealDeadline(rml_context_, tooltip_.revealDeadline());
+        const bool needs_render = tooltip_changed || size_changed || dp_changed || theme_changed || had_pending_model_dirty ||
                                   content_changed ||
                                   (animation_active_ && refresh_due);
         if (!rml_manager_ || !rml_manager_->getVulkanRenderInterface()) {
@@ -1842,7 +1814,9 @@ namespace lfs::vis::gui {
                 last_document_h_ = render_h;
             }
             rml_context_->Update();
-            fitToAvailableWidth(size_changed || dp_changed || theme_changed || section_signature_changed);
+            if (dp_changed || theme_changed)
+                updateFpsReservedWidths();
+            fitToAvailableWidth(render_w != last_render_w_ || dp_changed || theme_changed || section_signature_changed);
 
             rml_animation_active_ = rml_context_->GetNextUpdateDelay() == 0;
             animation_active_ = model_animation_active_ || rml_animation_active_;
@@ -1858,7 +1832,7 @@ namespace lfs::vis::gui {
 
         queueCachedVulkanContext(x, y - overlay_height, w_px, h_px + overlay_height,
                                  screen_w, screen_h,
-                                 render_w, render_h, true);
+                                 render_w, render_h, needs_render || direct_cache_.texture == 0);
     }
 
 } // namespace lfs::vis::gui

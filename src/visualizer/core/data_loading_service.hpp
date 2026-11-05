@@ -34,6 +34,7 @@ namespace lfs::vis {
         void processPendingImports();
         bool hasPendingImports() const { return !pending_imports_.empty(); }
         void cancelPendingImports() { pending_imports_.clear(); }
+        void rejectPendingImports(const std::string& reason);
 
         // Loading operations
         std::expected<void, std::string> loadPLY(const std::filesystem::path& path);
@@ -52,6 +53,7 @@ namespace lfs::vis {
     private:
         void setupEventHandlers();
         void handleLoadFileCommand(const lfs::core::events::cmd::LoadFile& cmd);
+        void startLoadFileCommand(const lfs::core::events::cmd::LoadFile& cmd);
         void handleLoadCheckpointForTrainingCommand(
             const std::filesystem::path& checkpoint_path,
             const std::filesystem::path& dataset_path,

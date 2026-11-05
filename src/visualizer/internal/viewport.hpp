@@ -3,8 +3,10 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #pragma once
+#include "input/navigation_movement.hpp"
 #include "rendering/coordinate_conventions.hpp"
 #include "rendering/render_constants.hpp"
+#include "visualizer/navigation_up_axis.hpp"
 #include "visualizer/preferences.hpp"
 #include <algorithm>
 #include <chrono>
@@ -28,7 +30,7 @@ class Viewport {
         float rotateCenterSpeed = 0.002f;
         float rotateRollSpeed = 0.01f;
         float translateSpeed = 0.0005f;
-        float wasdSpeed = 8.0f;
+        float wasdSpeed = 10.0f;
         float maxWasdSpeed = 100.0f;
         bool isOrbiting = false;
 
@@ -62,6 +64,17 @@ class Viewport {
 
         CameraMotion() = default;
 
+        lfs::vis::NavigationUpAxis navigationUpAxis() const { return navigation_up_axis_; }
+        glm::vec3 navigationUp() const { return lfs::vis::navigationFrame(navigation_up_axis_)[1]; }
+        void setNavigationUpAxis(lfs::vis::NavigationUpAxis axis) {
+            if (navigation_up_axis_ == axis)
+                return;
+            clearTransientMotion();
+            resetRollTarget();
+            navigation_up_axis_ = axis;
+            drone_synced = false;
+        }
+
         // Compute camera-to-world rotation that looks from 'from' toward 'to'
         static glm::mat3 computeLookAtRotation(const glm::vec3& from, const glm::vec3& to) {
             return lfs::rendering::makeVisualizerLookAtRotation(from, to);
@@ -71,6 +84,15 @@ class Viewport {
             home_R = R;
             home_t = t;
             home_pivot = pivot;
+            home_saved = true;
+        }
+
+        // Restore the built-in home that Shift+H replaces.
+        void resetHomePosition() {
+            const CameraMotion defaults{};
+            home_R = defaults.home_R;
+            home_t = defaults.home_t;
+            home_pivot = defaults.home_pivot;
             home_saved = true;
         }
 
@@ -102,49 +124,22 @@ class Viewport {
             const glm::vec3 backward = lfs::rendering::cameraBackward(R);
             t = center + backward * distance;
             pivot = center;
-            R = computeLookAtRotation(t, pivot);
+            R = lfs::rendering::makeVisualizerLookAtRotation(t, pivot, navigationUp());
             resetRollTarget();
             clearTransientMotion();
         }
 
-        // Record the whole-scene radius (half the bounds diagonal). It scales
-        // WASD speed and caps pan distance so navigation tracks splat size; the
-        // controller feeds it the trimmed whole-scene extent. 0 clears the cache.
+        // Record the whole-scene radius (half the bounds diagonal). It caps pan
+        // distance; the controller feeds it the trimmed whole-scene extent. 0
+        // clears the cache.
         void setSceneExtent(float radius) {
             if (std::isfinite(radius) && radius >= 0.0f)
                 scene_extent_ = radius;
         }
 
         void rotate(const glm::vec2& pos, bool enforceUpright = false) {
-            glm::vec2 delta = pos - prePos;
-
-            float y = -delta.x * rotateSpeed;
-            float p = -delta.y * rotateSpeed;
-            glm::vec3 upVec = enforceUpright ? glm::vec3(0.0f, 1.0f, 0.0f) : R[1];
-
-            if (enforceUpright) {
-                // Clamp pitch short of vertical: at the poles the upright basis
-                // (right = forward x world-up) degenerates and the view flips.
-                constexpr float MAX_PITCH = glm::radians(89.0f);
-                const glm::vec3 fwd = lfs::rendering::cameraForward(R);
-                const float current_pitch = std::asin(glm::clamp(fwd.y, -1.0f, 1.0f));
-                p = glm::clamp(p, -MAX_PITCH - current_pitch, MAX_PITCH - current_pitch);
-            }
-
-            glm::mat3 Ry = glm::mat3(glm::rotate(glm::mat4(1.0f), y, upVec));
-            glm::mat3 Rp = glm::mat3(glm::rotate(glm::mat4(1.0f), p, R[0]));
-            R = Rp * Ry * R;
-
-            if (enforceUpright) {
-                const glm::vec3 forward = lfs::rendering::cameraForward(R);
-                const glm::vec3 right = normalizedOr(glm::cross(forward, upVec), R[0]);
-                const glm::vec3 up = normalizedOr(glm::cross(-forward, right), R[1]);
-                R[0] = right;
-                R[1] = up;
-                R[2] = -forward;
-                roll_target = 0.0f;
-            }
-
+            const glm::vec2 delta = pos - prePos;
+            applyLookRotation(-delta.x * rotateSpeed, -delta.y * rotateSpeed, enforceUpright);
             prePos = pos;
         }
 
@@ -167,6 +162,70 @@ class Viewport {
 
         void translate(const glm::vec2& pos) { applyPanDrag(pos); }
 
+        // Continuous inputs use rates, independent of pixels and pointer state.
+        // Positive angles use the same yaw/pitch convention as orbit rotation.
+        void advanceLook(float delta_time, glm::vec2 radians_per_second, bool enforce_upright = true) {
+            const auto angles = angularStep(delta_time, radians_per_second);
+            if (angles == glm::vec2(0))
+                return;
+            float distance = glm::length(pivot - t);
+            if (!std::isfinite(distance) || distance < 0.1f)
+                distance = 5.0f;
+            applyLookRotation(angles.x, angles.y, enforce_upright);
+            updatePivotFromCamera(distance);
+        }
+
+        void advanceOrbit(float delta_time, glm::vec2 radians_per_second, bool trackball = false) {
+            const auto angles = angularStep(delta_time, radians_per_second);
+            if (angles != glm::vec2(0))
+                applyOrbitRotation(angles.x, angles.y, trackball);
+        }
+
+        // Pan rate is a fraction of the working distance per second, right/up.
+        // The scene extent caps that distance just as it does for mouse pan.
+        void advancePan(float delta_time, glm::vec2 relative_velocity) {
+            if (!validRateStep(delta_time, relative_velocity))
+                return;
+            const float distance = panDistance();
+            const auto movement = (R[0] * relative_velocity.x + R[1] * relative_velocity.y) * distance * delta_time;
+            if (finiteVector(t + movement) && finiteVector(pivot + movement)) {
+                t += movement;
+                pivot += movement;
+            }
+        }
+
+        // Orbit/trackball dolly follows the camera-to-pivot ray. A positive rate
+        // approaches the pivot exponentially; limits never move an already
+        // out-of-range camera farther out or snap it back into the range.
+        void advanceDolly(float delta_time, float relative_rate) {
+            if (!validRateStep(delta_time, {relative_rate, 0}) || relative_rate == 0)
+                return;
+            const auto offset = pivot - t;
+            const float distance = glm::length(offset);
+            if (!std::isfinite(distance) || distance <= 0)
+                return;
+            const double minimum = std::min(distance, 0.1f);
+            const double maximum = std::max(distance, lfs::rendering::DEFAULT_FAR_PLANE);
+            const double exponent = std::clamp(-double(relative_rate) * delta_time,
+                                               std::log(minimum / distance), std::log(maximum / distance));
+            const float next = static_cast<float>(distance * std::exp(exponent));
+            const auto position = pivot - (offset / distance) * next;
+            if (finiteVector(position))
+                t = position;
+        }
+
+        // Orthographic dolly changes projection scale only. The caller applies
+        // the returned scale to the addressed viewport/render settings.
+        [[nodiscard]] float advanceOrthographicDolly(float delta_time, float relative_rate, float scale) const {
+            if (!validRateStep(delta_time, {relative_rate, 0}) || !std::isfinite(scale) || scale <= 0 || relative_rate == 0)
+                return scale;
+            const double minimum = std::min(scale, 1.0f);
+            const double maximum = std::max(scale, 10000.0f);
+            const double exponent = std::clamp(double(relative_rate) * delta_time,
+                                               std::log(minimum / scale), std::log(maximum / scale));
+            return static_cast<float>(scale * std::exp(exponent));
+        }
+
         void zoom(float delta, bool carry_pivot = false) {
             const glm::vec3 forward = lfs::rendering::cameraForward(R);
             const float distToPivot = glm::length(pivot - t);
@@ -175,7 +234,15 @@ class Viewport {
             // level 100 matches the previous fastest setting (full distance).
             constexpr float kZoomFractionPerLevel = 0.01f;
             const float adaptiveSpeed = zoomSpeed * kZoomFractionPerLevel * distToPivot;
-            const glm::vec3 movement = delta * adaptiveSpeed * forward;
+            float distance = delta * adaptiveSpeed;
+            if (delta < 0.0f && !carry_pivot) {
+                // Bound orbit/trackball zoom before multiplying the direction:
+                // repeated outward steps otherwise overflow the camera position.
+                // Do not snap cameras already beyond the limit back toward it.
+                constexpr float kMaxDistance = lfs::rendering::DEFAULT_FAR_PLANE;
+                distance = std::max(distance, -std::max(0.0f, kMaxDistance - distToPivot));
+            }
+            const glm::vec3 movement = distance * forward;
 
             t += movement;
             if (carry_pivot) {
@@ -193,27 +260,52 @@ class Viewport {
             }
         }
 
+        // Walk uses the navigation plane, regardless of look pitch. Only trim
+        // excessive length: a partially deflected stick must remain slower.
+        [[nodiscard]] glm::vec3 walkVelocity(const lfs::vis::input::NavigationMovement& input,
+                                             float speed) const {
+            const auto up = navigationUp();
+            auto forward = -R[2];
+            forward -= up * glm::dot(forward, up);
+            if (glm::length(forward) < 1e-5f)
+                forward = glm::cross(up, R[0]);
+            forward = glm::normalize(forward);
+            const auto right = glm::normalize(glm::cross(forward, up));
+            const auto direction = forward * input.forward() + right * input.right();
+            const float amount = std::min(glm::length(glm::vec2(input.right(), input.forward())), 1.0f);
+            return amount > 0.0f ? glm::normalize(direction) * (amount * speed) : glm::vec3(0);
+        }
+
         // WASD movement carried by an exponentially-damped velocity: holding a
         // key eases the camera up to wasdSpeed, releasing lets it glide to rest
         // instead of stopping dead, giving a light sense of inertia. Call every
         // frame while hasWasdMomentum() so a released key can decay to zero.
         void advanceWasd(float deltaTime, bool forward, bool backward, bool left,
                          bool right, bool up, bool down, float additional_speed = 0.0f) {
+            advanceWasd(deltaTime, lfs::vis::input::NavigationMovement::fromKeys(forward, backward, left, right, up, down),
+                        additional_speed);
+        }
+
+        void advanceWasd(float deltaTime, const lfs::vis::input::NavigationMovement& input,
+                         float additional_speed = 0.0f) {
             glm::vec3 dir(0.0f);
-            if (forward != backward) {
+            if (input.forward() != 0.0f) {
                 const glm::vec3 f = lfs::rendering::cameraForward(R);
-                dir += forward ? f : -f;
+                dir += f * input.forward();
             }
-            if (left != right) {
+            if (input.right() != 0.0f) {
                 const glm::vec3 r = glm::normalize(R * glm::vec3(1, 0, 0));
-                dir += right ? r : -r;
+                dir += r * input.right();
             }
-            if (up != down) {
+            if (input.up() != 0.0f) {
                 const glm::vec3 u = glm::normalize(R * glm::vec3(0, 1, 0));
-                dir += up ? u : -u;
+                dir += u * input.up();
             }
 
-            const float effective_speed = (wasdSpeed + additional_speed) * wasdMoveScale();
+            const bool held = input.held();
+            if (held)
+                wasd_hold_seconds_ += deltaTime;
+            const float effective_speed = (wasdSpeed + additional_speed) * unitsPerSecondPerLevel();
             const glm::vec3 target_velocity = dir * effective_speed;
             const float blend = 1.0f - std::exp(-deltaTime * kWasdInertiaRate);
             wasd_velocity = glm::mix(wasd_velocity, target_velocity, blend);
@@ -221,6 +313,8 @@ class Viewport {
             const float stop_speed = kWasdStopFraction * effective_speed;
             if (glm::length2(dir) < 1e-8f && glm::length2(wasd_velocity) < stop_speed * stop_speed) {
                 wasd_velocity = glm::vec3(0.0f);
+                if (!held)
+                    wasd_hold_seconds_ = 0.0f;
                 return;
             }
 
@@ -229,8 +323,62 @@ class Viewport {
             pivot += movement;
         }
 
+        float advanceOrthographicWasd(float deltaTime, bool forward, bool backward, bool left,
+                                      bool right, bool up, bool down, float ortho_scale,
+                                      float perspective_scale, float distance_to_pivot,
+                                      float additional_speed = 0.0f) {
+            return advanceOrthographicWasd(
+                deltaTime, lfs::vis::input::NavigationMovement::fromKeys(forward, backward, left, right, up, down),
+                ortho_scale, perspective_scale, distance_to_pivot, additional_speed);
+        }
+
+        float advanceOrthographicWasd(float deltaTime, const lfs::vis::input::NavigationMovement& input,
+                                      float ortho_scale, float perspective_scale, float distance_to_pivot,
+                                      float additional_speed = 0.0f) {
+            const glm::vec3 f = lfs::rendering::cameraForward(R);
+            const glm::vec3 r = glm::normalize(R * glm::vec3(1, 0, 0));
+            const glm::vec3 u = glm::normalize(R * glm::vec3(0, 1, 0));
+            const float forward_input = input.forward();
+            const float side_input = input.right();
+            const float vertical_input = input.up();
+            const bool held = forward_input != 0.0f || side_input != 0.0f || vertical_input != 0.0f;
+            if (held)
+                wasd_hold_seconds_ += deltaTime;
+
+            const float effective_speed = (wasdSpeed + additional_speed) * unitsPerSecondPerLevel();
+            const float lateral_scale = perspective_scale / std::max(ortho_scale, 1e-6f);
+            const glm::vec3 lateral_direction = r * side_input + u * vertical_input;
+            const glm::vec3 target_velocity =
+                f * (forward_input * effective_speed) + lateral_direction * (effective_speed * lateral_scale);
+            const float blend = 1.0f - std::exp(-deltaTime * kWasdInertiaRate);
+            wasd_velocity = glm::mix(wasd_velocity, target_velocity, blend);
+
+            const float stop_speed = kWasdStopFraction * effective_speed * std::min(1.0f, lateral_scale);
+            if (glm::length2(target_velocity) < 1e-8f && glm::length2(wasd_velocity) < stop_speed * stop_speed) {
+                wasd_velocity = glm::vec3(0.0f);
+                if (!held)
+                    wasd_hold_seconds_ = 0.0f;
+                return ortho_scale;
+            }
+
+            const float forward_speed = glm::dot(wasd_velocity, f);
+            constexpr float kMinDistance = lfs::rendering::DEFAULT_NEAR_PLANE;
+            const float distance = std::max(distance_to_pivot, 0.01f);
+            const float next_distance = std::max(kMinDistance, distance - forward_speed * deltaTime);
+            const float next_scale = std::clamp(ortho_scale * distance / next_distance, 1.0f, 10000.0f);
+            const float applied_distance = distance * (1.0f - ortho_scale / next_scale);
+            const glm::vec3 lateral_velocity = wasd_velocity - f * forward_speed;
+            const glm::vec3 lateral_movement = lateral_velocity * deltaTime;
+            t += lateral_movement + f * applied_distance;
+            pivot += lateral_movement;
+            return next_scale;
+        }
+
         [[nodiscard]] bool hasWasdMomentum() const { return glm::length2(wasd_velocity) > 0.0f; }
-        void clearWasdMomentum() { wasd_velocity = glm::vec3(0.0f); }
+        void clearWasdMomentum() {
+            wasd_velocity = glm::vec3(0.0f);
+            wasd_hold_seconds_ = 0.0f;
+        }
 
         // DJI-style stabilized drone flight. Horizontal velocity lives in the
         // world yaw plane so the gimbal pitch never bleeds into the flight
@@ -240,10 +388,19 @@ class Viewport {
         // settle to rest.
         void advanceDrone(float deltaTime, bool forward, bool backward, bool left,
                           bool right, bool up, bool down, float additional_speed = 0.0f) {
+            advanceDrone(deltaTime, lfs::vis::input::NavigationMovement::fromKeys(forward, backward, left, right, up, down),
+                         additional_speed);
+        }
+
+        void advanceDrone(float deltaTime, const lfs::vis::input::NavigationMovement& input,
+                          float additional_speed = 0.0f) {
             syncDroneIfStale();
 
             const bool sport = additional_speed > 0.0f;
-            const float max_speed = (wasdSpeed + additional_speed) * wasdMoveScale();
+            const bool held = input.held();
+            if (held)
+                wasd_hold_seconds_ += deltaTime;
+            const float max_speed = (wasdSpeed + additional_speed) * unitsPerSecondPerLevel();
             const float max_climb = max_speed * kDroneClimbSpeedFraction;
 
             const float look_blend = 1.0f - std::exp(-deltaTime * kDroneLookRate);
@@ -259,22 +416,22 @@ class Viewport {
 
             const float sin_yaw = std::sin(drone_yaw);
             const float cos_yaw = std::cos(drone_yaw);
-            const glm::vec3 fwd_h(-sin_yaw, 0.0f, -cos_yaw);
-            const glm::vec3 right_h(cos_yaw, 0.0f, -sin_yaw);
+            const glm::vec3 fwd_h = navigationVector(glm::vec3(-sin_yaw, 0.0f, -cos_yaw));
+            const glm::vec3 right_h = navigationVector(glm::vec3(cos_yaw, 0.0f, -sin_yaw));
 
             glm::vec3 dir_h(0.0f);
-            if (forward != backward)
-                dir_h += forward ? fwd_h : -fwd_h;
-            if (left != right)
-                dir_h += right ? right_h : -right_h;
+            if (input.forward() != 0.0f)
+                dir_h += fwd_h * input.forward();
+            if (input.right() != 0.0f)
+                dir_h += right_h * input.right();
             const float dir_len2 = glm::length2(dir_h);
             if (dir_len2 > 1.0f)
                 dir_h /= std::sqrt(dir_len2);
             const bool has_h_input = dir_len2 > 0.0f;
-            const bool has_v_input = up != down;
+            const bool has_v_input = input.up() != 0.0f;
 
             const glm::vec3 target_h = dir_h * max_speed;
-            const float target_v = has_v_input ? (up ? max_climb : -max_climb) : 0.0f;
+            const float target_v = input.up() * max_climb;
 
             // Real drones brake noticeably harder than they spool up, so the
             // release rate is steeper than the acceleration rate.
@@ -299,12 +456,14 @@ class Viewport {
                 drone_vel_v = 0.0f;
                 movement_v = 0.0f;
             }
+            if (!held && glm::length2(drone_vel_h) == 0.0f && drone_vel_v == 0.0f)
+                wasd_hold_seconds_ = 0.0f;
 
             float pivot_distance = glm::length(pivot - t);
             if (!std::isfinite(pivot_distance) || pivot_distance < 0.1f)
                 pivot_distance = 5.0f;
 
-            const glm::vec3 movement = movement_h + glm::vec3(0.0f, movement_v, 0.0f);
+            const glm::vec3 movement = movement_h + navigationUp() * movement_v;
             t += movement;
 
             // Tilt tracks the velocity error (proportional to acceleration for
@@ -346,6 +505,19 @@ class Viewport {
                                             -kDroneMaxGimbalPitchRad, kDroneMaxGimbalPitchRad);
         }
 
+        void advanceDroneLook(float delta_time, glm::vec2 radians_per_second) {
+            const auto angles = angularStep(delta_time, radians_per_second);
+            if (angles == glm::vec2(0))
+                return;
+            syncDroneIfStale();
+            // Bound the target before advanceDrone's angle wrapping loop.
+            drone_yaw_target = static_cast<float>(std::remainder(
+                double(drone_yaw_target) + angles.x, double(glm::two_pi<float>())));
+            drone_pitch_target = static_cast<float>(std::clamp(
+                double(drone_pitch_target) + angles.y,
+                -double(kDroneMaxGimbalPitchRad), double(kDroneMaxGimbalPitchRad)));
+        }
+
         // Snaps any pre-existing roll level on entry (precedent: FPV rebuilds
         // an upright frame on the first look drag).
         void enterDrone() {
@@ -378,6 +550,7 @@ class Viewport {
         void clearDroneMotion() {
             drone_vel_h = glm::vec3(0.0f);
             drone_vel_v = 0.0f;
+            wasd_hold_seconds_ = 0.0f;
             drone_tilt_pitch = 0.0f;
             drone_tilt_roll = 0.0f;
             drone_yaw_target = drone_yaw;
@@ -386,6 +559,14 @@ class Viewport {
         }
 
         void initScreenPos(const glm::vec2& pos) { prePos = pos; }
+
+        // Keep a live camera drag anchored on the cursor when another handler
+        // consumes the motion, so the next sample is only the new delta.
+        void followDragPointer(const glm::vec2& pos, float time) {
+            prePos = pos;
+            pan_last_time = time;
+            orbit_last_time = time;
+        }
 
         void setPivot(const glm::vec3& new_pivot) {
             pivot = new_pivot;
@@ -602,6 +783,49 @@ class Viewport {
         }
 
     private:
+        [[nodiscard]] static bool finiteVector(glm::vec3 value) {
+            return std::isfinite(value.x) && std::isfinite(value.y) && std::isfinite(value.z);
+        }
+
+        [[nodiscard]] static bool validRateStep(float delta_time, glm::vec2 rate) {
+            return std::isfinite(delta_time) && delta_time > 0 &&
+                   std::isfinite(rate.x) && std::isfinite(rate.y);
+        }
+
+        [[nodiscard]] static glm::vec2 angularStep(float delta_time, glm::vec2 rate) {
+            if (!validRateStep(delta_time, rate))
+                return glm::vec2(0);
+            const auto angles = rate * delta_time;
+            return std::isfinite(angles.x) && std::isfinite(angles.y) ? angles : glm::vec2(0);
+        }
+
+        void applyLookRotation(float y, float p, bool enforceUpright) {
+            glm::vec3 upVec = enforceUpright ? navigationUp() : R[1];
+            if (enforceUpright) {
+                // Stop short of the poles, where the upright basis degenerates.
+                constexpr float MAX_PITCH = glm::radians(89.0f);
+                const glm::vec3 fwd = lfs::rendering::cameraForward(R);
+                const float current_pitch = std::asin(glm::clamp(glm::dot(fwd, navigationUp()), -1.0f, 1.0f));
+                p = glm::clamp(p, -MAX_PITCH - current_pitch, MAX_PITCH - current_pitch);
+            }
+            glm::mat3 Ry = glm::mat3(glm::rotate(glm::mat4(1.0f), y, upVec));
+            glm::mat3 Rp = glm::mat3(glm::rotate(glm::mat4(1.0f), p, R[0]));
+            R = Rp * Ry * R;
+            if (enforceUpright) {
+                const glm::vec3 forward = lfs::rendering::cameraForward(R);
+                const glm::vec3 right = normalizedOr(glm::cross(forward, upVec), R[0]);
+                const glm::vec3 up = normalizedOr(glm::cross(-forward, right), R[1]);
+                R[0] = right;
+                R[1] = up;
+                R[2] = -forward;
+                roll_target = 0.0f;
+            }
+        }
+
+        lfs::vis::NavigationUpAxis navigation_up_axis_ = lfs::vis::NavigationUpAxis::LegacyY;
+        glm::vec3 navigationVector(const glm::vec3& vector) const {
+            return navigation_up_axis_ == lfs::vis::NavigationUpAxis::LegacyY ? vector : lfs::vis::navigationFrame(navigation_up_axis_) * vector;
+        }
         float roll_target = 0.0f;
         glm::vec3 glide_target_t{0.0f};
         float glide_time_left = 0.0f;
@@ -652,12 +876,13 @@ class Viewport {
         // any roll in R) and zeroes all motion; used on mode entry and
         // whenever another system rotated the camera behind the drone's back.
         void syncDroneFromR() {
-            const glm::vec3 f = lfs::rendering::cameraForward(R);
+            const glm::mat3 local_rotation = navigation_up_axis_ == lfs::vis::NavigationUpAxis::LegacyY ? R : glm::transpose(lfs::vis::navigationFrame(navigation_up_axis_)) * R;
+            const glm::vec3 f = lfs::rendering::cameraForward(local_rotation);
             drone_pitch = glm::clamp(std::asin(glm::clamp(f.y, -1.0f, 1.0f)),
                                      -kDroneMaxGimbalPitchRad, kDroneMaxGimbalPitchRad);
             drone_yaw = glm::length(glm::vec2(f.x, f.z)) > 1e-4f
                             ? std::atan2(-f.x, -f.z)
-                            : std::atan2(-R[0].z, R[0].x);
+                            : std::atan2(-local_rotation[0].z, local_rotation[0].x);
             drone_yaw_target = drone_yaw;
             drone_pitch_target = drone_pitch;
             drone_vel_h = glm::vec3(0.0f);
@@ -679,35 +904,37 @@ class Viewport {
             const glm::mat3 Rx = glm::mat3(glm::rotate(glm::mat4(1.0f), pitch_total, glm::vec3(1.0f, 0.0f, 0.0f)));
             const glm::mat3 Rz = glm::mat3(glm::rotate(glm::mat4(1.0f), drone_tilt_roll, glm::vec3(0.0f, 0.0f, 1.0f)));
             R = Ry * Rx * Rz;
+            if (navigation_up_axis_ != lfs::vis::NavigationUpAxis::LegacyY)
+                R = lfs::vis::navigationFrame(navigation_up_axis_) * R;
             drone_last_R = R;
         }
 
-        // Whole-scene radius (half the bounds diagonal), fed by the controller.
-        // WASD scales by it and panning is capped by it. 0 = unknown, in
-        // which case movement keeps its distance-based behavior. Scenes load in
-        // arbitrary world units (no normalization), so an absolute speed feels right
-        // on one scene and wrong on the next; scaling by this removes that.
-        //
-        // WASD effective speed is wasdSpeed * radius / kWasdReferenceExtent, with
-        // wasdSpeed a 1..100 level (default 8). kWasdReferenceExtent is set so level
-        // 50 crosses one scene radius per second; the level-8 default is a calm
-        // exploration pace and level 100 covers two radii per second.
+        // WASD moves the same in every scene: level 10 is one world unit (a
+        // metre in metric scenes) per second and level 20 two. Holding movement
+        // keys longer than kWasdHoldDelaySeconds speeds it up by
+        // kWasdHoldBoostPerSecond times that speed each second, up to
+        // kWasdHoldMaxBoost times, so a tap stays precise and a long hold
+        // crosses large scenes. Turning or reversing keeps the speed; coming to
+        // rest with no key held starts over.
+        static constexpr float kWasdUnitsPerSecondPerLevel = 0.1f;
+        static constexpr float kWasdHoldDelaySeconds = 0.2f;
+        static constexpr float kWasdHoldBoostPerSecond = 6.0f;
+        static constexpr float kWasdHoldMaxBoost = 20.0f;
+        float wasd_hold_seconds_ = 0.0f;
+
+        float unitsPerSecondPerLevel() const {
+            const float boost = 1.0f + kWasdHoldBoostPerSecond * std::max(0.0f, wasd_hold_seconds_ - kWasdHoldDelaySeconds);
+            return kWasdUnitsPerSecondPerLevel * std::min(boost, kWasdHoldMaxBoost);
+        }
+
+        // Whole-scene radius (half the bounds diagonal), fed by the controller;
+        // panning is capped by it. 0 = unknown, in which case panning keeps its
+        // distance-based behavior.
         float scene_extent_ = 0.0f;
-        static constexpr float kWasdReferenceExtent = 50.0f;
-        static constexpr float kMinMoveScale = 0.05f;
-        static constexpr float kMaxMoveScale = 100.0f;
         // Cap pan distance against the trimmed scene radius. A minimum tied to
         // scene size makes large scenes pan too fast when the camera/pivot is
         // still close to the origin.
         static constexpr float kPanMaxDistanceFraction = 1.0f;
-
-        // WASD multiplier from the scene radius, clamped so degenerate or enormous
-        // bounds can't produce unusable speeds; 1.0 when the extent is unknown.
-        float wasdMoveScale() const {
-            if (scene_extent_ <= 0.0f)
-                return 1.0f;
-            return std::clamp(scene_extent_ / kWasdReferenceExtent, kMinMoveScale, kMaxMoveScale);
-        }
 
         float orbit_vel_yaw = 0.0f;
         float orbit_vel_pitch = 0.0f;
@@ -756,17 +983,17 @@ class Viewport {
                 pan_velocity = glm::vec3(0.0f);
         }
 
+        [[nodiscard]] float panDistance() const {
+            const float distance = glm::length(pivot - t);
+            return scene_extent_ > 0.0f ? std::min(distance, scene_extent_ * kPanMaxDistanceFraction) : distance;
+        }
+
         // Maps a drag delta to a world-space translation, applies it to camera
         // and pivot, advances prePos, and returns the applied movement so
         // callers can track momentum.
         glm::vec3 applyPanDrag(const glm::vec2& pos) {
             const glm::vec2 delta = pos - prePos;
-            const float dist_to_pivot = glm::length(pivot - t);
-            float pan_dist = dist_to_pivot;
-            if (scene_extent_ > 0.0f) {
-                pan_dist = std::min(pan_dist, scene_extent_ * kPanMaxDistanceFraction);
-            }
-            const float adaptive_speed = translateSpeed * pan_dist;
+            const float adaptive_speed = translateSpeed * panDistance();
             const glm::vec3 movement = -(delta.x * adaptive_speed) * R[0] + (delta.y * adaptive_speed) * R[1];
             t += movement;
             pivot += movement;
@@ -792,7 +1019,12 @@ class Viewport {
             }
         }
 
-        [[nodiscard]] static glm::vec3 axisViewUp(const int axis, const bool negative) {
+        [[nodiscard]] glm::vec3 axisViewUp(const int axis, const bool negative) const {
+            if (navigation_up_axis_ != lfs::vis::NavigationUpAxis::LegacyY) {
+                const auto forward = axisViewForward(axis, negative);
+                const auto up = navigationUp();
+                return std::abs(glm::dot(forward, up)) < 0.99f ? up : navigationVector(glm::vec3(0, 0, -glm::dot(forward, up)));
+            }
             const float sign = negative ? -1.0f : 1.0f;
             switch (axis) {
             case 0: return glm::vec3(0.0f, 1.0f, 0.0f);
@@ -802,7 +1034,7 @@ class Viewport {
             }
         }
 
-        [[nodiscard]] static glm::mat3 axisViewRotation(const int axis, const bool negative) {
+        [[nodiscard]] glm::mat3 axisViewRotation(const int axis, const bool negative) const {
             return lfs::rendering::makeVisualizerLookAtRotation(
                 glm::vec3(0.0f),
                 axisViewForward(axis, negative),
@@ -848,13 +1080,13 @@ class Viewport {
             return value / length;
         }
 
-        [[nodiscard]] static glm::mat3 makeRollStableOrbitRotation(const glm::vec3& eye,
-                                                                   const glm::vec3& target,
-                                                                   const glm::vec3& transported_right,
-                                                                   const glm::mat3& fallback_rotation,
-                                                                   const float step_angle,
-                                                                   const float roll_target_angle) {
-            constexpr glm::vec3 WORLD_UP(0.0f, 1.0f, 0.0f);
+        [[nodiscard]] glm::mat3 makeRollStableOrbitRotation(const glm::vec3& eye,
+                                                            const glm::vec3& target,
+                                                            const glm::vec3& transported_right,
+                                                            const glm::mat3& fallback_rotation,
+                                                            const float step_angle,
+                                                            const float roll_target_angle) const {
+            const glm::vec3 WORLD_UP = navigationUp();
 
             const glm::vec3 view = target - eye;
             const float view_length = glm::length(view);
@@ -912,7 +1144,7 @@ class Viewport {
         }
 
         void applyRotationAroundCenter(const float yaw, const float pitch) {
-            constexpr glm::vec3 WORLD_UP(0.0f, 1.0f, 0.0f);
+            const glm::vec3 WORLD_UP = navigationUp();
             // Just short of vertical: keeps the upright re-orthogonalization
             // below well-conditioned (right length >= 0.014) while allowing a
             // near-top-down view.
@@ -927,7 +1159,7 @@ class Viewport {
             // with the current frame, so leaving the pole never flips either.
             const float max_elevation = std::asin(MAX_VERTICAL_DOT);
             const glm::vec3 fwd = lfs::rendering::cameraForward(R);
-            const float elevation = std::asin(glm::clamp(fwd.y, -1.0f, 1.0f));
+            const float elevation = std::asin(glm::clamp(glm::dot(fwd, navigationUp()), -1.0f, 1.0f));
             const float limit = std::max(max_elevation, std::abs(elevation));
             const float clamped_pitch = glm::clamp(pitch, -limit - elevation, limit - elevation);
 

@@ -4,8 +4,10 @@
 #include "core/cuda/selection_ops.hpp"
 #include "core/cuda_error.hpp"
 #include "core/logger.hpp"
+#include <algorithm>
 #include <cassert>
 #include <cfloat>
+#include <cmath>
 #include <cuda_runtime.h>
 #include <nvtx3/nvToolsExt.h>
 #include <thrust/device_ptr.h>
@@ -18,6 +20,25 @@ namespace lfs::core::cuda {
     namespace {
 
         constexpr int BLOCK_SIZE = 256;
+
+        __device__ inline float3 transform_position(
+            const float* __restrict__ positions,
+            const int* __restrict__ transform_indices,
+            const float* __restrict__ transforms,
+            int idx) {
+            const float x = positions[idx * 3];
+            const float y = positions[idx * 3 + 1];
+            const float z = positions[idx * 3 + 2];
+            if (!transform_indices || !transforms) {
+                return make_float3(x, y, z);
+            }
+
+            const float* matrix = transforms + transform_indices[idx] * 16;
+            return make_float3(
+                matrix[0] * x + matrix[4] * y + matrix[8] * z + matrix[12],
+                matrix[1] * x + matrix[5] * y + matrix[9] * z + matrix[13],
+                matrix[2] * x + matrix[6] * y + matrix[10] * z + matrix[14]);
+        }
 
         __device__ inline int3 pos_to_cell(float3 pos, float3 grid_min, float inv_cell_size) {
             return make_int3(
@@ -35,6 +56,9 @@ namespace lfs::core::cuda {
 
         __global__ void compute_cell_ids(
             const float* __restrict__ positions,
+            const int* __restrict__ transform_indices,
+            const float* __restrict__ transforms,
+            float* __restrict__ world_positions,
             int* __restrict__ cell_ids,
             float3 grid_min, float inv_cell_size, int3 grid_dims,
             int N) {
@@ -42,7 +66,12 @@ namespace lfs::core::cuda {
             if (idx >= N)
                 return;
 
-            float3 p = make_float3(positions[idx * 3], positions[idx * 3 + 1], positions[idx * 3 + 2]);
+            const float3 p = transform_position(positions, transform_indices, transforms, idx);
+            if (world_positions) {
+                world_positions[idx * 3] = p.x;
+                world_positions[idx * 3 + 1] = p.y;
+                world_positions[idx * 3 + 2] = p.z;
+            }
             int3 cell = pos_to_cell(p, grid_min, inv_cell_size);
             cell_ids[idx] = cell_to_hash(cell, grid_dims);
         }
@@ -68,6 +97,8 @@ namespace lfs::core::cuda {
 
         __global__ void grow_kernel(
             const float* __restrict__ positions,
+            const int* __restrict__ transform_indices,
+            const float* __restrict__ transforms,
             const uint8_t* __restrict__ mask,
             uint8_t* __restrict__ out_mask,
             const int* __restrict__ sorted_indices,
@@ -86,7 +117,7 @@ namespace lfs::core::cuda {
                 return;
             }
 
-            float3 p = make_float3(positions[idx * 3], positions[idx * 3 + 1], positions[idx * 3 + 2]);
+            const float3 p = transform_position(positions, transform_indices, transforms, idx);
             int3 center_cell = pos_to_cell(p, grid_min, inv_cell_size);
 
             // Check 27 neighbor cells
@@ -108,9 +139,11 @@ namespace lfs::core::cuda {
                             if (mask[other] == 0)
                                 continue;
 
-                            float dist_x = positions[other * 3] - p.x;
-                            float dist_y = positions[other * 3 + 1] - p.y;
-                            float dist_z = positions[other * 3 + 2] - p.z;
+                            const float3 other_position = transform_position(
+                                positions, transform_indices, transforms, other);
+                            const float dist_x = other_position.x - p.x;
+                            const float dist_y = other_position.y - p.y;
+                            const float dist_z = other_position.z - p.z;
                             if (dist_x * dist_x + dist_y * dist_y + dist_z * dist_z <= radius_sq) {
                                 out_mask[idx] = group_id;
                                 return;
@@ -123,6 +156,8 @@ namespace lfs::core::cuda {
 
         __global__ void shrink_kernel(
             const float* __restrict__ positions,
+            const int* __restrict__ transform_indices,
+            const float* __restrict__ transforms,
             const uint8_t* __restrict__ mask,
             uint8_t* __restrict__ out_mask,
             const int* __restrict__ sorted_indices,
@@ -139,7 +174,7 @@ namespace lfs::core::cuda {
             if (mask[idx] == 0)
                 return;
 
-            float3 p = make_float3(positions[idx * 3], positions[idx * 3 + 1], positions[idx * 3 + 2]);
+            const float3 p = transform_position(positions, transform_indices, transforms, idx);
             int3 center_cell = pos_to_cell(p, grid_min, inv_cell_size);
 
             // If any unselected neighbor within radius → deselect (boundary erosion)
@@ -161,9 +196,11 @@ namespace lfs::core::cuda {
                             if (mask[other] > 0)
                                 continue;
 
-                            float dist_x = positions[other * 3] - p.x;
-                            float dist_y = positions[other * 3 + 1] - p.y;
-                            float dist_z = positions[other * 3 + 2] - p.z;
+                            const float3 other_position = transform_position(
+                                positions, transform_indices, transforms, other);
+                            const float dist_x = other_position.x - p.x;
+                            const float dist_y = other_position.y - p.y;
+                            const float dist_z = other_position.z - p.z;
                             if (dist_x * dist_x + dist_y * dist_y + dist_z * dist_z <= radius_sq) {
                                 out_mask[idx] = 0;
                                 return;
@@ -253,6 +290,8 @@ namespace lfs::core::cuda {
 
         __global__ void compute_aabb_kernel(
             const float* __restrict__ positions,
+            const int* __restrict__ transform_indices,
+            const float* __restrict__ transforms,
             float* __restrict__ aabb,
             int N) {
             __shared__ float s_min[3][BLOCK_SIZE];
@@ -267,8 +306,9 @@ namespace lfs::core::cuda {
             }
 
             if (idx < N) {
+                const float3 position = transform_position(positions, transform_indices, transforms, idx);
                 for (int c = 0; c < 3; ++c) {
-                    float v = positions[idx * 3 + c];
+                    const float v = c == 0 ? position.x : (c == 1 ? position.y : position.z);
                     s_min[c][tid] = v;
                     s_max[c][tid] = v;
                 }
@@ -294,6 +334,7 @@ namespace lfs::core::cuda {
         }
 
         struct SpatialGrid {
+            Tensor world_positions;
             Tensor sorted_indices;
             Tensor cell_start;
             Tensor cell_end;
@@ -303,7 +344,57 @@ namespace lfs::core::cuda {
             int num_cells;
         };
 
-        SpatialGrid build_grid(const Tensor& means, float cell_size, cudaStream_t stream) {
+        struct WorldTransformData {
+            Tensor indices;
+            Tensor matrices;
+
+            [[nodiscard]] const int* indices_ptr() const {
+                return indices.is_valid() ? indices.ptr<int>() : nullptr;
+            }
+
+            [[nodiscard]] const float* matrices_ptr() const {
+                return matrices.is_valid() ? matrices.ptr<float>() : nullptr;
+            }
+        };
+
+        WorldTransformData prepare_world_transforms(
+            const Tensor& means,
+            const Tensor* transform_indices,
+            const std::vector<glm::mat4>* node_transforms) {
+            WorldTransformData result;
+            if (!transform_indices && !node_transforms)
+                return result;
+
+            assert(transform_indices && node_transforms && !node_transforms->empty());
+            assert(transform_indices->is_valid());
+            assert(transform_indices->dtype() == DataType::Int32);
+            assert(transform_indices->numel() == means.size(0));
+
+            result.indices = transform_indices->device() == Device::CUDA
+                                 ? *transform_indices
+                                 : transform_indices->cuda();
+            if (!result.indices.is_contiguous())
+                result.indices = result.indices.contiguous();
+
+            std::vector<float> matrix_data;
+            matrix_data.reserve(node_transforms->size() * 16);
+            for (const auto& transform : *node_transforms) {
+                for (int column = 0; column < 4; ++column) {
+                    for (int row = 0; row < 4; ++row) {
+                        matrix_data.push_back(transform[column][row]);
+                    }
+                }
+            }
+            result.matrices = Tensor::from_vector(
+                matrix_data, {node_transforms->size(), 16}, Device::CUDA);
+            return result;
+        }
+
+        SpatialGrid build_grid(const Tensor& means,
+                               float cell_size,
+                               const int* transform_indices,
+                               const float* transforms,
+                               cudaStream_t stream) {
             const int N = static_cast<int>(means.size(0));
             const float* pos_ptr = means.ptr<float>();
 
@@ -319,7 +410,8 @@ namespace lfs::core::cuda {
 
             int blocks = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
             const auto aabb_ticket = ::lfs::core::cuda_record_range(stream, "core.selection.build_grid.aabb_pipeline");
-            compute_aabb_kernel<<<blocks, BLOCK_SIZE, 0, stream>>>(pos_ptr, aabb_buf.ptr<float>(), N);
+            compute_aabb_kernel<<<blocks, BLOCK_SIZE, 0, stream>>>(
+                pos_ptr, transform_indices, transforms, aabb_buf.ptr<float>(), N);
             LFS_CUDA_LAUNCH_CHECK(stream, "core.selection.build_grid.compute_aabb");
 
             float aabb_host[6];
@@ -328,20 +420,34 @@ namespace lfs::core::cuda {
                 "build_grid: AABB readback");
             LFS_CUDA_AWAIT(aabb_ticket, cudaStreamSynchronize(stream), "core.selection.build_grid.aabb_readback");
 
+            // Cells must be at least the search radius; beyond that, coarser
+            // cells only make the neighbour scan longer. A grid much finer
+            // than the point count spends 8 bytes on every empty cell (8 GiB
+            // at 1024^3), and one wider than MAX_DIM cells would drop the
+            // points outside it, so cells grow until neither happens.
+            constexpr int MAX_DIM = 1024;
+            const float span_x = std::max(aabb_host[3] - aabb_host[0], 0.0f);
+            const float span_y = std::max(aabb_host[4] - aabb_host[1], 0.0f);
+            const float span_z = std::max(aabb_host[5] - aabb_host[2], 0.0f);
+            const auto cells_at = [&](const float size) {
+                return (std::ceil(span_x / size) + 2.0) * (std::ceil(span_y / size) + 2.0) *
+                       (std::ceil(span_z / size) + 2.0);
+            };
+            cell_size = std::max(cell_size, std::max({span_x, span_y, span_z}) / (MAX_DIM - 4));
+            const double max_cells = std::max(4096.0, 2.0 * N);
+            while (cells_at(cell_size) > max_cells) {
+                cell_size *= 1.25f;
+            }
+
             float3 grid_min = make_float3(aabb_host[0] - cell_size, aabb_host[1] - cell_size, aabb_host[2] - cell_size);
             float3 grid_max = make_float3(aabb_host[3] + cell_size, aabb_host[4] + cell_size, aabb_host[5] + cell_size);
             float inv_cell_size = 1.0f / cell_size;
 
             int3 grid_dims = make_int3(
-                static_cast<int>(ceilf((grid_max.x - grid_min.x) * inv_cell_size)),
-                static_cast<int>(ceilf((grid_max.y - grid_min.y) * inv_cell_size)),
-                static_cast<int>(ceilf((grid_max.z - grid_min.z) * inv_cell_size)));
-
-            // Clamp grid to reasonable size
-            constexpr int MAX_DIM = 1024;
-            grid_dims.x = std::min(grid_dims.x, MAX_DIM);
-            grid_dims.y = std::min(grid_dims.y, MAX_DIM);
-            grid_dims.z = std::min(grid_dims.z, MAX_DIM);
+                std::max(1, static_cast<int>(ceilf((grid_max.x - grid_min.x) * inv_cell_size))),
+                std::max(1, static_cast<int>(ceilf((grid_max.y - grid_min.y) * inv_cell_size))),
+                std::max(1, static_cast<int>(ceilf((grid_max.z - grid_min.z) * inv_cell_size))));
+            assert(grid_dims.x <= MAX_DIM && grid_dims.y <= MAX_DIM && grid_dims.z <= MAX_DIM);
 
             const int64_t total = static_cast<int64_t>(grid_dims.x) * grid_dims.y * grid_dims.z;
             assert(total <= INT_MAX && "Grid cell count overflows int32");
@@ -350,9 +456,14 @@ namespace lfs::core::cuda {
             // Compute cell IDs
             auto cell_ids = Tensor::empty({static_cast<size_t>(N)}, Device::CUDA, DataType::Int32);
             auto sorted_indices = Tensor::empty({static_cast<size_t>(N)}, Device::CUDA, DataType::Int32);
+            Tensor world_positions;
+            if (transform_indices && transforms)
+                world_positions = Tensor::empty(means.shape(), Device::CUDA, DataType::Float32);
 
             compute_cell_ids<<<blocks, BLOCK_SIZE, 0, stream>>>(
-                pos_ptr, cell_ids.ptr<int>(),
+                pos_ptr, transform_indices, transforms,
+                world_positions.is_valid() ? world_positions.ptr<float>() : nullptr,
+                cell_ids.ptr<int>(),
                 grid_min, inv_cell_size, grid_dims, N);
             LFS_CUDA_LAUNCH_CHECK(stream, "core.selection.build_grid.compute_cell_ids");
 
@@ -379,6 +490,7 @@ namespace lfs::core::cuda {
             LFS_CUDA_LAUNCH_CHECK(stream, "core.selection.build_grid.find_cell_starts");
 
             return SpatialGrid{
+                std::move(world_positions),
                 std::move(sorted_indices),
                 std::move(cell_start),
                 std::move(cell_end),
@@ -390,7 +502,12 @@ namespace lfs::core::cuda {
 
     } // namespace
 
-    Tensor selection_grow(const Tensor& mask, const Tensor& means, float radius, uint8_t group_id) {
+    Tensor selection_grow(const Tensor& mask,
+                          const Tensor& means,
+                          float radius,
+                          uint8_t group_id,
+                          const Tensor* transform_indices,
+                          const std::vector<glm::mat4>* node_transforms) {
         assert(mask.device() == Device::CUDA);
         assert(means.device() == Device::CUDA);
         assert(mask.dtype() == DataType::UInt8);
@@ -408,13 +525,19 @@ namespace lfs::core::cuda {
         }
 
         cudaStream_t stream = mask.stream();
-        auto grid = build_grid(means, radius, stream);
+        auto world_transforms = prepare_world_transforms(means, transform_indices, node_transforms);
+        auto grid = build_grid(
+            means, radius, world_transforms.indices_ptr(), world_transforms.matrices_ptr(), stream);
+        const float* search_positions = grid.world_positions.is_valid()
+                                            ? grid.world_positions.ptr<float>()
+                                            : means.ptr<float>();
 
         auto out_mask = Tensor::zeros({static_cast<size_t>(N)}, Device::CUDA, DataType::UInt8);
 
         int blocks = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
         grow_kernel<<<blocks, BLOCK_SIZE, 0, stream>>>(
-            means.ptr<float>(), mask.ptr<uint8_t>(), out_mask.ptr<uint8_t>(),
+            search_positions, nullptr, nullptr,
+            mask.ptr<uint8_t>(), out_mask.ptr<uint8_t>(),
             grid.sorted_indices.ptr<int>(), grid.cell_start.ptr<int>(), grid.cell_end.ptr<int>(),
             grid.grid_min, grid.inv_cell_size, grid.grid_dims,
             radius * radius, group_id, N);
@@ -424,7 +547,11 @@ namespace lfs::core::cuda {
         return out_mask;
     }
 
-    Tensor selection_shrink(const Tensor& mask, const Tensor& means, float radius) {
+    Tensor selection_shrink(const Tensor& mask,
+                            const Tensor& means,
+                            float radius,
+                            const Tensor* transform_indices,
+                            const std::vector<glm::mat4>* node_transforms) {
         assert(mask.device() == Device::CUDA);
         assert(means.device() == Device::CUDA);
         assert(mask.dtype() == DataType::UInt8);
@@ -442,13 +569,19 @@ namespace lfs::core::cuda {
         }
 
         cudaStream_t stream = mask.stream();
-        auto grid = build_grid(means, radius, stream);
+        auto world_transforms = prepare_world_transforms(means, transform_indices, node_transforms);
+        auto grid = build_grid(
+            means, radius, world_transforms.indices_ptr(), world_transforms.matrices_ptr(), stream);
+        const float* search_positions = grid.world_positions.is_valid()
+                                            ? grid.world_positions.ptr<float>()
+                                            : means.ptr<float>();
 
         auto out_mask = Tensor::zeros({static_cast<size_t>(N)}, Device::CUDA, DataType::UInt8);
 
         int blocks = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
         shrink_kernel<<<blocks, BLOCK_SIZE, 0, stream>>>(
-            means.ptr<float>(), mask.ptr<uint8_t>(), out_mask.ptr<uint8_t>(),
+            search_positions, nullptr, nullptr,
+            mask.ptr<uint8_t>(), out_mask.ptr<uint8_t>(),
             grid.sorted_indices.ptr<int>(), grid.cell_start.ptr<int>(), grid.cell_end.ptr<int>(),
             grid.grid_min, grid.inv_cell_size, grid.grid_dims,
             radius * radius, N);

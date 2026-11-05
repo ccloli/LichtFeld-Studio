@@ -50,6 +50,7 @@ namespace lfs::vis::gui {
 
     private:
         friend class lfs::vis::WindowInputDispatchTest;
+        friend class lfs::vis::SidebarInputDispatchTest;
         struct InputForwardResult {
             bool event_forwarded = false;
         };
@@ -63,6 +64,7 @@ namespace lfs::vis::gui {
         [[nodiscard]] bool isLanguageSelectOpen() const;
         [[nodiscard]] bool isLanguageSelectHit(float local_x, float local_y) const;
         [[nodiscard]] bool isLanguageDropdownHit(float local_x, float local_y) const;
+        [[nodiscard]] std::string attributeAt(float local_x, float local_y, const char* attribute) const;
         [[nodiscard]] bool isLinkHit(float local_x, float local_y) const;
         [[nodiscard]] std::optional<StartupOverlayRect> elementBorderRect(Rml::Element* element) const;
         [[nodiscard]] std::optional<StartupOverlayRect> languageDropdownRect() const;

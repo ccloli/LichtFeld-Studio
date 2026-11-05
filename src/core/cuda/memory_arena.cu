@@ -6,7 +6,8 @@
 #include "core/assert.hpp"
 #include "core/cuda_error.hpp"
 #include "core/logger.hpp"
-#include "core/training_churn_metrics.hpp"
+#include "core/memory_pressure.hpp"
+#include "core/tensor/internal/memory_pool.hpp"
 #include "diagnostics/vram_profiler.hpp"
 #include "memory_arena.hpp"
 #include <algorithm>
@@ -24,8 +25,7 @@ namespace lfs::core {
     }
 
     RasterizerMemoryArena::RasterizerMemoryArena(const Config& cfg)
-        : config_(cfg),
-          creation_time_(std::chrono::steady_clock::now()) {
+        : config_(cfg) {
 
         // Check if VMM is supported
         int device = -1;
@@ -43,11 +43,30 @@ namespace lfs::core {
                   config_.max_physical >> 30, config_.granularity >> 20);
     }
 
+    namespace {
+        void log_teardown_status(const cudaError_t status, const char* what) {
+            if (status != cudaSuccess) {
+                ensure_cuda_success(status, what, "context=arena teardown",
+                                    LFS_SOURCE_SITE_CURRENT(),
+                                    CudaFailureDisposition::LogOnlyNoLatch);
+            }
+        }
+    } // namespace
+
     RasterizerMemoryArena::~RasterizerMemoryArena() {
-        dump_statistics();
+        drain_external_release();
 
         {
             std::lock_guard<std::mutex> event_lock(last_frame_event_mutex_);
+            if (release_event_) {
+                if (release_pending_) {
+                    // A viewer batch may still read the backing released below.
+                    log_teardown_status(cudaEventSynchronize(release_event_), "drain viewer release event (arena destruction)");
+                    release_pending_ = false;
+                }
+                log_teardown_status(cudaEventDestroy(release_event_), "destroy viewer release event");
+                release_event_ = nullptr;
+            }
             if (last_frame_event_) {
                 const cudaError_t destroy_status = cudaEventDestroy(last_frame_event_);
                 if (destroy_status != cudaSuccess) {
@@ -75,18 +94,12 @@ namespace lfs::core {
 
     RasterizerMemoryArena::RasterizerMemoryArena(RasterizerMemoryArena&& other) noexcept {
         std::scoped_lock lock(other.arena_mutex_, other.frame_mutex_, other.sync_mutex_,
-                              other.last_frame_event_mutex_);
+                              other.last_frame_event_mutex_, other.stats_mutex_);
         device_arenas_ = std::move(other.device_arenas_);
         frame_contexts_ = std::move(other.frame_contexts_);
         config_ = other.config_;
         frame_counter_ = other.frame_counter_.load();
         generation_counter_ = other.generation_counter_.load();
-        growth_timing_ = std::move(other.growth_timing_);
-        if (!growth_timing_) {
-            growth_timing_ = std::make_shared<GrowthTiming>();
-        }
-        other.growth_timing_ = std::make_shared<GrowthTiming>();
-        creation_time_ = other.creation_time_;
         total_frames_processed_ = other.total_frames_processed_.load();
         active_frames_ = other.active_frames_;
         pending_render_frames_ = other.pending_render_frames_;
@@ -95,20 +108,40 @@ namespace lfs::core {
         render_handoff_token_ = other.render_handoff_token_;
         next_render_handoff_token_ = other.next_render_handoff_token_;
         render_handoff_deadline_ = other.render_handoff_deadline_;
-        render_handoff_training_frames_ = other.render_handoff_training_frames_;
+        training_turns_owed_ = other.training_turns_owed_;
+        viewer_admission_ = other.viewer_admission_;
+        other.viewer_admission_ = {};
+        other.training_turns_owed_ = 0;
         other.render_handoff_token_ = 0;
         last_frame_event_ = other.last_frame_event_;
         last_frame_event_valid_ = other.last_frame_event_valid_;
+        last_frame_gpu_complete_ = other.last_frame_gpu_complete_;
         external_release_semaphore_ = other.external_release_semaphore_;
         external_release_value_ = other.external_release_value_;
+        release_stream_ = other.release_stream_;
+        release_event_ = other.release_event_;
+        release_pending_ = other.release_pending_;
+        release_stream_failed_ = other.release_stream_failed_;
+        release_submitted_at_ = other.release_submitted_at_;
+        std::copy(std::begin(other.viewer_turn_ring_), std::end(other.viewer_turn_ring_), viewer_turn_ring_);
+        viewer_turn_count_ = other.viewer_turn_count_;
+        training_step_ms_ = other.training_step_ms_;
+        viewer_record_ms_ = other.viewer_record_ms_;
+        last_training_begin_ = other.last_training_begin_;
+        last_tenant_was_training_ = other.last_tenant_was_training_;
         other.last_frame_event_ = nullptr;
         other.last_frame_event_valid_ = false;
+        other.last_frame_gpu_complete_ = false;
         other.external_release_semaphore_ = nullptr;
         other.external_release_value_ = 0;
+        other.release_stream_ = nullptr;
+        other.release_event_ = nullptr;
+        other.release_pending_ = false;
     }
 
     RasterizerMemoryArena& RasterizerMemoryArena::operator=(RasterizerMemoryArena&& other) noexcept {
         if (this != &other) {
+            drain_external_release();
             std::scoped_lock lock(
                 arena_mutex_,
                 other.arena_mutex_,
@@ -117,18 +150,14 @@ namespace lfs::core {
                 sync_mutex_,
                 other.sync_mutex_,
                 last_frame_event_mutex_,
-                other.last_frame_event_mutex_);
+                other.last_frame_event_mutex_,
+                stats_mutex_,
+                other.stats_mutex_);
             device_arenas_ = std::move(other.device_arenas_);
             frame_contexts_ = std::move(other.frame_contexts_);
             config_ = other.config_;
             frame_counter_ = other.frame_counter_.load();
             generation_counter_ = other.generation_counter_.load();
-            growth_timing_ = std::move(other.growth_timing_);
-            if (!growth_timing_) {
-                growth_timing_ = std::make_shared<GrowthTiming>();
-            }
-            other.growth_timing_ = std::make_shared<GrowthTiming>();
-            creation_time_ = other.creation_time_;
             total_frames_processed_ = other.total_frames_processed_.load();
             active_frames_ = other.active_frames_;
             pending_render_frames_ = other.pending_render_frames_;
@@ -137,8 +166,31 @@ namespace lfs::core {
             render_handoff_token_ = other.render_handoff_token_;
             next_render_handoff_token_ = other.next_render_handoff_token_;
             render_handoff_deadline_ = other.render_handoff_deadline_;
-            render_handoff_training_frames_ = other.render_handoff_training_frames_;
+            training_turns_owed_ = other.training_turns_owed_;
+            viewer_admission_ = other.viewer_admission_;
+            other.viewer_admission_ = {};
+            other.training_turns_owed_ = 0;
             other.render_handoff_token_ = 0;
+            if (release_event_) {
+                if (release_pending_) {
+                    log_teardown_status(cudaEventSynchronize(release_event_), "drain viewer release event (arena move assignment)");
+                }
+                log_teardown_status(cudaEventDestroy(release_event_), "destroy viewer release event (arena move assignment)");
+            }
+            release_stream_ = other.release_stream_;
+            release_event_ = other.release_event_;
+            release_pending_ = other.release_pending_;
+            release_stream_failed_ = other.release_stream_failed_;
+            release_submitted_at_ = other.release_submitted_at_;
+            std::copy(std::begin(other.viewer_turn_ring_), std::end(other.viewer_turn_ring_), viewer_turn_ring_);
+            viewer_turn_count_ = other.viewer_turn_count_;
+            training_step_ms_ = other.training_step_ms_;
+            viewer_record_ms_ = other.viewer_record_ms_;
+            last_training_begin_ = other.last_training_begin_;
+            last_tenant_was_training_ = other.last_tenant_was_training_;
+            other.release_stream_ = nullptr;
+            other.release_event_ = nullptr;
+            other.release_pending_ = false;
             if (last_frame_event_) {
                 const cudaError_t destroy_status = cudaEventDestroy(last_frame_event_);
                 if (destroy_status != cudaSuccess) {
@@ -150,10 +202,12 @@ namespace lfs::core {
             }
             last_frame_event_ = other.last_frame_event_;
             last_frame_event_valid_ = other.last_frame_event_valid_;
+            last_frame_gpu_complete_ = other.last_frame_gpu_complete_;
             external_release_semaphore_ = other.external_release_semaphore_;
             external_release_value_ = other.external_release_value_;
             other.last_frame_event_ = nullptr;
             other.last_frame_event_valid_ = false;
+            other.last_frame_gpu_complete_ = false;
             other.external_release_semaphore_ = nullptr;
             other.external_release_value_ = 0;
         }
@@ -252,8 +306,7 @@ namespace lfs::core {
     }
 
     RasterizerMemoryArena::RenderHandoffToken
-    RasterizerMemoryArena::request_render_handoff(const RenderHandoffToken current_token,
-                                                  const uint32_t training_frames_first) {
+    RasterizerMemoryArena::request_render_handoff(const RenderHandoffToken current_token) {
         std::lock_guard<std::mutex> lock(sync_mutex_);
         const auto now = std::chrono::steady_clock::now();
         if (render_handoff_token_ != 0 && render_handoff_deadline_ <= now) {
@@ -273,9 +326,65 @@ namespace lfs::core {
         }
         render_handoff_token_ = token;
         render_handoff_deadline_ = now + std::chrono::milliseconds(kRenderHandoffLeaseMs);
-        render_handoff_training_frames_ = training_frames_first;
         sync_cv_.notify_all();
         return token;
+    }
+
+    void RasterizerMemoryArena::owe_training_frames(const uint32_t frames) {
+        {
+            std::lock_guard<std::mutex> lock(sync_mutex_);
+            training_turns_owed_ = std::min<uint64_t>(uint64_t(training_turns_owed_) + frames, 64u);
+        }
+        sync_cv_.notify_all();
+    }
+
+    void RasterizerMemoryArena::prepare_viewer_frame() {
+        std::lock_guard<std::mutex> lock(sync_mutex_);
+        viewer_admission_.prepare(std::chrono::steady_clock::now());
+    }
+
+    void RasterizerMemoryArena::cancel_viewer_prediction() {
+        {
+            std::lock_guard<std::mutex> lock(sync_mutex_);
+            viewer_admission_ = {};
+        }
+        sync_cv_.notify_all();
+    }
+
+    RasterizerMemoryArena::RenderHandoffToken
+    RasterizerMemoryArena::reserve_next_viewer_turn(const RenderHandoffToken current_token) {
+        {
+            std::lock_guard<std::mutex> lock(sync_mutex_);
+            if (viewer_admission_.predicted(std::chrono::steady_clock::now())) {
+                // The forecast replaces the standing post-release lease. Active
+                // requests still reserve through request_render_handoff.
+                return 0;
+            }
+        }
+        return request_render_handoff(current_token);
+    }
+
+    RasterizerMemoryArena::TurnStats RasterizerMemoryArena::turn_stats() const {
+        std::lock_guard<std::mutex> lock(stats_mutex_);
+        TurnStats stats;
+        stats.training_step_ms = training_step_ms_;
+        stats.viewer_record_ms = viewer_record_ms_;
+        const uint32_t count = std::min<uint32_t>(viewer_turn_count_, 5u);
+        if (count != 0) {
+            double sorted[5];
+            std::copy(viewer_turn_ring_, viewer_turn_ring_ + count, sorted);
+            std::sort(sorted, sorted + count);
+            stats.viewer_turn_ms = sorted[count / 2];
+        }
+        return stats;
+    }
+
+    void RasterizerMemoryArena::update_viewer_turn_cost(const double turn_ms) {
+        std::lock_guard<std::mutex> lock(stats_mutex_);
+        viewer_turn_ring_[viewer_turn_count_ % 5u] = turn_ms;
+        ++viewer_turn_count_;
+        last_tenant_was_training_ = false;
+        lfs::diagnostics::VramProfiler::instance().setGauge("viewer.turn_ms", turn_ms);
     }
 
     void RasterizerMemoryArena::cancel_render_handoff(const RenderHandoffToken token) {
@@ -311,7 +420,7 @@ namespace lfs::core {
         std::lock_guard<std::mutex> lock(sync_mutex_);
         return render_handoff_token_ == token &&
                render_handoff_deadline_ > std::chrono::steady_clock::now() &&
-               render_handoff_training_frames_ != 0;
+               training_turns_owed_ != 0;
     }
 
     void RasterizerMemoryArena::withdraw_render_handoff_training_frames(const RenderHandoffToken token) {
@@ -319,8 +428,11 @@ namespace lfs::core {
             return;
         }
         std::lock_guard<std::mutex> lock(sync_mutex_);
-        if (render_handoff_token_ == token) {
-            render_handoff_training_frames_ = 0;
+        if (render_handoff_token_ == token && active_training_frames_ == 0 && viewer_release_waiters_ == 0 &&
+            !previous_frame_still_running()) {
+            // The grace period only reclaims turns from an idle trainer, never
+            // one still waiting for the viewer or executing its owed step.
+            training_turns_owed_ = 0;
         }
     }
 
@@ -340,8 +452,30 @@ namespace lfs::core {
         return !other_reservation && !previous_frame_still_running();
     }
 
+    bool RasterizerMemoryArena::release_event_pending_locked() const {
+        if (!release_pending_ || !release_event_) {
+            return false;
+        }
+        const cudaError_t status = cudaEventQuery(release_event_);
+        if (status == cudaErrorNotReady) {
+            return true;
+        }
+        if (status != cudaSuccess) {
+            ensure_cuda_success(status, "cudaEventQuery(viewer release)", "fallback=event wait",
+                                LFS_SOURCE_SITE_CURRENT(), CudaFailureDisposition::LogOnly);
+        }
+        return false;
+    }
+
     bool RasterizerMemoryArena::previous_frame_still_running() const {
         std::lock_guard<std::mutex> event_lock(last_frame_event_mutex_);
+        // A viewer batch registered through await_external_release counts as the
+        // previous frame until its release event completes: neither tenant may
+        // begin behind it, so at most one viewer frame is ever in flight and the
+        // trainer's wait for it happens before it claims the arena.
+        if (release_event_pending_locked()) {
+            return true;
+        }
         if (external_release_semaphore_ != nullptr || !last_frame_event_valid_ || !last_frame_event_) {
             return false;
         }
@@ -356,17 +490,130 @@ namespace lfs::core {
         return false;
     }
 
-    void RasterizerMemoryArena::note_external_release(cudaExternalSemaphore_t semaphore, uint64_t value) {
+    void RasterizerMemoryArena::await_external_release(cudaExternalSemaphore_t semaphore, uint64_t value, cudaStream_t viewer_stream) {
         std::lock_guard<std::mutex> lock(last_frame_event_mutex_);
         external_release_semaphore_ = semaphore;
         external_release_value_ = value;
+        if (semaphore == nullptr || value == 0 || viewer_stream == nullptr || release_stream_failed_) {
+            return;
+        }
+        // Input uploads were enqueued before the Vulkan submit. Its completion
+        // wait can follow on that same non-blocking stream: one-in-flight
+        // admission prevents another upload until this event has completed.
+        // The renderer drains this borrow before destroying the stream.
+        release_stream_ = viewer_stream;
+        if (!release_event_) {
+            const cudaError_t event_status =
+                cudaEventCreateWithFlags(&release_event_, cudaEventDisableTiming);
+            if (event_status != cudaSuccess) {
+                ensure_cuda_success(event_status, "cudaEventCreateWithFlags(viewer release)",
+                                    "fallback=semaphore wait on the tenant stream",
+                                    LFS_SOURCE_SITE_CURRENT(), CudaFailureDisposition::LogOnly);
+                release_event_ = nullptr;
+                release_stream_failed_ = true;
+                return;
+            }
+        }
+        cudaExternalSemaphoreWaitParams wait_params{};
+        wait_params.params.fence.value = value;
+        const cudaError_t wait_status =
+            cudaWaitExternalSemaphoresAsync(&semaphore, &wait_params, 1, release_stream_);
+        if (wait_status != cudaSuccess) {
+            release_pending_ = false;
+            release_stream_failed_ = true;
+            ensure_cuda_success(
+                wait_status, "cudaWaitExternalSemaphoresAsync(viewer release)",
+                detail::format_cuda_safe("release_value={}, fallback=semaphore wait on the tenant stream",
+                                         value),
+                LFS_SOURCE_SITE_CURRENT(), CudaFailureDisposition::LogOnly);
+            return;
+        }
+        const cudaError_t record_status = cudaEventRecord(release_event_, release_stream_);
+        if (record_status != cudaSuccess) {
+            release_pending_ = false;
+            release_stream_failed_ = true;
+            ensure_cuda_success(record_status, "cudaEventRecord(viewer release)",
+                                "fallback=semaphore wait on the tenant stream",
+                                LFS_SOURCE_SITE_CURRENT(), CudaFailureDisposition::LogOnly);
+            return;
+        }
+        if (!release_pending_) {
+            // A chained batch (selection overlay after the forward pass) keeps
+            // the first submit time: the turn cost is the whole viewer turn.
+            release_submitted_at_ = std::chrono::steady_clock::now();
+        }
+        release_pending_ = true;
+    }
+
+    void RasterizerMemoryArena::set_release_event_for_testing(cudaEvent_t event, cudaStream_t viewer_stream) {
+        std::lock_guard<std::mutex> lock(last_frame_event_mutex_);
+        if (release_event_ && release_event_ != event) {
+            log_teardown_status(cudaEventDestroy(release_event_), "replace viewer release event (test)");
+        }
+        release_event_ = event;
+        release_stream_ = viewer_stream;
+        release_pending_ = event != nullptr;
+        release_submitted_at_ = std::chrono::steady_clock::now();
+    }
+
+    bool RasterizerMemoryArena::wait_release_event() {
+        cudaEvent_t event = nullptr;
+        std::chrono::steady_clock::time_point submitted_at{};
+        {
+            std::lock_guard<std::mutex> lock(last_frame_event_mutex_);
+            if (!release_pending_ || !release_event_) {
+                return false;
+            }
+            event = release_event_;
+            submitted_at = release_submitted_at_;
+        }
+        // Bounded by the viewer batch itself. The event may be re-recorded by a
+        // chained viewer submit meanwhile; the caller re-checks afterwards.
+        const cudaError_t status = cudaEventSynchronize(event);
+        if (status != cudaSuccess) {
+            ensure_cuda_success(status, "cudaEventSynchronize(viewer release)",
+                                "fallback=semaphore wait on the tenant stream",
+                                LFS_SOURCE_SITE_CURRENT(), CudaFailureDisposition::LogOnly);
+        }
+        const double turn_ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - submitted_at).count();
+        bool consumed = false;
+        {
+            std::lock_guard<std::mutex> lock(last_frame_event_mutex_);
+            if (status != cudaSuccess) {
+                release_pending_ = false;
+                release_stream_failed_ = true;
+                return false;
+            }
+            if (release_pending_ && release_event_ == event &&
+                cudaEventQuery(release_event_) == cudaSuccess) {
+                release_pending_ = false;
+                last_frame_gpu_complete_ = true;
+                // The imported-timeline wait is already satisfied; drop the
+                // semaphore so the tenant stream does not wait it again.
+                external_release_semaphore_ = nullptr;
+                external_release_value_ = 0;
+                consumed = true;
+            }
+        }
+        if (consumed) {
+            update_viewer_turn_cost(turn_ms);
+            LOG_PERF("arena.viewer_turn took %.3fms", turn_ms);
+        }
+        return consumed;
     }
 
     void RasterizerMemoryArena::drain_external_release() {
+        while (wait_release_event()) {
+        }
         cudaExternalSemaphore_t release_semaphore = nullptr;
         uint64_t release_value = 0;
         {
             std::lock_guard<std::mutex> lock(last_frame_event_mutex_);
+            if (release_stream_) {
+                log_teardown_status(cudaStreamSynchronize(release_stream_), "drain viewer release stream");
+                release_stream_ = nullptr;
+            }
             release_semaphore = external_release_semaphore_;
             release_value = external_release_value_;
             external_release_semaphore_ = nullptr;
@@ -419,12 +666,21 @@ namespace lfs::core {
         uint64_t release_value = 0;
         bool chain_ok = false;
         cudaEvent_t previous_frame_event = nullptr;
+        // A viewer release with a live event was already host-waited by the
+        // admission loop for training frames; streamless tenants wait it here.
+        // Either way the Vulkan batch has finished and nothing of the previous
+        // frame is left on the GPU: the chain is re-established without the
+        // tenant-stream semaphore wait or a device sync.
+        (void)wait_release_event();
         {
             std::lock_guard<std::mutex> lock(last_frame_event_mutex_);
             release_semaphore = external_release_semaphore_;
             release_value = external_release_value_;
             external_release_semaphore_ = nullptr;
             external_release_value_ = 0;
+            if (last_frame_gpu_complete_ && release_semaphore == nullptr) {
+                return cudaSuccess;
+            }
             if (!stream && last_frame_event_valid_) {
                 previous_frame_event = last_frame_event_;
             }
@@ -486,6 +742,7 @@ namespace lfs::core {
         if (previous_frame_event != nullptr && release_semaphore == nullptr) {
             return cudaEventSynchronize(previous_frame_event);
         }
+        LOG_PERF("cudaDeviceSynchronize(arena frame fallback)");
         return cudaDeviceSynchronize();
     }
 
@@ -503,7 +760,8 @@ namespace lfs::core {
             };
             const auto expire_handoff = [this]() {
                 if (render_handoff_token_ != 0 &&
-                    render_handoff_deadline_ <= std::chrono::steady_clock::now()) {
+                    render_handoff_deadline_ <= std::chrono::steady_clock::now() &&
+                    training_turns_owed_ == 0) {
                     render_handoff_token_ = 0;
                 }
             };
@@ -513,17 +771,54 @@ namespace lfs::core {
                     return false;
                 }
                 if (!from_rendering) {
+                    std::lock_guard<std::mutex> stats_lock(stats_mutex_);
                     return pending_render_frames_ == 0 &&
-                           (!handoff_active() || render_handoff_training_frames_ != 0);
+                           (!handoff_active() || training_turns_owed_ != 0) &&
+                           viewer_admission_.admits(std::chrono::steady_clock::now(), training_step_ms_, training_turns_owed_);
                 }
-                return !handoff_active() || render_handoff_token_ == render_handoff_token;
+                return !handoff_active() ||
+                       (render_handoff_token_ == render_handoff_token && training_turns_owed_ == 0);
             };
-            const auto previous_frame_blocks = [this, decline_while_previous_frame_runs]() {
-                return decline_while_previous_frame_runs && previous_frame_still_running();
+            const auto previous_frame_blocks = [this, from_rendering, decline_while_previous_frame_runs]() {
+                // A forecast budgets one step, not a queue of CUDA frames. In
+                // navigation, finish the prior GPU turn before admitting more
+                // training. Idle training retains its asynchronous chaining.
+                return (decline_while_previous_frame_runs ||
+                        (!from_rendering && viewer_admission_.expires() > std::chrono::steady_clock::now())) &&
+                       previous_frame_still_running();
+            };
+            const auto sample_training_step = [this, from_rendering, &previous_frame_blocks]() {
+                if (from_rendering || active_frames_ != 0 || previous_frame_blocks())
+                    return;
+                // Measure through GPU completion, before any admission wait.
+                // CPU enqueue time alone can be much shorter than the step.
+                std::lock_guard<std::mutex> stats_lock(stats_mutex_);
+                if (last_tenant_was_training_ && last_training_begin_ != std::chrono::steady_clock::time_point{}) {
+                    const double period_ms = std::chrono::duration<double, std::milli>(
+                                                 std::chrono::steady_clock::now() - last_training_begin_)
+                                                 .count();
+                    training_step_ms_ = training_step_ms_ == 0.0
+                                            ? period_ms
+                                            : 0.9 * training_step_ms_ + 0.1 * period_ms;
+                }
+                last_tenant_was_training_ = false;
+            };
+            // A training frame never claims the arena while a viewer batch is
+            // still on the GPU: it waits for that batch here, on the host, with
+            // the arena free, and the wait is logged as the viewer's turn
+            // (arena.viewer_turn) instead of surfacing inside the rasterizer.
+            const auto viewer_turn_pending = [this, from_rendering]() {
+                if (from_rendering) {
+                    return false;
+                }
+                std::lock_guard<std::mutex> event_lock(last_frame_event_mutex_);
+                return release_pending_;
             };
             if (!wait_timeout_ms.has_value()) {
                 expire_handoff();
-                if (!can_begin() || previous_frame_blocks()) {
+                sample_training_step();
+                if (!can_begin() || previous_frame_blocks() ||
+                    (viewer_turn_pending() && previous_frame_still_running())) {
                     return std::nullopt;
                 }
             } else {
@@ -534,7 +829,16 @@ namespace lfs::core {
                               std::chrono::milliseconds(*wait_timeout_ms);
                 while (true) {
                     expire_handoff();
+                    sample_training_step();
                     const bool arena_free = can_begin();
+                    if (arena_free && viewer_turn_pending()) {
+                        ++viewer_release_waiters_;
+                        sync_lock.unlock();
+                        (void)wait_release_event();
+                        sync_lock.lock();
+                        --viewer_release_waiters_;
+                        continue;
+                    }
                     if (arena_free && !previous_frame_blocks()) {
                         break;
                     }
@@ -543,12 +847,15 @@ namespace lfs::core {
                         return std::nullopt;
                     }
                     auto wake_deadline = acquire_deadline;
-                    if (arena_free) {
+                    if (arena_free || previous_frame_blocks()) {
                         // Only the previous frame's GPU work is left; nothing
                         // signals its completion, so poll the event.
-                        wake_deadline = std::min(wake_deadline, now + std::chrono::microseconds(200));
+                        wake_deadline = std::min(wake_deadline, now + std::chrono::microseconds(50));
                     } else if (handoff_active()) {
                         wake_deadline = std::min(wake_deadline, render_handoff_deadline_);
+                    }
+                    if (!from_rendering && viewer_admission_.expires() > now) {
+                        wake_deadline = std::min(wake_deadline, viewer_admission_.expires());
                     }
                     if (wake_deadline == std::chrono::steady_clock::time_point::max()) {
                         sync_cv_.wait(sync_lock);
@@ -560,9 +867,17 @@ namespace lfs::core {
             ++active_frames_;
             if (!from_rendering) {
                 ++active_training_frames_;
-                if (handoff_active()) {
-                    --render_handoff_training_frames_;
+                if (training_turns_owed_ != 0) {
+                    --training_turns_owed_;
                 }
+                const auto now = std::chrono::steady_clock::now();
+                std::lock_guard<std::mutex> stats_lock(stats_mutex_);
+                last_training_begin_ = now;
+                last_tenant_was_training_ = true;
+            } else {
+                viewer_admission_.acquired(std::chrono::steady_clock::now());
+                std::lock_guard<std::mutex> stats_lock(stats_mutex_);
+                last_tenant_was_training_ = false;
             }
             if (from_rendering && render_handoff_token != 0 &&
                 render_handoff_token_ == render_handoff_token) {
@@ -641,6 +956,7 @@ namespace lfs::core {
         // frame ended without a stream breaks the chain (next begin device-syncs).
         {
             std::lock_guard<std::mutex> event_lock(last_frame_event_mutex_);
+            last_frame_gpu_complete_ = false;
             if (stream) {
                 if (!last_frame_event_) {
                     const cudaError_t create_status = cudaEventCreateWithFlags(
@@ -693,6 +1009,9 @@ namespace lfs::core {
                         break;
                     }
                 }
+                if (it->second->committed_size >= it->second->pressure_need) {
+                    it->second->pressure_need = 0;
+                }
 
                 // Update period peak (for logging)
                 size_t period_peak = it->second->peak_usage_period.load(std::memory_order_relaxed);
@@ -721,6 +1040,15 @@ namespace lfs::core {
 
         auto it = frame_contexts_.find(frame_id);
         if (it != frame_contexts_.end()) {
+            if (from_rendering) {
+                const double record_ms = std::chrono::duration<double, std::milli>(
+                                             std::chrono::steady_clock::now() - it->second.timestamp)
+                                             .count();
+                std::lock_guard<std::mutex> stats_lock(stats_mutex_);
+                viewer_record_ms_ = viewer_record_ms_ == 0.0
+                                        ? record_ms
+                                        : 0.9 * viewer_record_ms_ + 0.1 * record_ms;
+            }
             it->second.is_active = false;
         }
 
@@ -737,6 +1065,13 @@ namespace lfs::core {
             if (!from_rendering) {
                 if (active_training_frames_ > 0) {
                     --active_training_frames_;
+                    if (render_handoff_token_ != 0 && training_turns_owed_ == 0) {
+                        // The owed step is useful GPU work, not an abandoned
+                        // viewer's idle lease. Give the viewer its short claim
+                        // window after that step, preserving navigation cadence.
+                        render_handoff_deadline_ = std::chrono::steady_clock::now() +
+                                                   std::chrono::milliseconds(kRenderHandoffLeaseMs);
+                    }
                 } else {
                     LOG_WARN("RasterizerMemoryArena::end_frame called with no active training frames");
                 }
@@ -891,6 +1226,11 @@ namespace lfs::core {
             return;
         }
 
+        // Cached tensor-pool blocks count as used to cudaMemGetInfo.
+        if (CudaMemoryPool* pool = try_live_cuda_memory_pool()) {
+            pool->trim_cached_memory();
+        }
+
         // Allocate and immediately free a small buffer to trigger cleanup
         void* dummy = nullptr;
         const cudaError_t allocation_status = cudaMalloc(&dummy, 1);
@@ -966,6 +1306,19 @@ namespace lfs::core {
         // its release fence before the reset frees or decommits the backing.
         drain_external_release();
 
+        render_handoff_token_ = 0;
+        training_turns_owed_ = 0;
+        viewer_admission_ = {};
+        {
+            // A new session must not inherit another model's over-budget policy.
+            std::lock_guard<std::mutex> stats_lock(stats_mutex_);
+            viewer_turn_count_ = 0;
+            viewer_record_ms_ = 0.0;
+            training_step_ms_ = 0.0;
+            last_training_begin_ = {};
+            last_tenant_was_training_ = false;
+        }
+
         {
             const std::scoped_lock lock(arena_mutex_, frame_mutex_);
 
@@ -1007,14 +1360,14 @@ namespace lfs::core {
                             decommit_unused_memory(*arena, true);
                         } catch (const std::exception& e) {
                             LOG_ERROR("RasterizerMemoryArena full_reset decommit failed "
-                                      "(continuing teardown): {}",
+                                      "(continuing teardown): %s",
                                       e.what());
                         } catch (...) {
                             LOG_ERROR("RasterizerMemoryArena full_reset decommit failed "
                                       "(unknown; continuing teardown)");
                         }
                     } else {
-                        LOG_WARN("Skipping rasterizer arena decommit: device {} did not drain", device);
+                        LOG_WARN("Skipping rasterizer arena decommit: device %d did not drain", device);
                     }
                 }
             }
@@ -1027,7 +1380,7 @@ namespace lfs::core {
                 empty_cuda_cache();
             } catch (const std::exception& e) {
                 LOG_ERROR("RasterizerMemoryArena full_reset empty_cuda_cache failed "
-                          "(continuing teardown): {}",
+                          "(continuing teardown): %s",
                           e.what());
             } catch (...) {
                 LOG_ERROR("RasterizerMemoryArena full_reset empty_cuda_cache failed "
@@ -1159,10 +1512,6 @@ namespace lfs::core {
         arena.total_allocated.store(0, std::memory_order_release);
         arena.realloc_count.fetch_add(1, std::memory_order_relaxed);
 
-        LOG_INFO("Rasterizer arena now uses external CUDA backing '%s' size=%zu MiB ptr=%p",
-                 arena.external_label.empty() ? "unnamed" : arena.external_label.c_str(),
-                 static_cast<size_t>(backing.size >> 20),
-                 backing.device_ptr);
         sync_lock.unlock();
         sync_cv_.notify_all();
         return true;
@@ -1196,10 +1545,6 @@ namespace lfs::core {
                 continue;
             }
 
-            LOG_INFO("Rasterizer arena released external CUDA backing '%s' size=%zu MiB ptr=%p",
-                     arena.external_label.empty() ? "unnamed" : arena.external_label.c_str(),
-                     static_cast<size_t>(arena.committed_size >> 20),
-                     arena.fallback_buffer);
             release_arena_storage(arena);
             it = device_arenas_.erase(it);
         }
@@ -1287,26 +1632,17 @@ namespace lfs::core {
         // device is drained and no frame is active. device_ptr must stay constant.
         // The last submitted batch may still be in flight (#1621): commit must
         // retire the old import timeline-deferred, never destroy it inline.
-        const auto recommit_start = std::chrono::steady_clock::now();
         if (!commit(new_size)) {
             sync_lock.unlock();
             sync_cv_.notify_all();
             return fail(ExternalGrowFailure::CommitFailure);
         }
-        TrainingChurnMetrics::instance().record_arena_recommit(static_cast<std::uint64_t>(
-            std::chrono::duration_cast<std::chrono::microseconds>(
-                std::chrono::steady_clock::now() - recommit_start)
-                .count()));
-
         target->committed_size = new_size;
         target->capacity = new_size;
         target->boundaries_since_growth = 0;
         target->realloc_count.fetch_add(1, std::memory_order_relaxed);
         target->offset.store(0, std::memory_order_release);
         frame_contexts_.clear();
-
-        LOG_INFO("Rasterizer external arena grew in place: ptr=%p capacity=%zu MiB",
-                 device_ptr, static_cast<size_t>(new_size >> 20));
 
         sync_lock.unlock();
         sync_cv_.notify_all();
@@ -1365,7 +1701,6 @@ namespace lfs::core {
                     arena.d_ptr = 0;
                     arena.virtual_size = 0;
                 } else {
-                    LOG_INFO("VMM initialized: device=%d, virtual=%zu GB", device, arena.virtual_size >> 30);
                     // Reserving VA is free. Physical memory is committed only
                     // after the first frame has measured its actual requirement.
                     arena.generation = generation_counter_.fetch_add(1, std::memory_order_relaxed);
@@ -1385,8 +1720,7 @@ namespace lfs::core {
         return *arena_ptr;
     }
 
-    bool RasterizerMemoryArena::commit_more_memory(Arena& arena, size_t required_size,
-                                                   uint64_t frame_id) {
+    bool RasterizerMemoryArena::commit_more_memory(Arena& arena, size_t required_size) {
         // Only for VMM-enabled arenas
         if (arena.d_ptr == 0) {
             return false;
@@ -1427,7 +1761,7 @@ namespace lfs::core {
         }
 
         // Need substantial buffer for VMM and other operations
-        size_t buffer_needed = std::min(size_t(1) << 30, total_memory / 10); // 1GB or 10% of total
+        size_t buffer_needed = growth_headroom_bytes(total_memory);
 
         if (free_memory < commit_size + buffer_needed) {
             // Try cleanup
@@ -1457,131 +1791,55 @@ namespace lfs::core {
         prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
         prop.location.id = arena.device;
 
-        const auto timing_start = std::chrono::steady_clock::now();
-        const auto record_timing = [this, frame_id, &arena, &timing_start](bool committed) {
-            const auto elapsed_us = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
-                                                              std::chrono::steady_clock::now() - timing_start)
-                                                              .count());
-            record_commit_timing(frame_id, elapsed_us, committed);
-            if (committed) {
-                arena.boundaries_since_growth = 0;
-                TrainingChurnMetrics::instance().record_arena_recommit(elapsed_us);
-            }
-        };
-
-        CUmemGenericAllocationHandle handle;
-        CUresult result = cuMemCreate(&handle, commit_size, &prop, 0);
-
-        // If large allocation fails, try splitting into smaller chunks
-        if (result != CUDA_SUCCESS && commit_size > arena.granularity * 4) {
-            LOG_DEBUG("Large allocation of %zu MB failed, trying smaller chunks", commit_size >> 20);
-
-            // Try 4 smaller chunks (each 1/4 of requested size)
-            size_t chunk_size = (commit_size / 4);
-            chunk_size = (chunk_size / arena.granularity) * arena.granularity; // Round to granularity
-
-            size_t total_allocated = 0;
-            for (int i = 0; i < 4 && total_allocated < commit_size; ++i) {
-                CUmemGenericAllocationHandle chunk_handle;
-                result = cuMemCreate(&chunk_handle, chunk_size, &prop, 0);
-                if (result == CUDA_SUCCESS) {
-                    // Map this chunk
-                    const size_t map_offset = align_up(
-                        arena.committed_size + total_allocated, arena.granularity);
-
-                    result = cuMemMap(arena.d_ptr + map_offset, chunk_size, 0, chunk_handle, 0);
-                    if (result == CUDA_SUCCESS) {
-                        CUmemAccessDesc access_desc = {};
-                        access_desc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-                        access_desc.location.id = arena.device;
-                        access_desc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-
-                        result = cuMemSetAccess(arena.d_ptr + map_offset, chunk_size, &access_desc, 1);
-                        if (result == CUDA_SUCCESS) {
-                            {
-                                std::lock_guard<std::mutex> lock(arena.chunks_mutex);
-                                arena.chunks.push_back({chunk_handle, map_offset, chunk_size, true});
-                            }
-                            alloc_counter::record_site(alloc_counter::Site::Arena);
-                            lfs::diagnostics::VramProfiler::instance().recordAllocation(
-                                reinterpret_cast<void*>(arena.d_ptr + map_offset),
-                                chunk_size,
-                                lfs::diagnostics::VramAllocationMethod::Arena,
-                                "rasterizer.arena.vmm_chunk");
-                            total_allocated += chunk_size;
-                            LOG_TRACE("VMM chunk %d: %zu MB", i, chunk_size >> 20);
-                        } else {
-                            cuMemUnmap(arena.d_ptr + map_offset, chunk_size);
-                            cuMemRelease(chunk_handle);
-                        }
-                    } else {
-                        cuMemRelease(chunk_handle);
-                    }
-                }
-            }
-
-            if (total_allocated > 0) {
-                arena.committed_size += total_allocated;
-                arena.capacity = arena.committed_size;
-                arena.realloc_count.fetch_add(1, std::memory_order_relaxed);
-                LOG_DEBUG("Committed %zu MB via chunks (total: %zu MB)", total_allocated >> 20, arena.committed_size >> 20);
-                record_timing(true);
-                return true;
-            }
-
-            record_timing(false);
-            return false;
-        }
-
-        if (result != CUDA_SUCCESS) {
-            record_timing(false);
-            return false;
-        }
-
-        LOG_TRACE("VMM commit: %zu MB (total: %zu MB)", commit_size >> 20, (arena.committed_size + commit_size) >> 20);
-
-        // Map with proper alignment
-        const size_t map_offset = align_up(arena.committed_size, arena.granularity);
-
-        result = cuMemMap(arena.d_ptr + map_offset, commit_size, 0, handle, 0);
-        if (result != CUDA_SUCCESS) {
-            cuMemRelease(handle);
-            record_timing(false);
-            return false;
-        }
-
         CUmemAccessDesc access_desc = {};
         access_desc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
         access_desc.location.id = arena.device;
         access_desc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
 
-        result = cuMemSetAccess(arena.d_ptr + map_offset, commit_size, &access_desc, 1);
-        if (result != CUDA_SUCCESS) {
-            cuMemUnmap(arena.d_ptr + map_offset, commit_size);
-            cuMemRelease(handle);
-            record_timing(false);
+        // Map in bounded pieces. Decommit releases whole chunks above the
+        // retained peak, so one chunk per growth would stay committed until
+        // the peak fell below its start.
+        const size_t piece_limit = std::max(arena.granularity,
+                                            (kCommitPieceBytes / arena.granularity) * arena.granularity);
+        const size_t base = align_up(arena.committed_size, arena.granularity);
+        size_t committed = 0;
+        while (committed < commit_size) {
+            const size_t piece = std::min(piece_limit, commit_size - committed);
+            const CUdeviceptr ptr = arena.d_ptr + base + committed;
+            CUmemGenericAllocationHandle handle;
+            if (cuMemCreate(&handle, piece, &prop, 0) != CUDA_SUCCESS) {
+                break;
+            }
+            if (cuMemMap(ptr, piece, 0, handle, 0) != CUDA_SUCCESS) {
+                cuMemRelease(handle);
+                break;
+            }
+            if (cuMemSetAccess(ptr, piece, &access_desc, 1) != CUDA_SUCCESS) {
+                cuMemUnmap(ptr, piece);
+                cuMemRelease(handle);
+                break;
+            }
+            {
+                std::lock_guard<std::mutex> lock(arena.chunks_mutex);
+                arena.chunks.push_back({handle, base + committed, piece, true});
+            }
+            alloc_counter::record_site(alloc_counter::Site::Arena);
+            lfs::diagnostics::VramProfiler::instance().recordAllocation(
+                reinterpret_cast<void*>(ptr), piece,
+                lfs::diagnostics::VramAllocationMethod::Arena, "rasterizer.arena.vmm");
+            committed += piece;
+        }
+        if (committed == 0) {
             return false;
         }
 
-        // Track the chunk
-        {
-            std::lock_guard<std::mutex> lock(arena.chunks_mutex);
-            arena.chunks.push_back({handle, map_offset, commit_size, true});
-        }
-        alloc_counter::record_site(alloc_counter::Site::Arena);
-        lfs::diagnostics::VramProfiler::instance().recordAllocation(
-            reinterpret_cast<void*>(arena.d_ptr + map_offset),
-            commit_size,
-            lfs::diagnostics::VramAllocationMethod::Arena,
-            "rasterizer.arena.vmm");
-
-        arena.committed_size = map_offset + commit_size;
+        arena.committed_size = base + committed;
         arena.capacity = arena.committed_size;
         arena.realloc_count.fetch_add(1, std::memory_order_relaxed);
 
-        LOG_DEBUG("Committed %zu MB (total: %zu MB)", commit_size >> 20, arena.committed_size >> 20);
+        LOG_DEBUG("Committed %zu MB (total: %zu MB)", committed >> 20, arena.committed_size >> 20);
 
-        record_timing(true);
+        arena.boundaries_since_growth = 0;
         return true;
     }
 
@@ -1594,13 +1852,6 @@ namespace lfs::core {
         const size_t current_offset = arena.offset.load(std::memory_order_acquire);
         const size_t recent_peak = arena.peak_usage.load(std::memory_order_acquire);
         const size_t granularity = std::max<size_t>(arena.granularity, 1);
-        const auto decommit_start = std::chrono::steady_clock::now();
-        const auto record_decommit = [&decommit_start]() noexcept {
-            TrainingChurnMetrics::instance().record_arena_decommit(static_cast<std::uint64_t>(
-                std::chrono::duration_cast<std::chrono::microseconds>(
-                    std::chrono::steady_clock::now() - decommit_start)
-                    .count()));
-        };
         const auto reset_logical_peak = [&arena, current_offset]() {
             size_t lifetime_peak = arena.lifetime_peak_usage.load(std::memory_order_relaxed);
             while (current_offset > lifetime_peak) {
@@ -1636,16 +1887,15 @@ namespace lfs::core {
                 if (shrunk_size != 0 && shrunk_size <= old_size) {
                     arena.committed_size = shrunk_size;
                     arena.capacity = shrunk_size;
-                    LOG_DEBUG("Shrank external arena '{}' from {} MiB to {} MiB "
-                              "(trainer_peak={} MiB, viewer_high_water={} MiB)",
+                    LOG_DEBUG("Shrank external arena '%s' from %zu MiB to %zu MiB "
+                              "(trainer_peak=%zu MiB, viewer_high_water=%zu MiB)",
                               arena.external_label.empty() ? "unnamed" : arena.external_label.c_str(),
                               old_size >> 20,
                               shrunk_size >> 20,
                               recent_peak >> 20,
                               viewer_high_water >> 20);
-                    record_decommit();
                 } else if (shrunk_size != 0) {
-                    LOG_WARN("External arena '{}' shrink returned invalid size {} MiB (old {} MiB)",
+                    LOG_WARN("External arena '%s' shrink returned invalid size %zu MiB (old %zu MiB)",
                              arena.external_label.empty() ? "unnamed" : arena.external_label.c_str(),
                              shrunk_size >> 20,
                              old_size >> 20);
@@ -1733,7 +1983,6 @@ namespace lfs::core {
         if (chunks_removed > 0) {
             LOG_DEBUG("Decommitted %zu MB (%zu chunks), arena now at %zu MB",
                       total_freed >> 20, chunks_removed, arena.committed_size >> 20);
-            record_decommit();
         } else {
             LOG_TRACE("No unused chunks to decommit");
         }
@@ -1741,102 +1990,7 @@ namespace lfs::core {
         reset_logical_peak();
     }
 
-    void RasterizerMemoryArena::record_commit_timing(uint64_t frame_id,
-                                                     uint64_t elapsed_us,
-                                                     bool committed) {
-        if (!growth_timing_) {
-            return;
-        }
-        std::lock_guard<std::mutex> lock(growth_timing_->mutex);
-        const bool warmup = frame_id <= 200;
-        uint64_t& attempts = warmup ? growth_timing_->commit_attempts_warmup
-                                    : growth_timing_->commit_attempts_steady;
-        uint64_t& events = warmup ? growth_timing_->commit_events_warmup
-                                  : growth_timing_->commit_events_steady;
-        uint64_t& elapsed = warmup ? growth_timing_->commit_time_us_warmup
-                                   : growth_timing_->commit_time_us_steady;
-        ++attempts;
-        if (committed) {
-            ++events;
-        }
-        elapsed += elapsed_us;
-    }
-
-    void RasterizerMemoryArena::record_growth_path_timing(uint64_t frame_id,
-                                                          uint64_t elapsed_us,
-                                                          uint64_t sync_elapsed_us) {
-        if (!growth_timing_) {
-            return;
-        }
-        std::lock_guard<std::mutex> lock(growth_timing_->mutex);
-        if (frame_id <= 200) {
-            growth_timing_->growth_path_time_us_warmup += elapsed_us;
-            growth_timing_->growth_sync_time_us_warmup += sync_elapsed_us;
-        } else {
-            growth_timing_->growth_path_time_us_steady += elapsed_us;
-            growth_timing_->growth_sync_time_us_steady += sync_elapsed_us;
-        }
-    }
-
-    void RasterizerMemoryArena::record_boundary_timing(bool release_all,
-                                                       uint64_t frame_count,
-                                                       uint64_t elapsed_us) {
-        if (!growth_timing_) {
-            return;
-        }
-        std::lock_guard<std::mutex> lock(growth_timing_->mutex);
-        if (release_all) {
-            ++growth_timing_->b3_events;
-            growth_timing_->b3_time_us += elapsed_us;
-        } else if (frame_count > 0) {
-            ++growth_timing_->b1_events;
-            growth_timing_->b1_time_us += elapsed_us;
-        }
-    }
-
-    void RasterizerMemoryArena::dump_growth_timing() const {
-        if (!growth_timing_) {
-            return;
-        }
-        std::lock_guard<std::mutex> lock(growth_timing_->mutex);
-        LOG_INFO("Arena growth timing: commit_attempts warmup=%llu steady=%llu "
-                 "commit_events warmup=%llu (%llu us) steady=%llu (%llu us); "
-                 "growth_path warmup=%llu us steady=%llu us "
-                 "post_commit_sync warmup=%llu us steady=%llu us; "
-                 "boundary_events B1=%llu (%llu us) B3=%llu (%llu us)",
-                 static_cast<unsigned long long>(growth_timing_->commit_attempts_warmup),
-                 static_cast<unsigned long long>(growth_timing_->commit_attempts_steady),
-                 static_cast<unsigned long long>(growth_timing_->commit_events_warmup),
-                 static_cast<unsigned long long>(growth_timing_->commit_time_us_warmup),
-                 static_cast<unsigned long long>(growth_timing_->commit_events_steady),
-                 static_cast<unsigned long long>(growth_timing_->commit_time_us_steady),
-                 static_cast<unsigned long long>(growth_timing_->growth_path_time_us_warmup),
-                 static_cast<unsigned long long>(growth_timing_->growth_path_time_us_steady),
-                 static_cast<unsigned long long>(growth_timing_->growth_sync_time_us_warmup),
-                 static_cast<unsigned long long>(growth_timing_->growth_sync_time_us_steady),
-                 static_cast<unsigned long long>(growth_timing_->b1_events),
-                 static_cast<unsigned long long>(growth_timing_->b1_time_us),
-                 static_cast<unsigned long long>(growth_timing_->b3_events),
-                 static_cast<unsigned long long>(growth_timing_->b3_time_us));
-
-        const auto churn = TrainingChurnMetrics::instance().snapshot();
-        LOG_INFO("Training churn timing: trims=%llu (%llu us); "
-                 "arena_decommit=%llu (%llu us) arena_recommit=%llu (%llu us); "
-                 "child_alloc=%llu (%llu us) child_free=%llu (%llu us)",
-                 static_cast<unsigned long long>(churn.trim_calls),
-                 static_cast<unsigned long long>(churn.trim_time_us),
-                 static_cast<unsigned long long>(churn.arena_decommit_events),
-                 static_cast<unsigned long long>(churn.arena_decommit_time_us),
-                 static_cast<unsigned long long>(churn.arena_recommit_events),
-                 static_cast<unsigned long long>(churn.arena_recommit_time_us),
-                 static_cast<unsigned long long>(churn.child_alloc_events),
-                 static_cast<unsigned long long>(churn.child_alloc_time_us),
-                 static_cast<unsigned long long>(churn.child_free_events),
-                 static_cast<unsigned long long>(churn.child_free_time_us));
-    }
-
     bool RasterizerMemoryArena::shrink_at_boundary(bool release_all) {
-        const auto timing_start = std::chrono::steady_clock::now();
         std::unique_lock<std::mutex> sync_lock(sync_mutex_);
 
         // active_frames_ is the single global ownership count used by both the
@@ -1847,7 +2001,6 @@ namespace lfs::core {
         } else if (active_frames_ != 0) {
             return false;
         }
-        const uint64_t frame_count = total_frames_processed_.load(std::memory_order_relaxed);
         drain_external_release();
 
         bool success = true;
@@ -1897,10 +2050,6 @@ namespace lfs::core {
 
         sync_lock.unlock();
         sync_cv_.notify_all();
-        const auto elapsed_us = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
-                                                          std::chrono::steady_clock::now() - timing_start)
-                                                          .count());
-        record_boundary_timing(release_all, frame_count, elapsed_us);
         return success;
     }
 
@@ -1910,6 +2059,51 @@ namespace lfs::core {
 
     bool RasterizerMemoryArena::release_at_boundary() {
         return shrink_at_boundary(true);
+    }
+
+    size_t RasterizerMemoryArena::release_idle_for_pressure() {
+        // Runs inside an allocation's OOM path, possibly under a caller's
+        // arena locks: never wait, never allocate.
+        std::unique_lock<std::mutex> sync_lock(sync_mutex_, std::try_to_lock);
+        if (!sync_lock.owns_lock() || active_frames_ != 0) {
+            return 0;
+        }
+        std::unique_lock<std::mutex> arena_lock(arena_mutex_, std::try_to_lock);
+        if (!arena_lock.owns_lock()) {
+            return 0;
+        }
+        int previous_device = -1;
+        if (cudaGetDevice(&previous_device) != cudaSuccess) {
+            (void)cudaGetLastError();
+            return 0;
+        }
+        size_t released = 0;
+        for (auto& [device, arena_ptr] : device_arenas_) {
+            if (!arena_ptr || arena_ptr->external_backing || arena_ptr->committed_size == 0 ||
+                cudaSetDevice(device) != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess) {
+                (void)cudaGetLastError();
+                continue;
+            }
+            const size_t before = arena_ptr->committed_size;
+            const size_t need = std::max(before, arena_ptr->peak_usage.load(std::memory_order_relaxed));
+            arena_ptr->offset.store(0, std::memory_order_release);
+            decommit_unused_memory(*arena_ptr, true, true);
+            if (arena_ptr->committed_size < before) {
+                released += before - arena_ptr->committed_size;
+                // Owed until a frame commits it again; the high-water of the
+                // views seen so far still describes what frames need.
+                arena_ptr->pressure_need = std::max(arena_ptr->pressure_need, need);
+                arena_ptr->peak_usage.store(need, std::memory_order_release);
+            }
+        }
+        if (cudaSetDevice(previous_device) != cudaSuccess) {
+            (void)cudaGetLastError();
+        }
+        if (released > 0) {
+            std::lock_guard<std::mutex> frame_lock(frame_mutex_);
+            frame_contexts_.clear();
+        }
+        return released;
     }
 
     char* RasterizerMemoryArena::allocate_internal(
@@ -1993,7 +2187,6 @@ namespace lfs::core {
 
             // external_grow preserves the stable virtual base and returns the new
             // committed size. The Vulkan side re-imports its new handle later.
-            const auto recommit_start = std::chrono::steady_clock::now();
             const size_t new_committed = arena.external_grow(need);
             if (new_committed < need) {
                 LOG_ERROR("External rasterizer arena '%s' grow failed (need=%zu MiB, capacity=%zu MiB)",
@@ -2006,14 +2199,6 @@ namespace lfs::core {
             arena.capacity = new_committed;
             arena.boundaries_since_growth = 0;
             arena.realloc_count.fetch_add(1, std::memory_order_relaxed);
-            TrainingChurnMetrics::instance().record_arena_recommit(static_cast<std::uint64_t>(
-                std::chrono::duration_cast<std::chrono::microseconds>(
-                    std::chrono::steady_clock::now() - recommit_start)
-                    .count()));
-            LOG_INFO("External rasterizer arena '%s' grew in place to %zu MiB (need %zu MiB)",
-                     arena.external_label.empty() ? "unnamed" : arena.external_label.c_str(),
-                     static_cast<size_t>(new_committed >> 20),
-                     static_cast<size_t>(need >> 20));
             return ExternalGrowResult::Grown;
         };
 
@@ -2131,20 +2316,14 @@ namespace lfs::core {
             }
 
             // Try to grow
-            const auto growth_start = std::chrono::steady_clock::now();
-            uint64_t sync_elapsed_us = 0;
             bool success = false;
             if (arena.d_ptr != 0) {
                 // VMM path
-                success = commit_more_memory(arena, growth_needed, frame_id);
+                success = commit_more_memory(arena, growth_needed);
                 // Synchronize after committing new memory to ensure no GPU kernels
                 // are still accessing old memory regions before we allow new allocations
                 if (success) {
-                    const auto sync_start = std::chrono::steady_clock::now();
                     const cudaError_t sync_status = cudaDeviceSynchronize();
-                    sync_elapsed_us = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
-                                                                std::chrono::steady_clock::now() - sync_start)
-                                                                .count());
                     if (sync_status != cudaSuccess) {
                         ensure_cuda_success(
                             sync_status, "cudaDeviceSynchronize(arena VMM growth)",
@@ -2157,12 +2336,6 @@ namespace lfs::core {
                 // only the arena's 256-byte sub-allocation alignment applied.
                 success = grow_arena(arena, total_needed);
             }
-            record_growth_path_timing(
-                frame_id,
-                static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
-                                          std::chrono::steady_clock::now() - growth_start)
-                                          .count()),
-                sync_elapsed_us);
 
             if (!success) {
                 if (retry < MAX_RETRIES - 1) {
@@ -2372,6 +2545,9 @@ namespace lfs::core {
                 info.required_bytes = align_up(
                     info.peak_usage, std::max<size_t>(arena.granularity, 1));
                 info.num_reallocations = arena.realloc_count.load(std::memory_order_relaxed);
+                info.recommit_bytes = arena.pressure_need > arena.committed_size
+                                          ? arena.pressure_need - arena.committed_size
+                                          : 0;
                 info.utilization_percent = info.arena_capacity > 0 ? (100.0f * info.peak_usage / info.arena_capacity) : 0.0f;
             }
         } else {
@@ -2387,29 +2563,6 @@ namespace lfs::core {
                                 CudaFailureDisposition::LogOnly);
         }
         return info;
-    }
-
-    void RasterizerMemoryArena::dump_statistics() const {
-        const auto stats = get_statistics();
-        size_t lifetime_peak = stats.peak_usage;
-        {
-            std::lock_guard<std::mutex> lock(arena_mutex_);
-            for (const auto& entry : device_arenas_) {
-                if (entry.second) {
-                    lifetime_peak = std::max(
-                        lifetime_peak,
-                        entry.second->lifetime_peak_usage.load(std::memory_order_relaxed));
-                }
-            }
-        }
-        const auto runtime = std::chrono::steady_clock::now() - creation_time_;
-        const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(runtime).count();
-        const float utilization = stats.capacity > 0 ? (100.0f * stats.peak_usage / stats.capacity) : 0.0f;
-
-        LOG_INFO("Arena stats: committed=%zu MB, peak=%zu MB (%.1f%%), frames=%zu, reallocs=%zu, runtime=%lds",
-                 stats.capacity >> 20, lifetime_peak >> 20, utilization,
-                 stats.frame_count, stats.reallocation_count, seconds);
-        dump_growth_timing();
     }
 
     bool RasterizerMemoryArena::is_under_memory_pressure() const {
@@ -2453,6 +2606,22 @@ namespace lfs::core {
             config.log_interval = 1000;      // Log every 1000 frames
 
             arena_ = std::make_unique<RasterizerMemoryArena>(config);
+            // Between frames the arena holds memory nothing uses; a refine or
+            // reorder short of VRAM takes it instead of failing.
+            MemoryPressureCoordinator::instance().register_client(PressureClient{
+                .name = "idle-rasterizer-arena",
+                .priority = 20,
+                .domain = MemoryDomain::CudaDevice,
+                .affinity = PressureAffinity::ImmediateThreadSafe,
+                .estimate = nullptr,
+                .shrink = [this](const PressureRequest&) {
+                    std::unique_lock<std::mutex> lock(init_mutex_, std::try_to_lock);
+                    if (!lock.owns_lock() || shutdown_ || !arena_) {
+                        return ReclaimResult{};
+                    }
+                    return ReclaimResult{.logical_bytes_released = arena_->release_idle_for_pressure()};
+                },
+            });
         }
         return *arena_;
     }

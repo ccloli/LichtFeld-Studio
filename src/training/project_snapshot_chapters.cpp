@@ -109,7 +109,8 @@ namespace lfs::training {
         const int iteration,
         ProjectSnapshotCpuState& output,
         const std::span<const lfs::core::Uuid>
-            selected_node_uuids) {
+            selected_node_uuids,
+        const lfs::io::project::ScenePayloadBindings& inherited_bindings) {
         if (snapshot_uuid.is_nil()) {
             return capture_error(
                 lfs::ErrorCode::InvalidArgument,
@@ -129,7 +130,7 @@ namespace lfs::training {
         }
 
         TrainingSnapshotCpuStateMetrics metrics;
-        lfs::io::project::ScenePayloadBindings bindings;
+        auto bindings = inherited_bindings;
         bindings.emplace(
             training_uuid,
             lfs::io::project::PayloadBinding{
@@ -183,6 +184,8 @@ namespace lfs::training {
         staged.selection = std::move(*selection);
         staged.parameters =
             std::move(captured_parameters);
+        staged.sfm_observation_cameras =
+            lfs::io::project::capture_sfm_observation_cameras(scene);
         output = std::move(staged);
         return metrics;
     }
@@ -196,7 +199,8 @@ namespace lfs::training {
         const int iteration,
         ProjectSnapshotCpuState& output,
         const std::span<const lfs::core::Uuid>
-            selected_node_uuids) {
+            selected_node_uuids,
+        const lfs::io::project::ScenePayloadBindings& inherited_bindings) {
         auto parameters =
             capture_parameters(checkpoint_params);
         if (!parameters) {
@@ -209,7 +213,7 @@ namespace lfs::training {
         return capture_project_snapshot_cpu_state(
             scene, *parameters, snapshot_uuid,
             iteration, output,
-            selected_node_uuids);
+            selected_node_uuids, inherited_bindings);
     }
 
     lfs::Result<void>
@@ -223,6 +227,7 @@ namespace lfs::training {
                     lfs::ErrorCode::InvalidArgument,
                     "Detached snapshot CPU state has an invalid stamp"));
         }
+        auto collisions = std::move(state.scene_graph.collisions);
         auto scene_graph =
             lfs::io::project::
                 materialize_scene_graph_chapter(
@@ -257,6 +262,9 @@ namespace lfs::training {
         staged.selection = std::move(*selection);
         staged.parameters =
             std::move(state.parameters);
+        staged.sfm_observation_cameras =
+            std::move(state.sfm_observation_cameras);
+        staged.collisions = std::move(collisions);
         staged.document_context = std::move(context);
         output = std::move(staged);
         return {};

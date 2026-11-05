@@ -82,6 +82,12 @@ namespace lfs::vis {
         bool use_crop_box = false;
         bool show_ellipsoid = false;
         bool use_ellipsoid = false;
+        bool selection_outline = false;
+        float selection_outline_opacity = 1.0f;
+        float selection_outline_width = 2.0f;
+        float selection_outline_threshold = 0.5f;
+        bool selection_outline_holes = true;
+        std::array<float, 3> selection_outline_color{0.0f, 0.604f, 0.733f};
         bool desaturate_unselected = false;
         bool desaturate_cropping = false;
         bool hide_outside_depth_box = false;
@@ -102,6 +108,7 @@ namespace lfs::vis {
         bool show_grid = true;
         int grid_plane = 1;
         float grid_opacity = 0.5f;
+        float collision_preview_opacity = 0.4f;
         bool point_cloud_mode = false;
         float voxel_size = 0.01f;
         bool show_rings = false;
@@ -109,6 +116,7 @@ namespace lfs::vis {
         bool show_center_markers = false;
         bool show_camera_frustums = false;
         float camera_frustum_scale = 0.25f;
+        bool hide_disabled_camera_frustums = false;
         std::array<float, 3> train_camera_color{1.0f, 1.0f, 1.0f};
         std::array<float, 3> eval_camera_color{1.0f, 0.0f, 0.0f};
         bool show_pivot = false;
@@ -117,6 +125,8 @@ namespace lfs::vis {
         float split_position = 0.5f;
         size_t split_view_offset = 0;
         int raster_backend = 2;
+        int transparency_mode = 0;
+        int stochastic_max_frames = lfs::rendering::DEFAULT_STOCHASTIC_REFINEMENT_FRAMES;
         bool gut = false;
         bool equirectangular = false;
         bool orthographic = false;
@@ -125,7 +135,6 @@ namespace lfs::vis {
         float depth_view_min = lfs::rendering::DEFAULT_DEPTH_VIEW_MIN;
         float depth_view_max = lfs::rendering::DEFAULT_DEPTH_VIEW_MAX;
         int depth_visualization_mode = 0;
-        std::array<float, 3> selection_color_committed{0.859f, 0.325f, 0.325f};
         std::array<float, 3> selection_color_preview{0.0f, 0.871f, 0.298f};
         std::array<float, 3> selection_color_center_marker{0.0f, 0.604f, 0.733f};
         bool depth_clip_enabled = false;

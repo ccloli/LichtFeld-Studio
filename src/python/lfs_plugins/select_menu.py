@@ -38,24 +38,14 @@ def _is_selection_tool_active():
         return False
 
 
-def _activate_select_tool():
-    from .tools import ToolRegistry
-
-    return ToolRegistry.set_active("builtin.select")
-
-
 def _open_selection_groups():
-    """Enable the Rendering child. Registration stays closed, so layout reset does not add a tab."""
+    """Show the group list in Rendering > Selection & Overlays."""
     try:
-        lf.ui.set_panel_enabled("lfs.selection_groups", True)
+        lf.ui.set_main_panel_active_tab("lfs.rendering")
+        rendering_panel = lf.ui.get_panel_object("lfs.rendering")
     except (AttributeError, RuntimeError, TypeError):
         return False
-    if _is_selection_tool_active():
-        return True
-    try:
-        return bool(_activate_select_tool())
-    except (AttributeError, RuntimeError, TypeError):
-        return False
+    return bool(rendering_panel and rendering_panel.reveal_selection_groups())
 
 
 @register_menu
@@ -70,36 +60,10 @@ class SelectMenu:
         tr = lf.ui.tr
         can_edit = _can_edit_selection()
         has_selection = _has_gaussian_selection()
-        has_clipboard = _has_gaussian_clipboard()
         selection_tool_active = _is_selection_tool_active()
         action = lf.keymap.Action
 
         return [
-            menu_action(
-                tr("menu.select.copy_selection"),
-                lf.ui.copy_gaussian_selection,
-                shortcut=keymap_shortcut(action.COPY_SELECTION),
-                enabled=can_edit and has_selection,
-            ),
-            menu_action(
-                tr("menu.select.cut_selection"),
-                lf.ui.cut_gaussian_selection,
-                shortcut=keymap_shortcut(action.CUT_SELECTION),
-                enabled=can_edit and has_selection,
-            ),
-            menu_action(
-                tr("menu.select.paste_selection"),
-                lf.ui.paste_gaussian_selection,
-                shortcut=keymap_shortcut(action.PASTE_SELECTION),
-                enabled=can_edit and has_clipboard,
-            ),
-            menu_separator(),
-            menu_action(
-                tr("menu.select.invert_selection"),
-                lf.ui.invert_gaussian_selection,
-                shortcut=keymap_shortcut(action.INVERT_SELECTION),
-                enabled=can_edit,
-            ),
             menu_action(
                 tr("menu.select.select_all"),
                 lf.ui.select_all_gaussians,
@@ -111,6 +75,12 @@ class SelectMenu:
                 lf.ui.deselect_all_gaussians,
                 shortcut=keymap_shortcut(action.DESELECT_ALL),
                 enabled=can_edit and has_selection,
+            ),
+            menu_action(
+                tr("menu.select.invert_selection"),
+                lf.ui.invert_gaussian_selection,
+                shortcut=keymap_shortcut(action.INVERT_SELECTION),
+                enabled=can_edit,
             ),
             menu_separator(),
             menu_action(

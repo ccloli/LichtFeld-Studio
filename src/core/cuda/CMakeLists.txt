@@ -8,6 +8,7 @@
 # ============================================================================
 
 set(LFS_CORE_CUDA_SOURCES
+    collision_voxelization.cu
     memory_arena.cu
     exportable_storage.cpp
     lanczos_resize/lanczos_resize.cu
@@ -15,6 +16,9 @@ set(LFS_CORE_CUDA_SOURCES
     kernels/selection_ops.cu
     kernels/splat_transform.cu
     kernels/sh_layout.cu
+    kernels/initial_scales.cu
+    kernels/image_quantize.cu
+    kernels/mask_normalization.cu
     sh_value_quant_kernels.cu
     tensor_debug.cu
 )

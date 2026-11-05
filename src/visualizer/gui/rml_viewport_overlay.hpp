@@ -29,8 +29,9 @@ namespace Rml {
 } // namespace Rml
 
 namespace lfs::vis {
+    class SequencerFrameDemandTest_PropagatesPlaybackStreamAndPreviewDemand_Test;
     struct Theme;
-}
+} // namespace lfs::vis
 namespace lfs::vis::gui {
 
     struct PanelInputState;
@@ -44,6 +45,8 @@ namespace lfs::vis::gui {
             std::string psnr_text;
             bool show_ssim = false;
             std::string ssim_text;
+            lfs::vis::AppStore::CameraMetricsStatus metrics_status =
+                lfs::vis::AppStore::CameraMetricsStatus::Available;
         };
 
         struct SplitDividerOverlayState {
@@ -52,6 +55,12 @@ namespace lfs::vis::gui {
             float y = 0.0f;
             float width = 0.0f;
             float height = 0.0f;
+            std::string left_name;
+            std::string right_name;
+            float left_name_right = 0.0f;
+            float right_name_right = 0.0f;
+            float name_bottom = 0.0f;
+            float name_max_width = 0.0f;
         };
 
         struct LodStatsOverlayState {
@@ -91,6 +100,8 @@ namespace lfs::vis::gui {
         void shutdown();
         void setViewportBounds(glm::vec2 pos, glm::vec2 size, glm::vec2 screen_origin);
         void setViewportContentOffset(float x);
+        // Python may request the next sync from inside a sync; that request survives it.
+        void requestDocumentSync() { document_sync_requested_ = true; }
         void setToolbarPanels(float primary_x, float primary_width, float inset,
                               bool show_secondary = false,
                               float secondary_x = 0.0f,
@@ -107,17 +118,24 @@ namespace lfs::vis::gui {
         void renderFrostedGlass();
         void processInput(const PanelInputState& input, std::function<bool(float, float)> pointer_blocker = {});
         bool wantsInput() const { return wants_input_; }
+        // Cursor of the hovered overlay element. RmlUi's own cursor request is set
+        // while SDL events are dispatched, before the frame resets it.
+        [[nodiscard]] RmlCursorRequest cursorRequest() const { return cursor_request_; }
         [[nodiscard]] bool needsAnimationFrame() const {
             return render_needed_ || document_sync_dirty_ || animation_active_ || tooltip_.revealDue() ||
                    toolbar_drag_active_ ||
                    (vram_hud_ && vram_hud_->needsAnimationFrame());
         }
-        // Finite RmlUi scheduled update delay (seconds) when > 0; nullopt for
-        // continuous demand (0) or idle (infinity).
+        // Next finite RmlUi or passive document-hook deadline in seconds.
+        // Continuous RmlUi demand is reported by needsAnimationFrame().
         [[nodiscard]] std::optional<double> nextScheduledUpdateDelay() const;
         [[nodiscard]] bool blocksPointer(double screen_x, double screen_y) const;
 
     private:
+        void syncGamepadIndicator();
+        friend class ViewportDepthLayoutTestAccess;
+        friend class VramHudHeaderClickTest;
+        friend class lfs::vis::SequencerFrameDemandTest_PropagatesPlaybackStreamAndPreviewDemand_Test;
         struct ToolbarDragListener final : Rml::EventListener {
             RmlViewportOverlay* owner = nullptr;
             void ProcessEvent(Rml::Event& event) override;
@@ -132,6 +150,7 @@ namespace lfs::vis::gui {
         bool syncBuiltinDocument(bool force);
         bool updateToolbarRoots();
         bool updateToolbarRailLayout();
+        bool updateViewportOverlayPanelLayout();
         bool applyToolbarPosition();
         void attachToolbarDragListeners();
         void resetToolbarDragListeners();
@@ -179,6 +198,7 @@ namespace lfs::vis::gui {
         Rml::Context* rml_context_ = nullptr;
         Rml::ElementDocument* document_ = nullptr;
         Rml::Element* body_el_ = nullptr;
+        bool gamepad_indicator_visible_ = false;
 
         glm::vec2 vp_pos_{0, 0};
         glm::vec2 vp_size_{0, 0};
@@ -223,10 +243,12 @@ namespace lfs::vis::gui {
         bool render_needed_ = true;
         std::uint32_t render_reason_bits_ = static_cast<std::uint32_t>(RenderReason::Initial);
         bool document_sync_dirty_ = true;
+        bool document_sync_requested_ = false;
         bool data_model_binding_dirty_ = true;
         bool animation_active_ = false;
         double next_update_delay_ = std::numeric_limits<double>::infinity();
         bool hovered_interactive_ = false;
+        RmlCursorRequest cursor_request_{};
         Rml::Element* last_hover_element_ = nullptr;
         bool mouse_pos_valid_ = false;
         int last_mouse_x_ = 0;
@@ -245,8 +267,6 @@ namespace lfs::vis::gui {
         std::optional<lfs::vis::AppStore::CameraMetrics> camera_metrics_;
         lfs::core::reactive::SubscriptionToken gt_metrics_config_subscription_;
         lfs::core::reactive::SubscriptionToken camera_metrics_subscription_;
-        lfs::core::reactive::SubscriptionToken vram_hud_subscription_;
-        lfs::core::reactive::SubscriptionToken perf_hud_subscription_;
         std::vector<lfs::core::reactive::SubscriptionToken> document_sync_subscriptions_;
         std::unique_ptr<VramHudOverlay> vram_hud_;
         RmlTooltipController tooltip_;

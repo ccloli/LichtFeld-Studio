@@ -4,20 +4,28 @@
 
 #include "rendering_manager.hpp"
 #include "core/cuda/memory_arena.hpp"
+#include "core/error_bus.hpp"
+#include "core/event_bridge/localization_manager.hpp"
 #include "core/events.hpp"
 #include "core/logger.hpp"
+#include "core/path_utils.hpp"
+#include "gui/string_keys.hpp"
 #include "point_cloud_vulkan_renderer.hpp"
 #include "preferences.hpp"
+#include "python/python_runtime.hpp"
+#include "rendering/environment_image.hpp"
 #include "rendering/export_post_process.hpp"
 #include "rendering/ppisp_overrides_utils.hpp"
 #include "rendering/rendering.hpp"
 #include "rendering/scene_upscaler_registry.hpp"
 #include "rendering/selection_ops.hpp"
 #include "scene/scene_manager.hpp"
+#include "sequencer/timeline.hpp"
 #include "theme/theme.hpp"
 #include "training/trainer.hpp"
 #include "training/training_manager.hpp"
 #include "visualizer/app_store.hpp"
+#include "visualizer/visualizer.hpp"
 #include "vksplat_viewport_renderer.hpp"
 
 #include <algorithm>
@@ -41,7 +49,31 @@ namespace lfs::vis {
                    !ppispOverridesEqual(old_settings.ppisp_overrides, new_settings.ppisp_overrides);
         }
 
-        constexpr std::uint32_t kVksplatIdleScratchReleaseFrames = 30;
+        constexpr auto kVksplatIdleScratchReleaseDelay = std::chrono::seconds{3};
+
+        [[nodiscard]] lfs::Result<void> validateEnvironmentMapForUser(
+            const std::filesystem::path& path) {
+            try {
+                rendering::probeEnvironmentImage(path);
+                return {};
+            } catch (const std::exception& failure) {
+                auto error = lfs::make_error(lfs::ErrorInit{
+                    .code = lfs::ErrorCode::InvalidArgument,
+                    .domain = lfs::ErrorDomain::App,
+                    .user_message = LOCF("runtime.environment_map_failed", core::path_to_utf8(path.filename())),
+                    .detail = failure.what(),
+                    .detection = LFS_SOURCE_SITE_CURRENT(),
+                });
+                LOG_WARN("{}", failure.what());
+                lfs::ErrorBus::instance().publish(lfs::ErrorNotification{
+                    .error = error,
+                    .surface = lfs::ErrorSurface::Toast,
+                    .actions = {},
+                    .operation_id = lfs::OperationId::generate(),
+                });
+                return lfs::Result<void>::failure(std::move(error));
+            }
+        }
 
         [[nodiscard]] bool applySparkLodViewerDefaults(RenderSettings& settings) {
             bool changed = false;
@@ -91,7 +123,8 @@ namespace lfs::vis {
                 .iteration = iteration,
                 .psnr = metrics->psnr,
                 .ssim = metrics->ssim,
-                .used_mask = metrics->used_mask};
+                .used_mask = metrics->used_mask,
+                .status = AppStore::CameraMetricsStatus::Available};
         }
 
         [[nodiscard]] AppStore::CameraMetrics toAppCameraMetrics(
@@ -101,7 +134,8 @@ namespace lfs::vis {
                 .iteration = metrics.iteration,
                 .psnr = metrics.psnr,
                 .ssim = metrics.ssim,
-                .used_mask = metrics.used_mask};
+                .used_mask = metrics.used_mask,
+                .status = metrics.status};
         }
     } // namespace
 
@@ -115,7 +149,21 @@ namespace lfs::vis {
 
     // RenderingManager Implementation
     RenderingManager::RenderingManager() {
+        (void)applyRenderingDefaults(settings_, UserPreferences::instance().renderingDefaults());
         viewport_interop_ = std::make_unique<ViewportInteropService>();
+        frame_demand_ledger_.request(FrameRequest{.reason = FrameReason::Startup,
+                                                  .scope = FrameScope::All,
+                                                  .flags = DirtyFlag::ALL,
+                                                  .detail = "startup"});
+        frame_demand_ledger_.setWakeCallback([this] {
+            std::function<void()> wake_callback;
+            {
+                std::scoped_lock lock(wake_callback_mutex_);
+                wake_callback = wake_callback_;
+            }
+            if (wake_callback)
+                wake_callback();
+        });
         gt_comparison_image_worker_ = std::jthread([this](std::stop_token stop_token) {
             gtComparisonImageWorkerLoop(stop_token);
         });
@@ -140,6 +188,20 @@ namespace lfs::vis {
         camera_metrics_worker_.request_stop();
         camera_metrics_cv_.notify_all();
         lfs::rendering::releaseEnvironmentMapCaches();
+    }
+
+    void RenderingManager::setVulkanMeshFrame(VulkanMeshFrame frame) {
+        std::lock_guard lock(vulkan_mesh_frame_mutex_);
+        if (vksplat_viewport_renderer_) {
+            vksplat_viewport_renderer_->retainPublishedSplitImages(
+                frame.split_view.enabled ? frame.split_view.left.external_image_view : VK_NULL_HANDLE,
+                frame.split_view.enabled ? frame.split_view.right.external_image_view : VK_NULL_HANDLE);
+        }
+        vulkan_mesh_frame_ = std::move(frame);
+    }
+
+    void RenderingManager::clearVulkanMeshFrame() {
+        setVulkanMeshFrame({});
     }
 
     ViewportInteropService& RenderingManager::viewportInterop() {
@@ -191,37 +253,37 @@ namespace lfs::vis {
         }
 
         initialized_ = true;
-        LOG_INFO("Auxiliary rendering engine initialized successfully");
     }
 
-    void RenderingManager::markDirty() {
-        markDirty(DirtyFlag::ALL);
-    }
-
-    void RenderingManager::markDirty(const DirtyMask flags) {
+    void RenderingManager::markDirty(const DirtyMask flags, const FrameReason reason, std::string detail) {
+        frame_demand_ledger_.request(FrameRequest{.reason = reason,
+                                                  .scope = FrameScope::View,
+                                                  .views = 1,
+                                                  .flags = flags,
+                                                  .detail = std::move(detail)});
         dirty_mask_.fetch_or(flags, std::memory_order_relaxed);
 
-        LOG_TRACE("Render marked dirty (flags: 0x{:x})", flags);
+        LOG_TRACE("Render marked dirty (flags: 0x{:x}, reason: {})", flags, frameReasonName(reason));
     }
 
     void RenderingManager::markCameraPoseChanged() {
-        markDirty(DirtyFlag::CAMERA);
+        markDirty(DirtyFlag::CAMERA, FrameReason::CameraMotion);
     }
 
     bool RenderingManager::pollDirtyState() {
         if (const DirtyMask animation_dirty = animation_state_.pollDirtyState(); animation_dirty) {
-            dirty_mask_.fetch_or(animation_dirty, std::memory_order_relaxed);
+            markDirty(animation_dirty, FrameReason::Overlay);
             return true;
         }
         if (lod_controller_ && lod_controller_->hasReadyResults()) {
-            dirty_mask_.fetch_or(DirtyFlag::CAMERA, std::memory_order_relaxed);
+            markDirty(DirtyFlag::CAMERA, FrameReason::LodStreaming);
             return true;
         }
         return dirty_mask_.load(std::memory_order_relaxed) != 0;
     }
 
     void RenderingManager::requestRenderFollowUp() {
-        dirty_mask_.fetch_or(DirtyFlag::CAMERA, std::memory_order_relaxed);
+        markDirty(DirtyFlag::CAMERA, FrameReason::AsyncCompletion, "lod_results");
 
         std::function<void()> wake_callback;
         {
@@ -233,6 +295,167 @@ namespace lfs::vis {
         }
     }
 
+    void RenderingManager::syncCustomPrograms() {
+        if (!shader_service_)
+            return;
+        const auto generation = shader_service_->generation();
+        if (shader_sync_generation_ == generation && !shader_service_->hasBindings() && !custom_effect_snapshot_)
+            return;
+        // Frames plan their hosts, so a service change must reach a drawn frame.
+        if (shader_sync_generation_ != generation)
+            markDirty(DirtyFlag::SPLATS, FrameReason::AsyncCompletion, "custom_effect");
+        shader_sync_generation_ = generation;
+        const auto retained = shader_service_->restrictFallback(last_complete_);
+        if (!retained)
+            last_complete_.reset();
+        if (!vksplat_viewport_renderer_)
+            return;
+        if (shader_device_generation_ != vksplat_viewport_renderer_->deviceGeneration()) {
+            shader_device_generation_ = vksplat_viewport_renderer_->deviceGeneration();
+            shader_service_->observeDisplay({});
+            display_record_.reset();
+            shader_service_->deviceReset();
+        }
+        const auto target = shader_service_->candidate();
+        shaders::SnapshotPtr selected;
+        rendering::ProgramSetHandle handle;
+        const auto wake = [changes = shader_service_->changes(), this] {
+            changes->notify();
+            std::function<void()> callback;
+            {
+                std::scoped_lock lock(wake_callback_mutex_);
+                callback = wake_callback_;
+            }
+            if (callback)
+                callback();
+        };
+        for (const auto& snapshot : {target, retained}) {
+            if (!snapshot)
+                continue;
+            auto ready = vksplat_viewport_renderer_->preparePrograms(snapshot->programs, handle, wake, snapshot == target);
+            if (!ready) {
+                shader_service_->failCandidate(snapshot, ready.error());
+                continue;
+            }
+            if (*ready) {
+                selected = snapshot;
+                break;
+            }
+        }
+        if (!selected)
+            handle.reset();
+        if (custom_effect_snapshot_ != selected || live_programs_ != handle) {
+            custom_effect_snapshot_ = std::move(selected);
+            live_programs_ = std::move(handle);
+            ++custom_effect_generation_;
+            markDirty(DirtyFlag::SPLATS, FrameReason::AsyncCompletion, "custom_effect");
+        }
+    }
+
+    RenderingManager::ExportLease RenderingManager::prepareShaderExport(const ExportFrame frame, const core::SplatData* model, const RenderSettings* settings, const bool dynamic) {
+        if (!shader_service_ || !shader_service_->hasBindings() || (settings && (settings->point_cloud_mode || ((!model || model->size() == 0) && !dynamic))))
+            return {};
+        if (!model && !settings && !shader_service_->hasApplicableBindings(sequencer_custom_reveal_))
+            return {};
+        auto lease = shader_service_->prepareExport({});
+        lease.per_frame = dynamic || !model || !settings;
+        lease.frame = frame;
+        if (!lease.per_frame) {
+            auto ready = prepareShaderExport(lease, model, settings);
+            if (!ready)
+                lease.error = ready.error();
+        }
+        return lease;
+    }
+
+    Status RenderingManager::selectExportPrograms(std::string_view host) {
+        const auto& lease = *export_draw_;
+        if (lease.ended() || (lease.snapshot && (!lease.programs || lease.programs->generation != vksplat_viewport_renderer_->deviceGeneration())))
+            return Status::failure(shadersNotReady());
+        if (lease.request && (!lease.snapshot || !std::ranges::contains(lease.snapshot->programs->hosts, host, &shaders::HostProgram::label))) {
+            // A host beyond the plan, such as the banded retry of a tile-instance overflow only the draw finds.
+            if (!std::ranges::contains(lease.missing, host))
+                lease.missing.emplace_back(host);
+            return Status::failure(shadersNotReady());
+        }
+        vksplat_viewport_renderer_->usePrograms(export_draw_->programs);
+        return {};
+    }
+
+    void RenderingManager::setSceneTime(const float seconds) {
+        if (scene_time_ == seconds)
+            return;
+        scene_time_ = seconds;
+        if (display_record_ && display_record_->custom)
+            markDirty(DirtyFlag::SPLATS, FrameReason::Playback);
+    }
+
+    RenderingManager::VulkanFrameResult RenderingManager::renderVulkanFrame(const RenderContext& context) {
+        custom_frame_drawing_ = false;
+        custom_frame_complete_ = true;
+        custom_hosts_planned_.clear();
+        if (!vksplat_viewport_renderer_)
+            vksplat_viewport_renderer_ = std::make_unique<VksplatViewportRenderer>();
+        vksplat_viewport_renderer_->prepare_custom = [this](const auto& prepared, [[maybe_unused]] const auto& request) -> Status {
+            if (export_draw_)
+                return selectExportPrograms(prepared.hosts.host);
+            assert(!request.custom_effect || std::ranges::contains(custom_hosts_planned_, prepared.hosts.host));
+            vksplat_viewport_renderer_->usePrograms(live_programs_);
+            return {};
+        };
+        auto frame = drawVulkanFrame(context);
+        if (frame.rendered && context.on_screen) {
+            if (custom_frame_drawing_ && custom_frame_complete_)
+                last_complete_ = custom_effect_snapshot_;
+            if (!display_record_ || display_record_->snapshot != custom_effect_snapshot_ || display_record_->custom != custom_frame_drawing_ || display_record_->complete != custom_frame_complete_) {
+                display_record_ = std::make_shared<const shaders::DisplayRecord>(shaders::DisplayRecord{custom_effect_snapshot_, custom_frame_drawing_, live_programs_, custom_frame_complete_});
+                if (shader_service_)
+                    shader_service_->observeDisplay(display_record_);
+            }
+        }
+        return frame;
+    }
+
+    void RenderingManager::attachCustomEffect(SceneRenderState& state, const SceneManager& scene_manager, const float time) const {
+        const auto snapshot = export_draw_ ? export_draw_->snapshot : custom_effect_snapshot_;
+        if (!snapshot || (!export_draw_ && shader_service_ && snapshot->epoch != shader_service_->projectToken()[0]))
+            return;
+        const auto scene = shaders::captureEffectScene(scene_manager.getScene(), state.model_transforms.size());
+        state.custom_effect = shaders::makeCustomEffectState(*snapshot, scene, time, sequencer_custom_reveal_);
+    }
+
+    Error RenderingManager::shaderWaitError(const Error& error, const std::stop_token& stop) {
+        // The viewer thread cannot wait for them.
+        if (error.code() == ErrorCode::ContractViolation)
+            return shadersNotReady();
+        using namespace lichtfeld::Strings;
+        std::string message =
+            error.code() != ErrorCode::Cancelled
+                ? LOCF(Runtime::EXPORT_SHADER_UNAVAILABLE, std::string(error.user_message()))
+                : LOC(stop.stop_requested() ? Runtime::EXPORT_CANCELLED : Runtime::EXPORT_STOPPED);
+        return make_error(ErrorInit{.code = error.code(),
+                                    .domain = ErrorDomain::Rendering,
+                                    .user_message = std::move(message),
+                                    .detection = LFS_SOURCE_SITE_CURRENT()});
+    }
+
+    Error RenderingManager::shadersNotReady() {
+        return make_error(ErrorInit{.code = ErrorCode::FailedPrecondition,
+                                    .domain = ErrorDomain::Rendering,
+                                    .user_message = LOC(lichtfeld::Strings::Runtime::EXPORT_SHADER_NOT_READY),
+                                    .detection = LFS_SOURCE_SITE_CURRENT()});
+    }
+
+    RenderingManager::SplatMotion RenderingManager::displayedSplatMotion() const {
+        if (display_record_ && display_record_->custom)
+            return SplatMotion::CustomEffect;
+        if (sequencer_custom_reveal_ ||
+            (sequencer_reveal_ &&
+             lfs::sequencer::revealMovesSplats(static_cast<lfs::sequencer::RevealEffect>(sequencer_reveal_->effect))))
+            return SplatMotion::Reveal;
+        return SplatMotion::None;
+    }
+
     void RenderingManager::notifyAsyncLodResultsReady() {
         requestRenderFollowUp();
     }
@@ -241,7 +464,7 @@ namespace lfs::vis {
         const bool active,
         const ViewportResizeRenderPolicy render_policy) {
         if (const DirtyMask dirty = frame_lifecycle_service_.setViewportResizeActive(active, render_policy); dirty) {
-            markDirty(dirty);
+            markDirty(dirty, lfs::vis::FrameReason::SceneChange);
             std::function<void()> wake_callback;
             {
                 std::scoped_lock lock(wake_callback_mutex_);
@@ -396,6 +619,10 @@ namespace lfs::vis {
     }
 
     void RenderingManager::releaseSceneRenderResources() {
+        if (shader_service_)
+            shader_service_->observeDisplay({});
+        display_record_.reset();
+        live_programs_.reset();
         vksplat_stale_frame_guard_.onSuccess();
         viewport_artifact_service_.clearViewportOutput();
         invalidateGTComparisonImageCache();
@@ -419,6 +646,7 @@ namespace lfs::vis {
         // Renderer reset frees ring cells; clear manager GT ticket state so the
         // next frame does not poll a stale ticket id against a fresh ring.
         gt_async_depth_ticket_ = 0;
+        gt_async_refresh_pending_ = false;
         gt_async_depth_dest_ = {};
         gt_async_ticket_mode_ = GTComparisonMode::RGB;
         gt_async_ticket_intrinsics_.reset();
@@ -434,9 +662,9 @@ namespace lfs::vis {
         lfs::core::Tensor::trim_memory_pool();
     }
 
-    void RenderingManager::noteVksplatIdleFrame(const bool training_active) {
+    void RenderingManager::releaseIdleVksplatScratch(const bool training_active) {
         if (!vksplat_viewport_renderer_) {
-            vksplat_idle_frame_count_ = 0;
+            vksplat_idle_since_ = {};
             return;
         }
         // A parked refresh polls for its turn on the training arena; releasing
@@ -449,25 +677,94 @@ namespace lfs::vis {
         const bool under_pressure = arena != nullptr && arena->is_under_memory_pressure();
 
         if (!training_active) {
-            vksplat_idle_frame_count_ = 0;
+            vksplat_idle_since_ = {};
             if (under_pressure) {
                 vksplat_viewport_renderer_->releaseScratchOnIdle(true);
             }
             return;
         }
 
-        if (vksplat_idle_frame_count_ < kVksplatIdleScratchReleaseFrames) {
-            ++vksplat_idle_frame_count_;
-        }
-        if (under_pressure || vksplat_idle_frame_count_ >= kVksplatIdleScratchReleaseFrames) {
+        const auto now = std::chrono::steady_clock::now();
+        if (vksplat_idle_since_ == std::chrono::steady_clock::time_point{})
+            vksplat_idle_since_ = now;
+        const bool release_private_scratch = now - vksplat_idle_since_ >= kVksplatIdleScratchReleaseDelay;
+        if (under_pressure || release_private_scratch) {
             // During training the shared arena is owned by FastGS. Only release
             // private viewer allocations here; the terminal callback below is
             // the point at which the shared import may be relinquished.
             vksplat_viewport_renderer_->releaseScratchOnIdle(
                 false,
-                vksplat_idle_frame_count_ >= kVksplatIdleScratchReleaseFrames);
-            vksplat_idle_frame_count_ = 0;
+                release_private_scratch);
+            vksplat_idle_since_ = now;
         }
+    }
+
+    void RenderingManager::retainVksplatScratch() {
+        vksplat_idle_since_ = std::chrono::steady_clock::now();
+    }
+
+    double RenderingManager::secondsUntilVksplatScratchRelease() const {
+        if (!vksplat_viewport_renderer_ || parked_arena_retry_ != 0)
+            return std::numeric_limits<double>::infinity();
+        if (vksplat_idle_since_ == std::chrono::steady_clock::time_point{})
+            return std::chrono::duration<double>(kVksplatIdleScratchReleaseDelay).count();
+        const auto due = vksplat_idle_since_ + kVksplatIdleScratchReleaseDelay;
+        return std::max(0.0, std::chrono::duration<double>(due - std::chrono::steady_clock::now()).count());
+    }
+
+    lfs::Result<void> RenderingManager::updateSettingsFromUser(const RenderSettings& new_settings) {
+        bool validate_environment = false;
+        bool orthographic_selected = false;
+        {
+            std::lock_guard<std::mutex> lock(settings_mutex_);
+            orthographic_selected = new_settings.orthographic && !settings_.orthographic &&
+                                    settings_.equirectangular;
+            validate_environment = settings_.environment_map_path != new_settings.environment_map_path ||
+                                   (settings_.environment_mode != new_settings.environment_mode &&
+                                    new_settings.environment_mode == EnvironmentBackgroundMode::Equirectangular);
+        }
+        if (validate_environment) {
+            const auto path = core::utf8_to_path(new_settings.environment_map_path);
+            if (const auto result = validateEnvironmentMapForUser(path); !result)
+                return result;
+        }
+        if (new_settings.orthographic && new_settings.equirectangular) {
+            auto projection_settings = new_settings;
+            // Select the newly enabled projection. Ambiguous requests retain
+            // panorama's existing rendering priority.
+            if (orthographic_selected) {
+                projection_settings.equirectangular = false;
+            } else {
+                projection_settings.orthographic = false;
+            }
+            updateSettings(projection_settings);
+        } else {
+            updateSettings(new_settings);
+        }
+        return {};
+    }
+
+    void RenderingManager::restoreSettingsFromProject(const RenderSettings& settings) {
+        if (settings.environment_mode == EnvironmentBackgroundMode::Equirectangular) {
+            (void)validateEnvironmentMapForUser(
+                core::utf8_to_path(settings.environment_map_path));
+        }
+        updateSettings(settings);
+    }
+
+    bool RenderingManager::setViewportRenderMode(std::string_view mode) {
+        if (mode != "splats" && mode != "points" && mode != "rings" && mode != "centers")
+            return false;
+        auto settings = getSettings();
+        const bool points = mode == "points";
+        const bool changed = settings.point_cloud_mode != points;
+        settings.point_cloud_mode = points;
+        settings.show_rings = mode == "rings";
+        settings.show_center_markers = mode == "centers";
+        updateSettings(settings, changed && points ? DirtyFlag::ALL : DirtyFlag::SELECTION);
+        if (auto* viewer = python::get_visualizer())
+            viewer->projectMarkSessionChapterCommitted("VIEW");
+        return true;
     }
 
     void RenderingManager::updateSettings(const RenderSettings& new_settings) {
@@ -477,6 +774,11 @@ namespace lfs::vis {
     void RenderingManager::updateSettings(const RenderSettings& new_settings,
                                           const DirtyMask dirty_flags) {
         RenderSettings sanitized_settings = new_settings;
+        // Restored settings retain panorama's rendering priority. Input must
+        // use that same projection even when an older project saved both flags.
+        if (sanitized_settings.equirectangular) {
+            sanitized_settings.orthographic = false;
+        }
         const auto backend = sceneUpscalerBackendFromId(sanitized_settings.scene_upscaler)
                                  .value_or(SceneUpscalerBackend::Native);
         if (!sceneUpscalerPreset(backend, sanitized_settings.scene_upscaler_preset)) {
@@ -531,6 +833,10 @@ namespace lfs::vis {
 
             const auto previous_backend = settings_.raster_backend;
             const bool previous_gut = settings_.gut;
+            if (settings_.environment_map_path != sanitized_settings.environment_map_path) {
+                environment_map_path_ =
+                    std::make_shared<const std::filesystem::path>(sanitized_settings.environment_map_path);
+            }
             settings_ = sanitized_settings;
             const bool gut_toggle_only =
                 settings_.raster_backend == previous_backend && settings_.gut != previous_gut;
@@ -539,7 +845,10 @@ namespace lfs::vis {
                                            : lfs::rendering::normalizeViewerRasterBackend(
                                                  settings_.raster_backend, settings_.gut);
             settings_.gut = lfs::rendering::isGutBackend(settings_.raster_backend);
-            enforceProjectionBackend(settings_);
+            settings_.transparency_mode = static_cast<lfs::rendering::GaussianTransparencyMode>(
+                std::clamp(static_cast<int>(settings_.transparency_mode), 0, 2));
+            settings_.stochastic_max_frames = std::clamp(settings_.stochastic_max_frames, 1, 1024);
+            enforceProjectionBackend(settings_, true);
             sanitizeDepthViewSettings(settings_);
             sanitizeGTComparisonSettings(settings_);
             settings_.grid_plane = clampGridPlane(settings_.grid_plane);
@@ -550,7 +859,7 @@ namespace lfs::vis {
             } else {
                 syncGridPlanesLocked(settings_.grid_plane);
             }
-            markDirty(dirty_flags);
+            markDirty(dirty_flags, lfs::vis::FrameReason::SceneChange);
         }
 
         if (lod_request_changed && lod_controller_) {
@@ -573,10 +882,30 @@ namespace lfs::vis {
         return settings_;
     }
 
+    RenderingManager::CameraProjectionSettings RenderingManager::getCameraProjectionSettings() const {
+        std::lock_guard<std::mutex> lock(settings_mutex_);
+        return {settings_.orthographic, settings_.focal_length_mm, settings_.ortho_scale};
+    }
+
+    void RenderingManager::setOrthographicScale(const float scale) {
+        {
+            std::lock_guard<std::mutex> lock(settings_mutex_);
+            settings_.ortho_scale = std::clamp(scale, 1.0f, 10000.0f);
+            markDirty(DirtyFlag::CAMERA, lfs::vis::FrameReason::CameraMotion);
+        }
+        auto& generation = app_store().render_settings_generation;
+        generation.set(generation.get() + 1);
+    }
+
     void RenderingManager::reportSceneUpscalerRuntimeSelection(
         const SceneUpscalerSelection selection) {
         std::lock_guard lock(settings_mutex_);
+        if (scene_upscaler_runtime_selection_ == selection)
+            return;
         scene_upscaler_runtime_selection_ = selection;
+        // Presentation prepares reconstruction after the scene render. Schedule
+        // the next render to use the reported resolution, even with an idle camera.
+        markDirty(DirtyFlag::VIEWPORT, FrameReason::SettingsChange);
     }
 
     SceneUpscalerSelection RenderingManager::sceneUpscalerRuntimeSelection() const {
@@ -585,7 +914,13 @@ namespace lfs::vis {
     }
 
     void RenderingManager::setOrthographic(const bool enabled, const float viewport_height, const float distance_to_pivot) {
-        std::lock_guard<std::mutex> lock(settings_mutex_);
+        std::unique_lock<std::mutex> lock(settings_mutex_);
+
+        const bool projection_changed = enabled && settings_.equirectangular;
+        if (projection_changed) {
+            settings_.equirectangular = false;
+            enforceProjectionBackend(settings_, true);
+        }
 
         constexpr float MIN_DISTANCE = 0.01f;
         constexpr float MIN_SCALE = 1.0f;
@@ -597,12 +932,7 @@ namespace lfs::vis {
             if (enabled && !settings_.orthographic) {
                 settings_.ortho_scale = DEFAULT_SCALE;
             }
-            settings_.orthographic = enabled;
-            markDirty(DirtyFlag::CAMERA);
-            return;
-        }
-
-        if (enabled && !settings_.orthographic) {
+        } else if (enabled && !settings_.orthographic) {
             const float vfov = lfs::rendering::focalLengthToVFov(settings_.focal_length_mm);
             const float half_tan_fov = std::tan(glm::radians(vfov) * 0.5f);
             settings_.ortho_scale = std::clamp(
@@ -611,7 +941,13 @@ namespace lfs::vis {
         }
 
         settings_.orthographic = enabled;
-        markDirty(DirtyFlag::CAMERA);
+        markDirty(DirtyFlag::CAMERA, lfs::vis::FrameReason::CameraMotion);
+        lock.unlock();
+
+        if (projection_changed) {
+            auto& generation = app_store().render_settings_generation;
+            generation.set(generation.get() + 1);
+        }
     }
 
     float RenderingManager::getFovDegrees() const {
@@ -629,13 +965,13 @@ namespace lfs::vis {
         settings_.focal_length_mm = std::clamp(focal_mm,
                                                lfs::rendering::MIN_FOCAL_LENGTH_MM,
                                                lfs::rendering::MAX_FOCAL_LENGTH_MM);
-        markDirty(DirtyFlag::CAMERA);
+        markDirty(DirtyFlag::CAMERA, lfs::vis::FrameReason::CameraMotion);
     }
 
     void RenderingManager::advanceSplitOffset() {
         std::lock_guard<std::mutex> lock(settings_mutex_);
         split_view_service_.advanceSplitOffset(settings_);
-        markDirty(DirtyFlag::SPLIT_VIEW);
+        markDirty(DirtyFlag::SPLIT_VIEW, lfs::vis::FrameReason::SettingsChange);
     }
 
     SplitViewInfo RenderingManager::getSplitViewInfo() const {
@@ -655,6 +991,18 @@ namespace lfs::vis {
     bool RenderingManager::isGTComparisonActive() const {
         std::lock_guard<std::mutex> lock(settings_mutex_);
         return split_view_service_.isGTComparisonActive(settings_);
+    }
+
+    bool RenderingManager::hasGTComparisonAvailable() const {
+        const auto* const scene_manager = services().sceneOrNull();
+        if (!scene_manager || !scene_manager->hasDataset()) {
+            return false;
+        }
+
+        const auto cameras = scene_manager->getScene().getAllCamerasCached();
+        return cameras && std::any_of(cameras->begin(), cameras->end(), [](const auto& camera) {
+                   return camera && camera->has_image() && !camera->image_path().empty();
+               });
     }
 
     bool RenderingManager::isPLYComparisonActive() const {
@@ -707,7 +1055,7 @@ namespace lfs::vis {
         if (!independent_split_active || split_view_service_.focusedPanel() == panel) {
             settings_.grid_plane = clamped_plane;
         }
-        markDirty(DirtyFlag::OVERLAY);
+        markDirty(DirtyFlag::OVERLAY, lfs::vis::FrameReason::Overlay);
     }
 
     void RenderingManager::clearLatestCameraMetrics() {
@@ -738,9 +1086,11 @@ namespace lfs::vis {
         }
 
         auto* const trainer_mgr = scene_manager->getTrainerManager();
-        if (!trainer_mgr || !trainer_mgr->getTrainer()) {
+        if (!trainer_mgr) {
             return;
         }
+        const auto* const trainer = trainer_mgr->getTrainer();
+        const bool training_session_initialized = trainer && trainer->isInitialized();
 
         const auto settings = getSettings();
         if (!splitViewUsesGTComparison(settings.split_view_mode) ||
@@ -754,6 +1104,17 @@ namespace lfs::vis {
         }
 
         const int current_iteration = trainer_mgr->getCurrentIteration();
+        if (!training_session_initialized) {
+            const std::optional<AppStore::CameraMetrics> unavailable =
+                AppStore::CameraMetrics::unavailable(current_camera_id, current_iteration, false);
+            if (app_store().camera_metrics.get() != unavailable) {
+                invalidateCameraMetricsRequests(true);
+                app_store().camera_metrics.set(unavailable);
+                markDirty(DirtyFlag::OVERLAY, lfs::vis::FrameReason::Overlay);
+            }
+            return;
+        }
+
         const bool include_ssim =
             settings.camera_metrics_mode == RenderSettings::CameraMetricsMode::PSNRSSIM;
         const auto now = std::chrono::steady_clock::now();
@@ -834,7 +1195,7 @@ namespace lfs::vis {
 
         if (cached_app_metrics) {
             app_store().camera_metrics.set(std::move(cached_app_metrics));
-            markDirty(DirtyFlag::OVERLAY);
+            markDirty(DirtyFlag::OVERLAY, lfs::vis::FrameReason::Overlay);
             return;
         }
         if (!should_queue) {
@@ -905,6 +1266,10 @@ namespace lfs::vis {
                         app_metrics = toAppCameraMetrics(*metrics);
                     } else {
                         latest_camera_metrics_.reset();
+                        app_metrics = AppStore::CameraMetrics::unavailable(
+                            request.camera_id,
+                            request.iteration,
+                            request.trainer_manager->hasInitializedTrainer());
                     }
                     last_camera_metrics_refresh_time_ = std::chrono::steady_clock::now();
                     applied = true;
@@ -913,7 +1278,7 @@ namespace lfs::vis {
 
             if (applied) {
                 app_store().camera_metrics.set(std::move(app_metrics));
-                markDirty(DirtyFlag::OVERLAY);
+                markDirty(DirtyFlag::OVERLAY, lfs::vis::FrameReason::Overlay);
             }
         }
     }
@@ -972,7 +1337,7 @@ namespace lfs::vis {
             event.emit();
         }
         if (result.render_settings_changed) {
-            markDirty(DirtyFlag::OVERLAY);
+            markDirty(DirtyFlag::OVERLAY, lfs::vis::FrameReason::Overlay);
             auto& render_settings_generation = app_store().render_settings_generation;
             render_settings_generation.set(render_settings_generation.get() + 1);
         }
@@ -990,16 +1355,17 @@ namespace lfs::vis {
                                                  const bool add_mode, lfs::core::Tensor* selection_tensor,
                                                  const bool saturation_mode, const float saturation_amount,
                                                  const std::optional<SplitViewPanelId> panel,
-                                                 const int focused_gaussian_id, const bool request_render) {
+                                                 const int focused_gaussian_id, const bool highlight_splats) {
         viewport_overlay_service_.setCursorPreview(active, x, y, radius, add_mode, selection_tensor,
-                                                   saturation_mode, saturation_amount, panel, focused_gaussian_id);
-        if (request_render)
-            markDirty(DirtyFlag::SELECTION);
+                                                   saturation_mode, saturation_amount, panel, focused_gaussian_id,
+                                                   highlight_splats);
+        if (highlight_splats)
+            markDirty(DirtyFlag::SELECTION, lfs::vis::FrameReason::Selection);
     }
 
     void RenderingManager::clearCursorPreviewState() {
         viewport_overlay_service_.clearCursorPreview();
-        markDirty(DirtyFlag::SELECTION);
+        markDirty(DirtyFlag::SELECTION, lfs::vis::FrameReason::Selection);
     }
 
     void RenderingManager::setRectPreview(float x0, float y0, float x1, float y1, bool add_mode,
@@ -1039,7 +1405,7 @@ namespace lfs::vis {
 
     void RenderingManager::clearSelectionPreviews() {
         viewport_overlay_service_.clearSelectionPreviews();
-        markDirty(DirtyFlag::SELECTION);
+        markDirty(DirtyFlag::SELECTION, lfs::vis::FrameReason::Selection);
     }
 
 } // namespace lfs::vis

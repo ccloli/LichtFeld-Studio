@@ -6,6 +6,7 @@
 #pragma once
 
 #include "core/checkpoint_format.hpp"
+#include "core/collision.hpp"
 #include "core/error.hpp"
 #include "core/export.hpp"
 #include "io/geometry_payload.hpp"
@@ -33,9 +34,13 @@ namespace lfs::io {
 
 namespace lfs::io::project {
 
-    // The current SCNG-bound checkpoint is resumable; older CKPT chapters are
-    // retained history. This cap counts only unbound historical chapters.
-    inline constexpr std::size_t CHECKPOINT_HISTORY_LIMIT = 16;
+    // Compare without overflowing when a project contains very large payloads.
+    [[nodiscard]] constexpr bool checkpoint_rewrite_required(
+        std::uint64_t dead_bytes, std::uint64_t superseded_bytes,
+        std::uint64_t resulting_live_bytes) noexcept {
+        const auto threshold = resulting_live_bytes / 2 + resulting_live_bytes % 2;
+        return dead_bytes >= threshold || superseded_bytes >= threshold - dead_bytes;
+    }
 
     // A binary chapter whose clean source range is also its lazy hydration
     // handle. Reading a clean value never marks it dirty; saving that same
@@ -59,6 +64,12 @@ namespace lfs::io::project {
         [[nodiscard]] static lfs::Result<LazyChunkValue>
         from_owned(std::vector<std::byte> bytes,
                    const lfs::core::Uuid& snapshot_uuid);
+        // Compresses a CKPT payload once, consuming it: each segment is freed
+        // as soon as its records are compressed. The value then holds only
+        // the stored bytes; reads beyond the header decode them.
+        [[nodiscard]] static lfs::Result<LazyChunkValue>
+        from_owned_checkpoint(SegmentedPayload bytes,
+                              const lfs::core::Uuid& snapshot_uuid);
         // Independent owner of the same file-backed or owned bytes. Safe to
         // retain after the source ProjectDocument is closed or replaced.
         [[nodiscard]] lfs::Result<LazyChunkValue> share() const;
@@ -96,6 +107,8 @@ namespace lfs::io::project {
         // Skip Impl::validate after the chapter scan. Hydration re-opens a
         // path the shell already validated; identity is checked by the caller.
         bool skip_validation = false;
+        // Optional validated source: retain its file handle, path and exact commit. Borrowed only during open().
+        const ProjectReader* retained_source = nullptr;
     };
 
     struct ProjectDocumentSaveOptions {
@@ -118,6 +131,9 @@ namespace lfs::io::project {
         // missing THMB.
         std::span<const std::byte> preview_png;
         bool remove_preview = false;
+        // Save As may omit run metrics from the destination while preserving
+        // the open source document if publication fails.
+        bool omit_metrics = false;
         // When enabled, an ordinary explicit save creates a dataset preview
         // only when the opened source has no THMB.
         bool regenerate_dataset_preview = true;
@@ -134,6 +150,10 @@ namespace lfs::io::project {
         // Untitled crash-protection writes a complete master without binding
         // the live document to that app-private path.
         bool leave_unbound = false;
+        // A captured checkpoint carries the preference at its training safe point.
+        // Other callers use the active PRMS preference.
+        std::optional<bool> keep_all_checkpoints = std::nullopt;
+        CommitBoundaryObserver boundary_observer = {};
     };
 
     // Inspect a first-save destination without creating, truncating, or
@@ -171,6 +191,9 @@ namespace lfs::io::project {
         std::uint64_t disk_reserve_bytes = 64ull * 1024 * 1024;
         std::optional<WriterLockLease> writer_lock_lease =
             std::nullopt;
+        // Recovered sessions keep their materialized document on a staging
+        // path while autosaves remain bound to the original master.
+        std::optional<std::filesystem::path> recovery_base_path;
         CommitBoundaryObserver boundary_observer;
     };
 
@@ -193,6 +216,9 @@ namespace lfs::io::project {
         std::uint64_t reused_chunks = 0;
         std::uint64_t opaque_chunks_carried = 0;
         std::uint64_t erased_chunks = 0;
+        bool rewrote_container = false;
+        std::uint64_t resulting_live_bytes = 0;
+        std::uint64_t superseded_checkpoint_bytes = 0;
     };
 
     struct LFS_IO_API DatasetEmbedSource {
@@ -295,6 +321,8 @@ namespace lfs::io::project {
         [[nodiscard]] ViewSessionChapter& edit_view() noexcept;
         [[nodiscard]] const EditorSessionChapter& editor() const noexcept;
         [[nodiscard]] EditorSessionChapter& edit_editor() noexcept;
+        [[nodiscard]] const ShaderLibraryChapter& shaders() const noexcept;
+        [[nodiscard]] ShaderLibraryChapter& edit_shaders() noexcept;
         [[nodiscard]] const SequencerSessionChapter& sequencer() const noexcept;
         [[nodiscard]] SequencerSessionChapter& edit_sequencer() noexcept;
         [[nodiscard]] const MetricsChapter& metrics() const noexcept;
@@ -324,15 +352,22 @@ namespace lfs::io::project {
         [[nodiscard]] std::vector<lfs::core::Uuid>
         dataset_source_uuids() const;
         [[nodiscard]] lfs::Result<ProjectDocumentSaveReport>
-        embed_dataset_batch(const EmbeddedDatasetManifest& manifest,
+        embed_dataset_batch(EmbeddedDatasetManifest manifest,
                             std::span<const DatasetEmbedSource> sources,
-                            const ProjectDocumentSaveOptions& options = {});
+                            const ProjectDocumentSaveOptions& options = {},
+                            std::function<void(float, const std::string&)> progress = {},
+                            std::function<bool()> cancel = {});
 
         [[nodiscard]] const LazyChunkValue*
         find_ppisp(const lfs::core::Uuid& instance_uuid) const noexcept;
         [[nodiscard]] lfs::Result<void>
         set_ppisp(const lfs::core::Uuid& instance_uuid,
                   LazyChunkValue payload);
+        // The single SfM observation chapter (SFMO), or null.
+        [[nodiscard]] const LazyChunkValue* find_sfm_observations() const noexcept;
+        // Replaces the SFMO chapter; nullopt removes it.
+        [[nodiscard]] lfs::Result<void>
+        set_sfm_observations(std::optional<LazyChunkValue> payload);
         [[nodiscard]] lfs::Result<void>
         set_georeference(const ProjectGeoreference& value);
         [[nodiscard]] lfs::Result<void>
@@ -364,7 +399,15 @@ namespace lfs::io::project {
         [[nodiscard]] lfs::Result<void>
         set_mesh(const lfs::core::Uuid& node_uuid, MeshPayload payload);
         [[nodiscard]] bool remove_mesh(const lfs::core::Uuid& node_uuid);
-        // Drop SPLT/PCLD/MESH payloads the current scene graph no longer binds.
+        [[nodiscard]] lfs::Result<void>
+        set_collision(const lfs::core::Uuid& instance_uuid,
+                      std::shared_ptr<const lfs::core::CollisionVolume> volume);
+        [[nodiscard]] bool has_deferred_collision_payloads() const;
+        // May run on a worker only while this candidate document is exclusively
+        // owned by the opener. Publishes no live scene state.
+        [[nodiscard]] lfs::Result<void>
+        preload_collision_payloads(const std::function<bool()>& canceled = {});
+        // Drop SPLT/PCLD/MESH/COLV payloads the current scene graph no longer binds.
         void remove_geometry_payloads_not_bound_by_scene();
 
         [[nodiscard]] std::vector<lfs::core::Uuid> splat_uuids() const;
@@ -381,12 +424,17 @@ namespace lfs::io::project {
         [[nodiscard]] lfs::Result<ProjectDocumentSaveReport>
         save_as(const std::filesystem::path& path,
                 const ProjectDocumentSaveOptions& options = {});
-        // Builds one complete overlay relative to the currently opened
-        // master. It never clears dirty state or regenerates THMB.
+        // Builds one complete overlay relative to the opened master. It never
+        // clears dirty state or regenerates THMB.
         [[nodiscard]] lfs::Result<ProjectDocumentSaveReport>
         save_autosave(
             const std::filesystem::path& sidecar_path,
             const ProjectDocumentAutosaveOptions& options);
+        // Carry the selected recovery overlay forward when publishing the
+        // next autosave against its original master.
+        [[nodiscard]] lfs::Result<void>
+        prepare_recovery_autosave(
+            const std::filesystem::path& sidecar_path);
         // Append THMB onto the current source generation without encoding
         // dirty chapters or payloads. Clean proofs are rebound to the new
         // head so a later save can carry the thumbnail forward.
@@ -405,6 +453,14 @@ namespace lfs::io::project {
         stage_hydration(
             lfs::core::Scene& destination,
             const ScenePayloadResolver& external_payloads = {},
+            lfs::core::SplatTensorAllocator splat_allocator = {},
+            std::function<void(std::size_t, std::size_t)> payload_progress = {}) const;
+
+        // Stage only these saved nodes for a partial payload commit after Undo.
+        [[nodiscard]] lfs::Result<ProjectHydrationPlan>
+        stage_payload_hydration_for_nodes(
+            lfs::core::Scene& destination,
+            std::span<const lfs::core::Uuid> node_uuids,
             lfs::core::SplatTensorAllocator splat_allocator = {},
             std::function<void(std::size_t, std::size_t)> payload_progress = {}) const;
 
@@ -434,6 +490,13 @@ namespace lfs::io::project {
             std::span<const ReferenceOwnerBinding> additional_bindings = {}) const;
 
     private:
+        [[nodiscard]] lfs::Result<ProjectHydrationPlan>
+        stage_hydration_filtered(
+            lfs::core::Scene& destination,
+            const ScenePayloadResolver& external_payloads,
+            lfs::core::SplatTensorAllocator splat_allocator,
+            std::function<void(std::size_t, std::size_t)> payload_progress,
+            std::optional<std::span<const lfs::core::Uuid>> node_uuids) const;
         [[nodiscard]] lfs::Result<ProjectDocumentSaveReport>
         save_impl(
             const std::filesystem::path& path,

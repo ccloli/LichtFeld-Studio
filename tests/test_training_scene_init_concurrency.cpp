@@ -7,14 +7,18 @@
 #include "core/events.hpp"
 #include "core/mesh_data.hpp"
 #include "core/parameters.hpp"
+#include "core/path_utils.hpp"
 #include "core/point_cloud.hpp"
 #include "core/scene.hpp"
 #include "core/splat_data.hpp"
 #include "core/tensor.hpp"
 #include "core/uuid.hpp"
+#include "io/exporter.hpp"
+#include "licht_test_support.hpp"
 #include "training/trainer.hpp"
 #include "training/training_setup.hpp"
 #include "visualizer/core/services.hpp"
+#include "visualizer/rendering/rendering_manager.hpp"
 #include "visualizer/scene/scene_manager.hpp"
 #include "visualizer/training/training_manager.hpp"
 
@@ -27,6 +31,7 @@
 #include <filesystem>
 #include <functional>
 #include <future>
+#include <glm/gtc/matrix_transform.hpp>
 #include <gtest/gtest.h>
 #include <memory>
 #include <mutex>
@@ -241,6 +246,15 @@ protected:
         lfs::event::EventBridge::instance().clear_all();
     }
 
+    void set_running(lfs::vis::TrainerManager& manager) {
+        ASSERT_TRUE(manager.state_machine_.transitionTo(lfs::vis::TrainingState::Starting));
+        ASSERT_TRUE(manager.state_machine_.transitionTo(lfs::vis::TrainingState::Running));
+    }
+
+    void backdate_training_start(lfs::vis::TrainerManager& manager, const std::chrono::seconds age) {
+        manager.training_start_time_ = std::chrono::steady_clock::now() - age;
+    }
+
     void set_scene_owner_poster(
         lfs::vis::TrainerManager& manager,
         std::function<bool(std::function<void()>, std::function<void()>)> poster) {
@@ -259,6 +273,74 @@ protected:
         manager.runOnSceneOwnerThread(std::move(run), std::move(cancel));
     }
 };
+
+// Elapsed time adds the running segment only while the state is Running; a
+// stop that skips it before entering Stopping reports 0 s for a run without pauses.
+TEST_F(TrainingSceneInitConcurrencyTest, StopKeepsTheRunningSegmentInElapsedTime) {
+    lfs::core::Scene scene;
+    const auto dataset = scene.addDataset("Dataset");
+    const auto cameras = scene.addCameraGroup("Training (1)", dataset, 1);
+    ASSERT_NE(scene.addCamera("camera.png", cameras, make_test_camera()), lfs::core::NULL_NODE);
+    lfs::vis::TrainerManager manager;
+    manager.setTrainer(std::make_unique<lfs::training::Trainer>(scene));
+    set_running(manager);
+    backdate_training_start(manager, std::chrono::seconds(5));
+
+    std::optional<float> reported;
+    lfs::core::events::state::TrainingCompleted::when(
+        [&reported](const auto& event) { reported = event.elapsed_seconds; });
+    manager.stopTraining();
+
+    ASSERT_TRUE(wait_until([&] { return manager.getState() == lfs::vis::TrainingState::Finished; }));
+    EXPECT_GE(manager.getElapsedSeconds(), 5.0f);
+    ASSERT_TRUE(reported);
+    EXPECT_GE(*reported, 5.0f);
+}
+
+TEST_F(TrainingSceneInitConcurrencyTest, ColdViewportDefersWhileTrainerHoldsModelLock) {
+    lfs::vis::SceneManager scene_manager;
+    scene_manager.changeContentType(lfs::vis::SceneManager::ContentType::Dataset);
+    auto& scene = scene_manager.getScene();
+    const auto dataset = scene.addDataset("Dataset");
+    const auto cameras = scene.addCameraGroup("Training (1)", dataset, 1);
+    ASSERT_NE(scene.addCamera("camera.png", cameras, make_test_camera()), lfs::core::NULL_NODE);
+    lfs::vis::TrainerManager manager;
+    manager.setTrainer(std::make_unique<lfs::training::Trainer>(scene_manager.getScene()));
+    lfs::vis::services().set(&manager);
+    set_running(manager);
+
+    lfs::vis::RenderingManager rendering;
+    Viewport viewport(640, 480);
+    viewport.frameBufferSize = {640, 480};
+    lfs::vis::RenderSettings settings;
+    const lfs::vis::RenderingManager::RenderContext context{
+        .viewport = viewport,
+        .settings = settings,
+        .scene_manager = &scene_manager};
+    std::promise<void> locked;
+    std::promise<void> viewer_work;
+    auto work = viewer_work.get_future();
+    std::atomic<bool> timed_out{false};
+    std::jthread worker([&] {
+        std::unique_lock lock(manager.getTrainer()->getRenderMutex());
+        locked.set_value();
+        // Model growth waits for work on the viewer thread while holding this
+        // lock. Bound that wait so a blocking preview fails instead of hanging.
+        timed_out = work.wait_for(std::chrono::seconds(2)) == std::future_status::timeout;
+    });
+    locked.get_future().wait();
+    const auto deferred = rendering.renderVulkanFrame(context);
+    viewer_work.set_value();
+    worker.join();
+    EXPECT_FALSE(timed_out);
+    EXPECT_FALSE(deferred.matches_viewport_extent);
+    EXPECT_EQ(deferred.image, nullptr);
+    EXPECT_NE(rendering.pendingDirtyMask(), 0u);
+
+    // Once growth releases the lock, a hidden/empty scene can publish its extent.
+    const auto ready = rendering.renderVulkanFrame(context);
+    EXPECT_TRUE(ready.matches_viewport_extent);
+}
 
 TEST_F(TrainingSceneInitConcurrencyTest, DelayedOwnerInstallMutatesGraphWhileReadersScan) {
     lfs::vis::SceneManager scene_manager;
@@ -415,6 +497,71 @@ TEST_F(TrainingSceneInitConcurrencyTest, PrepareKeepsSeedsOutsideEnabledCropbox)
     EXPECT_EQ((*prepared)->preserved_cropbox_data.max, empty_box.max);
     EXPECT_EQ(scene.getNodeCount(), node_count);
     EXPECT_EQ(scene.getTrainingModel(), nullptr);
+}
+
+// Catches training from an --init splat dropping the crop box placed on its preview point cloud: the model then
+// trained without the crop box region and the cropbox evaluation mask found no crop box.
+TEST_F(TrainingSceneInitConcurrencyTest, PrepareFromInitSplatKeepsTheCropbox) {
+    lfs::core::Scene scene;
+    ASSERT_TRUE(populate_init_scene(scene));
+    const lfs::test::licht::TemporaryDirectory temp("lfs-init-splat-cropbox");
+    const auto init = temp.path / "init.ply";
+    ASSERT_TRUE(lfs::io::save_ply(*lfs::test::licht::make_splat(5),
+                                  {.output_path = init, .binary = true, .async = false}));
+    lfs::core::param::TrainingParameters params;
+    params.init_path = lfs::core::path_to_utf8(init);
+    params.optimization.sh_degree = 0;
+    params.optimization.max_cap = 16;
+    params.optimization.random = false;
+
+    const auto prepared = lfs::training::prepareTrainingModel(params, scene);
+    ASSERT_TRUE(prepared) << prepared.error();
+    ASSERT_TRUE(prepared->has_value());
+    EXPECT_EQ((*prepared)->model->size(), 5);
+    EXPECT_TRUE((*prepared)->has_preserved_cropbox);
+    EXPECT_TRUE((*prepared)->preserved_cropbox_data.enabled);
+    EXPECT_EQ((*prepared)->preserved_cropbox_data.min, glm::vec3(-100.0f));
+    EXPECT_EQ((*prepared)->preserved_cropbox_data.max, glm::vec3(100.0f));
+}
+
+// Catches a crop polygon on the dataset point cloud that training drops: the model takes it over like the crop box,
+// so the polygon region of interest applies once training starts.
+TEST_F(TrainingSceneInitConcurrencyTest, PrepareAndInstallCarryTheCropPolygon) {
+    lfs::core::Scene scene;
+    const auto dataset = scene.addDataset("Dataset");
+    const auto cameras = scene.addCameraGroup("Training (1)", dataset, 1);
+    ASSERT_NE(scene.addCamera("cam_0001.png", cameras, make_test_camera()), lfs::core::NULL_NODE);
+    const auto pc = scene.addPointCloud("PointCloud", make_test_point_cloud(8), dataset);
+    ASSERT_NE(pc, lfs::core::NULL_NODE);
+    const lfs::core::CropPolygonData polygon{
+        .vertices = {{-1.0f, -1.0f}, {1.0f, -1.0f}, {0.0f, 1.0f}},
+        .half_depth = 2.0f,
+        .inverse = true};
+    const glm::mat4 local = glm::translate(glm::mat4(1.0f), glm::vec3(0.5f, 0.0f, 0.0f));
+    ASSERT_NE(scene.addCropPolygon("PointCloud_crop_polygon", pc, polygon, local), lfs::core::NULL_NODE);
+
+    lfs::core::param::TrainingParameters params;
+    params.optimization.sh_degree = 0;
+    params.optimization.max_cap = 16;
+    params.optimization.random = false;
+    auto prepared = lfs::training::prepareTrainingModel(params, scene);
+    ASSERT_TRUE(prepared) << prepared.error();
+    ASSERT_TRUE(prepared->has_value());
+    ASSERT_TRUE((*prepared)->preserved_crop_polygon.has_value());
+    EXPECT_EQ((*prepared)->preserved_crop_polygon_transform, local);
+
+    ASSERT_TRUE(lfs::training::installTrainingModel(scene, std::move(**prepared)));
+    const auto* model = scene.getNodeByUuid(scene.getTrainingModelNodeUuid());
+    ASSERT_NE(model, nullptr);
+    const auto polygon_id = scene.getCropPolygonForSplat(model->id);
+    ASSERT_NE(polygon_id, lfs::core::NULL_NODE);
+    EXPECT_EQ(scene.getCropPolygonData(polygon_id)->vertices, polygon.vertices);
+    EXPECT_FLOAT_EQ(scene.getCropPolygonData(polygon_id)->half_depth, polygon.half_depth);
+    EXPECT_TRUE(scene.getCropPolygonData(polygon_id)->inverse);
+    EXPECT_EQ(scene.getNodeById(polygon_id)->local_transform.get(), local);
+    const auto region = lfs::training::resolve_training_cropbox_geom(scene);
+    ASSERT_TRUE(region.has_value());
+    EXPECT_TRUE(region->is_polygon());
 }
 
 TEST_F(TrainingSceneInitConcurrencyTest, StopTrainingReturnsWhileWorkerWaitsForOwner) {

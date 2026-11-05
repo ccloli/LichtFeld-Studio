@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include "sdl_coordinate_utils.hpp"
 #include <SDL3/SDL_events.h>
 #include <SDL3/SDL_keyboard.h>
 #include <SDL3/SDL_mouse.h>
@@ -30,8 +31,11 @@ namespace lfs::vis {
     struct FrameInputEvent {
         FrameInputEventKind kind = FrameInputEventKind::KeyDown;
         SDL_Scancode scancode = SDL_SCANCODE_UNKNOWN;
+        SDL_Keycode keycode = SDLK_UNKNOWN;
         SDL_Keymod modifiers = SDL_KMOD_NONE;
         bool repeat = false;
+        // SDL timestamp, so a key handled at dispatch matches its frame-pass copy.
+        uint64_t timestamp = 0;
         std::string text{};
         int editing_start = -1;
         int editing_length = -1;
@@ -53,6 +57,10 @@ namespace lfs::vis {
         uint64_t serial = 0;
         float mouse_x = 0;
         float mouse_y = 0;
+        // Pointer motion this frame. It keeps counting in relative mouse mode,
+        // where SDL clamps mouse_x/mouse_y to the window.
+        float mouse_dx = 0;
+        float mouse_dy = 0;
         bool mouse_down[3] = {};
         bool mouse_clicked[3] = {};
         bool mouse_released[3] = {};
@@ -72,12 +80,19 @@ namespace lfs::vis {
         int window_h = 0;
         std::chrono::steady_clock::time_point poll_time{};
 
+        [[nodiscard]] bool hasUserInput() const {
+            return mouse_moved || window_event || mouse_wheel != 0.0f || mouse_wheel_x != 0.0f ||
+                   !mouse_button_events.empty() || !input_events.empty() || !keys_pressed.empty();
+        }
+
         void beginFrame() {
             ++serial;
             mouse_clicked[0] = mouse_clicked[1] = mouse_clicked[2] = false;
             mouse_released[0] = mouse_released[1] = mouse_released[2] = false;
             mouse_wheel = 0;
             mouse_wheel_x = 0;
+            mouse_dx = 0;
+            mouse_dy = 0;
             mouse_button_events.clear();
             input_events.clear();
             keys_pressed.clear();
@@ -101,6 +116,8 @@ namespace lfs::vis {
             switch (event.type) {
             case SDL_EVENT_MOUSE_MOTION:
                 mouse_moved = true;
+                mouse_dx += event.motion.xrel;
+                mouse_dy += event.motion.yrel;
                 break;
             case SDL_EVENT_MOUSE_BUTTON_DOWN:
             case SDL_EVENT_MOUSE_BUTTON_UP: {
@@ -128,12 +145,12 @@ namespace lfs::vis {
                 mouse_wheel_x += event.wheel.x;
                 break;
             case SDL_EVENT_KEY_DOWN:
-                input_events.push_back({.kind = FrameInputEventKind::KeyDown, .scancode = event.key.scancode, .modifiers = event.key.mod, .repeat = event.key.repeat});
+                input_events.push_back({.kind = FrameInputEventKind::KeyDown, .scancode = event.key.scancode, .keycode = event.key.key, .modifiers = event.key.mod, .repeat = event.key.repeat, .timestamp = event.common.timestamp});
                 if (!event.key.repeat)
                     keys_pressed.push_back(event.key.scancode);
                 break;
             case SDL_EVENT_KEY_UP:
-                input_events.push_back({.kind = FrameInputEventKind::KeyUp, .scancode = event.key.scancode, .modifiers = event.key.mod});
+                input_events.push_back({.kind = FrameInputEventKind::KeyUp, .scancode = event.key.scancode, .keycode = event.key.key, .modifiers = event.key.mod, .timestamp = event.common.timestamp});
 
                 break;
             case SDL_EVENT_TEXT_INPUT:
@@ -154,13 +171,20 @@ namespace lfs::vis {
         void finalize(SDL_Window* window) {
             assert(window);
             poll_time = std::chrono::steady_clock::now();
-            const SDL_MouseButtonFlags buttons = SDL_GetMouseState(&mouse_x, &mouse_y);
+            const SDL_MouseButtonFlags buttons = input::mouseStateInPixels(window, &mouse_x, &mouse_y);
             mouse_down[0] = (buttons & SDL_BUTTON_LMASK) != 0;
             mouse_down[1] = (buttons & SDL_BUTTON_RMASK) != 0;
             mouse_down[2] = (buttons & SDL_BUTTON_MMASK) != 0;
             key_mods = SDL_GetModState();
             int w = 0, h = 0;
-            SDL_GetWindowSize(window, &w, &h);
+            SDL_GetWindowSizeInPixels(window, &w, &h);
+            const auto scale = input::windowPixelScale(window);
+            mouse_dx *= scale.x;
+            mouse_dy *= scale.y;
+            for (auto& event : mouse_button_events) {
+                event.x *= scale.x;
+                event.y *= scale.y;
+            }
             window_w = w;
             window_h = h;
         }

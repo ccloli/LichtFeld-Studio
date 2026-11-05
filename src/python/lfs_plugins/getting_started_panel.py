@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: 2025 LichtFeld Studio Authors
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Getting Started panel with tutorial videos and documentation links."""
+from _lfs_path_io import native_path, open
 
 import os
 import threading
@@ -43,9 +44,9 @@ def _extract_video_id(url):
 
 
 def _download_thumbnail(video_id, on_done):
-    os.makedirs(_CACHE_DIR, exist_ok=True)
+    os.makedirs(native_path(_CACHE_DIR), exist_ok=True)
     path = os.path.join(_CACHE_DIR, f"{video_id}.jpg")
-    if os.path.exists(path):
+    if os.path.exists(native_path(path)):
         on_done(video_id, path)
         return
     try:
@@ -62,6 +63,7 @@ class GettingStartedPanel(Panel):
     """Floating panel displaying tutorial videos and documentation."""
 
     def __init__(self):
+        self._section = "highlights"
         self._handle = None
         self._ready_lock = threading.Lock()
         self._ready_queue = []
@@ -76,8 +78,22 @@ class GettingStartedPanel(Panel):
             return
 
         model.bind_func("panel_label", lambda: lf.ui.tr("getting_started.title"))
+        for section in ("highlights", "training", "datasets"):
+            binding_name = f"show_{section}"
+            model.bind_func(binding_name,
+                            lambda section=section: self._section == section)
+            model.bind_event(binding_name,
+                             lambda *_args, section=section: self._set_section(section))
         model.bind_event("open_url", self._on_open_url)
         self._handle = model.get_handle()
+
+    def _set_section(self, section):
+        if self._section == section:
+            return
+        self._section = section
+        if self._handle:
+            for name in ("show_highlights", "show_training", "show_datasets"):
+                self._handle.dirty(name)
 
     def on_mount(self, doc):
         super().on_mount(doc)

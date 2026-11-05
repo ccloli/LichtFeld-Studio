@@ -123,7 +123,7 @@ class _EventStub:
 def test_mesh2splat_panel_uses_dirty_update_policy(mesh2splat_module):
     module, _state = mesh2splat_module
     assert module.Mesh2SplatPanel.update_policy == "dirty"
-    assert module.Mesh2SplatPanel.update_interval_ms == 100
+    assert module.Mesh2SplatPanel.update_interval_ms is None
 
 
 def test_mesh2splat_panel_builds_mesh_and_resolution_records(mesh2splat_module):
@@ -263,3 +263,14 @@ def test_mesh2splat_panel_store_update_invalidates_model(mesh2splat_module):
     finally:
         panel._unsubscribe_reactive_state()
         module.RuntimeState.mesh2splat_state._fallback = {}
+
+
+def test_label_reset_rejects_active_conversion(mesh2splat_module):
+    module, _state = mesh2splat_module
+    panel = module.Mesh2SplatPanel()
+    panel._quality = .9
+    assert panel._apply_reset("quality", .5)
+    assert panel._quality == .5
+    panel._last_active = True
+    assert panel._reset_default("gaussian_scale") is None
+    assert not panel._apply_reset("quality", .5)

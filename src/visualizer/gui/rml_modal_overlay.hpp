@@ -3,12 +3,14 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #pragma once
+#include "gui/rmlui/rml_tooltip.hpp"
 
 #include "core/modal_request.hpp"
 #include "gui/rmlui/rml_input_utils.hpp"
 #include "gui/rmlui/rmlui_manager.hpp"
 
 #include <RmlUi/Core/EventListener.h>
+#include <chrono>
 #include <core/export.hpp>
 #include <cstddef>
 #include <deque>
@@ -36,6 +38,7 @@ namespace lfs::vis {
     class VisualizerImplResetTest_RecoverThenCleanQuitDoesNotReoffer_Test;
     class VisualizerImplResetTest_RecoverThenDiscardExitRemovesMasterSidecar_Test;
     class VisualizerImplResetTest_RecoverThenCrashStillOffersRecovery_Test;
+    class VisualizerImplResetTest_RecoverThenAutosaveEditsForNextRecovery_Test;
     class VisualizerImplResetTest_StartupOffersScratchRecoveryAsUntitled_Test;
     class VisualizerImplResetTest_StartupSweepsEmptyScratchAndDoesNotOffer_Test;
     class VisualizerImplResetTest_RecoverTempWithSidecarThenDiscardExitLeavesNoTempFiles_Test;
@@ -45,6 +48,8 @@ namespace lfs::vis {
 namespace lfs::vis::gui {
 
     class RmlUIManager;
+    class ModalFormBehaviorTest;
+    class SequencerExportWorkflowTest;
     struct PanelInputState;
 
     struct LFS_VIS_API ModalSnapshot {
@@ -66,9 +71,7 @@ namespace lfs::vis::gui {
         void enqueue(lfs::core::ModalRequest request);
         void activatePending();
         void processInput(const PanelInputState& input);
-        void render(int screen_w, int screen_h,
-                    float screen_x, float screen_y,
-                    float vp_x, float vp_y, float vp_w, float vp_h);
+        void render(int screen_w, int screen_h);
         void releaseRendererResources();
         void reloadResources();
         void preload();
@@ -79,12 +82,16 @@ namespace lfs::vis::gui {
         bool dismiss(const std::string& button_label);
         bool updateForm(const std::string& key, const std::optional<std::string>& body_rml,
                         const std::vector<lfs::core::ModalButtonSpec>& buttons);
+        bool setFormValues(const std::string& key, const std::unordered_map<std::string, std::string>& values);
         [[nodiscard]] bool hasPendingRequest() const;
         [[nodiscard]] bool hasPendingRenderWork() const;
         [[nodiscard]] bool needsAnimationFrame() const;
+        [[nodiscard]] std::optional<double> secondsUntilNextUpdate() const;
         [[nodiscard]] std::string animationDemandDescription() const;
 
     private:
+        friend class ModalFormBehaviorTest;
+        friend class SequencerExportWorkflowTest;
         friend class lfs::vis::VisualizerImplResetTest_RecoveryDeclineKeepsSidecarSuppressesRepeatAndExplicitSaveDeletesIt_Test;
         friend class lfs::vis::VisualizerImplResetTest_NewProjectClearsRecoveryPromptPendingSoNextOpenProceeds_Test;
         friend class lfs::vis::VisualizerImplResetTest_RecoveredPublishUsesRecoveredCommitKind_Test;
@@ -97,6 +104,7 @@ namespace lfs::vis::gui {
         friend class lfs::vis::VisualizerImplResetTest_RecoverThenCleanQuitDoesNotReoffer_Test;
         friend class lfs::vis::VisualizerImplResetTest_RecoverThenDiscardExitRemovesMasterSidecar_Test;
         friend class lfs::vis::VisualizerImplResetTest_RecoverThenCrashStillOffersRecovery_Test;
+        friend class lfs::vis::VisualizerImplResetTest_RecoverThenAutosaveEditsForNextRecovery_Test;
         friend class lfs::vis::VisualizerImplResetTest_StartupOffersScratchRecoveryAsUntitled_Test;
         friend class lfs::vis::VisualizerImplResetTest_StartupSweepsEmptyScratchAndDoesNotOffer_Test;
         friend class lfs::vis::VisualizerImplResetTest_RecoverTempWithSidecarThenDiscardExitLeavesNoTempFiles_Test;
@@ -107,9 +115,13 @@ namespace lfs::vis::gui {
         void cacheElements();
 
         void showNext();
+        void applyFormUpdate(const std::optional<std::string>& body_rml,
+                             const std::vector<lfs::core::ModalButtonSpec>& buttons);
+        void flushPendingActions();
         void updateButtons(const std::vector<lfs::core::ModalButtonSpec>& buttons);
         bool dismissFirstEnabledButton();
         void bindTextInputRevert();
+        void resetTooltip();
         void cancel();
         lfs::core::ModalResult collectFormValues() const;
 
@@ -118,8 +130,30 @@ namespace lfs::vis::gui {
             void ProcessEvent(Rml::Event& event) override;
         };
 
+        struct DispatchScope {
+            explicit DispatchScope(RmlModalOverlay& overlay, bool flush = true);
+            ~DispatchScope();
+            RmlModalOverlay& overlay;
+            bool flush;
+        };
+
+        struct PendingAction {
+            enum class Kind { Update,
+                              Dismiss,
+                              Cancel } kind;
+            std::optional<std::string> body_rml;
+            std::vector<lfs::core::ModalButtonSpec> buttons;
+            std::string button_label;
+        };
+
+        std::deque<PendingAction> pending_actions_;
+        int dispatch_depth_ = 0;
+        bool flushing_actions_ = false;
+        bool close_pending_ = false;
+
         RmlUIManager* rml_manager_;
         OverlayEventListener listener_;
+        bool setting_form_values_ = false;
         rml_input::TextInputEscapeRevertController text_input_revert_;
 
         Rml::Context* rml_context_ = nullptr;
@@ -146,7 +180,10 @@ namespace lfs::vis::gui {
         int width_ = 0;
         int height_ = 0;
         CachedVulkanContextRender direct_cache_;
+        RmlTooltipController tooltip_;
+        Rml::Element* tooltip_suppressed_target_ = nullptr;
         bool render_needed_ = true;
+        std::optional<std::chrono::steady_clock::time_point> next_update_at_;
         bool dialog_position_valid_ = false;
         float last_dialog_left_ = 0.0f;
         float last_dialog_top_ = 0.0f;

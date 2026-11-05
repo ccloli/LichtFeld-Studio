@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Persistent gallery work queue. Network and disk transfers run off the UI thread."""
 from __future__ import annotations
+from _lfs_path_io import native_path, open
 
 import copy
 from contextlib import contextmanager
@@ -16,8 +17,9 @@ import threading
 import uuid
 import time
 import urllib.error
-from pathlib import Path
+from _lfs_path_io import Path
 
+from .private_directory import mkdir_private
 from .portal_account import PortalHTTPError, PortalProtocolError, _locked_sidecar
 from .portal_gallery import (PortalGalleryClient, GalleryTransferCanceled, GalleryProcessingPaused,
     GalleryProcessingTimeout, GalleryTransferInvalid, PROCESSING_TIMEOUT, DEFAULT_MAX_FILE_BYTES, disk_preflight, domain_tokens, UNSUPPORTED_PORTAL, _fingerprint)
@@ -26,6 +28,7 @@ from .portal_security import redact, safe_filename
 from .credential_storage import FileBackend
 from .project_identity import ProjectPathIdentity
 from . import gallery_validation, gallery_preparation
+from .gallery_storage import is_storage_error
 from .gallery_logging import failure as log_failure, safe_url, safe_text, stage as log_stage
 
 
@@ -162,6 +165,14 @@ def _validate_journal(data):
 COVER_WARNING = "projects.gallery.warning.cover_failed"
 
 
+def portal_sentence(exc):
+    """The sentence a rejected gallery request carries for the user, in the error or its detail."""
+    for text in (exc.error, (exc.detail or {}).get("message")):
+        if isinstance(text, str) and " " in text.strip():
+            return text
+    return ""
+
+
 def friendly_error(exc):
     import lichtfeld as lf
 
@@ -175,6 +186,8 @@ def friendly_error(exc):
                 "Invalid portable LichtFeld project.", "Project checksum failed.",
                 "Embedded project asset checksum failed."):
             return "The downloaded file is damaged or was changed on the portal."
+        if exc.status == 400 and portal_sentence(exc):
+            return "gallery_portal:" + redact(portal_sentence(exc))
     if isinstance(status, int):
         key = {401: "authorization_expired", 403: "access", 404: "not_found",
                409: "http_conflict", 413: "too_large", 429: "portal_busy"}.get(status)
@@ -221,6 +234,7 @@ class GallerySync:
         self._quota_bytes = None
         self._used_bytes = None
         self._reserved_bytes = None
+        self._wrap_overhead_bytes = None
         self._hdr_backgrounds = None
         self._change_sequence = None
         self._completion = None
@@ -298,6 +312,7 @@ class GallerySync:
                     self._retire_update_download(job)
             pending_cleanup = [job for bucket in self._data["accounts"].values() for job in bucket["jobs"]
                                if job["status"] in ("error", "completed", "canceled") and job.get("ownedExport")
+                               and not (job["status"] == "error" and is_storage_error(job.get("message", "")))
                                and (not job.get("preparedRemoved") or job.get("cleanupPending"))]
             for job in pending_cleanup:
                 if job["status"] == "error":
@@ -318,7 +333,7 @@ class GallerySync:
                     raise ValueError("Gallery transfer history is too large to save. Keep the recovery folder for help.")
             temporary = None
             try:
-                with tempfile.NamedTemporaryFile(mode="w", dir=self.root, delete=False) as file:
+                with tempfile.NamedTemporaryFile(mode="w", dir=native_path(self.root), delete=False) as file:
                     temporary = Path(file.name)
                     file.write(encoded)
                     file.flush()
@@ -333,7 +348,7 @@ class GallerySync:
                     path_identity.validate()
                     if len(check) > 2 and file_stamp(path_identity.path) != check[2]:
                         raise ValueError("The local project changed. Review it before updating.")
-                os.replace(temporary, self._journal)
+                os.replace(native_path(temporary), native_path(self._journal))
                 self._journal_seen = True
                 self._disk_digest = hashlib.sha256(encoded.encode()).hexdigest()
             finally:
@@ -417,6 +432,7 @@ class GallerySync:
                 "quotaBytes": self._quota_bytes if same else None,
                 "usedBytes": self._used_bytes if same else None,
                 "reservedBytes": self._reserved_bytes if same else None,
+                "wrapOverheadBytes": self._wrap_overhead_bytes if same else None,
                 "hdrBackgrounds": self._hdr_backgrounds if same else None,
                 "changeSequence": self._change_sequence if same else None,
                 "established": bool(same and self._owner and self._checked_at),
@@ -571,7 +587,7 @@ class GallerySync:
                             cache = {}
                     except (OSError, ValueError):
                         cache = {}
-                    self._quota_bytes = self._used_bytes = self._reserved_bytes = None
+                    self._quota_bytes = self._used_bytes = self._reserved_bytes = self._wrap_overhead_bytes = None
                     self._source_formats = []
                 cached = self.scenes if same else copy.deepcopy(cache.get("scenes", []))
                 sequence = self._change_sequence if same else cache.get("changeSequence")
@@ -630,6 +646,7 @@ class GallerySync:
                 self._quota_bytes = capabilities.get("quotaBytes")
                 self._used_bytes = capabilities.get("usedBytes")
                 self._reserved_bytes = capabilities.get("reservedBytes")
+                self._wrap_overhead_bytes = capabilities.get("wrapOverheadBytes")
                 self._hdr_backgrounds = capabilities.get("hdrBackgrounds")
                 self._change_sequence = getattr(client, "change_sequence", None)
                 version = capabilities.get("revisionDomains", 0)
@@ -660,7 +677,7 @@ class GallerySync:
         identity = (self.account.base_url, snap.email, snap.connected_since, snap.signed_in)
         with self._lock:
             if identity != self._poster_identity or not snap.signed_in:
-                shutil.rmtree(self.root / "posters", ignore_errors=True)
+                shutil.rmtree(native_path(self.root / "posters", force_extended=True), ignore_errors=True)
                 self._poster_entries.clear()
                 self._storage_hosts = None
                 self._poster_identity = identity
@@ -716,7 +733,7 @@ class GallerySync:
                         return
                     if status == 304 and old and old.is_file():
                         # LRU access must not change the image decoder's revision.
-                        os.utime(old, ns=(time.time_ns(), old.stat().st_mtime_ns))
+                        os.utime(native_path(old), ns=(time.time_ns(), old.stat().st_mtime_ns))
                         continue
                     if status == 304:
                         continue
@@ -727,7 +744,7 @@ class GallerySync:
                         stale.unlink(missing_ok=True)
                     destination = folder / f"{scene_id}-{revision}.png"
                     destination.write_bytes(data)
-                    os.utime(destination, ns=(time.time_ns(), destination.stat().st_mtime_ns))
+                    os.utime(native_path(destination), ns=(time.time_ns(), destination.stat().st_mtime_ns))
                     self._poster_entries[scene_id] = {"path": str(destination), "etag": tag}
                     self._trim_poster_cache(cache_limit)
             except (OSError, ValueError, PortalHTTPError, PortalProtocolError) as exc:
@@ -1197,9 +1214,8 @@ class GallerySync:
                     exc = (ConnectionError("Gallery download connection closed before completion")
                         if job.get("kind") == "download" else GalleryTransferInvalid(
                             "The portal closed the upload without acknowledging it. Start a new upload."))
-                elif isinstance(exc, PortalHTTPError) and exc.status == 400 and exc.error in (
-                        "Invalid portable LichtFeld project.", "Project checksum failed.",
-                        "Embedded project asset checksum failed."):
+                elif (isinstance(exc, PortalHTTPError) and exc.status == 400 and portal_sentence(exc)
+                      and not is_storage_error(portal_sentence(exc))):
                     exc = GalleryTransferInvalid(friendly_error(exc))
                 with self._lock:
                     job["failureReason"] = safe_text(f"{type(exc).__name__}: {exc}")
@@ -1223,7 +1239,7 @@ class GallerySync:
                     elif isinstance(exc, GalleryTransferCanceled) and job.get("preparation") and not job.get("packaged"):
                         job["message"] = "Preparation paused. Resume to prepare the saved scene and upload it."
                     self.message = job["message"]
-                    if job["status"] == "error" and job.get("ownedExport"):
+                    if job["status"] == "error" and job.get("ownedExport") and not is_storage_error(job["message"]):
                         job.update(requiresPreparation=True, retryable=True)
                 self._save()
                 if job.get("requiresPreparation"):
@@ -1324,12 +1340,14 @@ class GallerySync:
                     raise ValueError("The recovery copy destination already exists. Try again.")
                 disk_preflight([(backup, Path(project_path).stat().st_size),
                                 (project_path, expected_stamp[2] + job['total'])])
-                directory.mkdir(mode=0o700, exist_ok=True)
+                mkdir_private(directory, exist_ok=True)
                 if file_stamp(project_path) != expected_stamp:
                     raise ValueError("The local project changed. Review it before updating.")
                 source_identity.validate()
                 _require_project(project_path, project_id)
                 digest = hashlib.sha256()
+                # The I/O-aware Path supplies the native spelling via __fspath__;
+                # retain the PathLike contract for temporary-file wrappers.
                 with open(project_path, "rb") as source, tempfile.NamedTemporaryFile(dir=directory, delete=False) as output:
                     temporary = Path(output.name)
                     while block := source.read(4 * 1024 * 1024):
@@ -1347,7 +1365,7 @@ class GallerySync:
                 source_identity.validate()
                 _require_project(project_path, project_id)
                 backup_identity.validate()
-                os.replace(temporary, backup)
+                os.replace(native_path(temporary), native_path(backup))
                 temporary = None
                 with self._lock:
                     record.update(state="ready", backupPath=str(backup), sha256=digest.hexdigest())
@@ -1412,7 +1430,7 @@ class GallerySync:
                 if not for_update:
                     preflight.append((self._download_destination(job), Path(job['path']).stat().st_size))
                 disk_preflight(preflight)
-                target.parent.mkdir(mode=0o700, exist_ok=True)
+                mkdir_private(target.parent, exist_ok=True)
                 with self._lock:
                     record["path"] = str(target)
                 self._save()  # Keep partial preparations discoverable after a restart.
@@ -1453,7 +1471,7 @@ class GallerySync:
                     # Keep a private asset independently of disposable import
                     # staging. Saved projects/recovery copies reference it.
                     assets = self.root / "environments"
-                    assets.mkdir(mode=0o700, exist_ok=True)
+                    mkdir_private(assets, exist_ok=True)
                     if assets.is_symlink() or getattr(assets, "is_junction", lambda: False)():
                         raise ValueError("The HDR asset folder was redirected.")
                     asset = assets / (identifier + ".lfsenv")
@@ -1564,7 +1582,7 @@ class GallerySync:
                 if file_stamp(target) != expected_stamp:
                     raise ValueError("The local project changed. Keep the backup and review both files.")
                 digest = hashlib.sha256()
-                with source.open("rb") as incoming, tempfile.NamedTemporaryFile(dir=target_identity.canonical_path.parent, delete=False) as output:
+                with source.open("rb") as incoming, tempfile.NamedTemporaryFile(dir=native_path(target_identity.canonical_path.parent), delete=False) as output:
                     temporary = Path(output.name)
                     while chunk := incoming.read(gallery_validation.CHUNK_BYTES):
                         self._client()
@@ -1580,7 +1598,7 @@ class GallerySync:
                 expected_project = record.get("project") or _project_uuid(source)
                 _require_project(source, expected_project)
                 _require_project(target, expected_project)
-                os.replace(temporary, target_identity.canonical_path)
+                os.replace(native_path(temporary), native_path(target_identity.canonical_path))
                 restored = True
                 record["undoRestored"] = True
                 if record.get("previousLink") and record.get("appliedLink"):
@@ -1712,9 +1730,9 @@ class GallerySync:
         try:
             try:
                 if path.is_dir():
-                    os.rmdir(path.name, dir_fd=directory)
+                    os.rmdir(native_path(path.name), dir_fd=directory)
                 else:
-                    os.unlink(path.name, dir_fd=directory)
+                    os.unlink(native_path(path.name), dir_fd=directory)
             except FileNotFoundError:
                 pass
         finally:
@@ -2079,7 +2097,7 @@ class GallerySync:
                         job.update(completed=done, total=total)
                         self.version += 1
                 client.download(job["sceneId"], job["path"], cancel=self._cancel, on_progress=progress)
-                target.parent.mkdir(mode=0o700, exist_ok=True)
+                mkdir_private(target.parent, exist_ok=True)
                 if target.parent.is_symlink() or target.is_symlink() or temporary.is_symlink():
                     raise ValueError("The HDR background folder was redirected.")
                 from .portable_project import ProjectFile
@@ -2088,7 +2106,7 @@ class GallerySync:
                     output.flush()
                     os.fsync(output.fileno())
                 self._client()
-                os.replace(temporary, target)
+                os.replace(native_path(temporary), native_path(target))
                 job["settingsEnvironment"] = {"state": "ready", "path": str(target)}
             except Exception as exc:
                 job["settingsEnvironment"] = {"state": "failed", "message": friendly_error(exc)}

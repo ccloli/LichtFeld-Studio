@@ -11,20 +11,63 @@
 #include "io/loader.hpp"
 #include "py_error.hpp"
 #include "python/python_runtime.hpp"
+#include "rendering/selection_ops.hpp"
+#include "visualizer/gui/gui_manager.hpp"
 #include "visualizer/gui_capabilities.hpp"
+#include "visualizer/input/input_controller.hpp"
 #include "visualizer/operation/undo_entry.hpp"
 #include "visualizer/operation/undo_history.hpp"
+#include "visualizer/post_work_utils.hpp"
 #include "visualizer/rendering/vulkan_external_tensor.hpp"
 #include "visualizer/scene/scene_manager.hpp"
 #include "visualizer/training/training_manager.hpp"
 #include "visualizer/training/training_state.hpp"
+#include "visualizer/visualizer_impl.hpp"
 #include <algorithm>
+#include <cmath>
+#include <glm/gtc/type_ptr.hpp>
+#include <limits>
 #include <nanobind/ndarray.h>
 #include <stdexcept>
+#include <type_traits>
+#include <utility>
 
 namespace lfs::python {
 
     namespace {
+        template <typename F>
+        auto point_cloud_access(core::Scene* scene, F&& access) -> std::invoke_result_t<F> {
+            using T = std::invoke_result_t<F>;
+            auto* viewer = scene ? get_visualizer() : nullptr;
+            if (!viewer || viewer->isOnViewerThread())
+                return access();
+            const core::TaskContext context{
+                .name = "python.point_cloud.access",
+                .domain = lfs::ErrorDomain::Python,
+                .operation_id = lfs::OperationId::generate(),
+                .site = LFS_SOURCE_SITE_CURRENT(),
+            };
+            const auto cancelled = lfs::make_error(lfs::ErrorInit{
+                .code = lfs::ErrorCode::Cancelled,
+                .domain = lfs::ErrorDomain::Python,
+                .severity = lfs::Severity::Warning,
+                .detail = "Viewer is shutting down",
+                .detection = LFS_SOURCE_SITE_CURRENT(),
+            });
+            nb::gil_scoped_release release;
+            return unwrap(vis::post_guarded_and_wait<T>(
+                *viewer, context,
+                [&access]() -> lfs::Result<T> {
+                    if constexpr (std::is_void_v<T>) {
+                        access();
+                        return {};
+                    } else {
+                        return access();
+                    }
+                },
+                cancelled));
+        }
+
         void register_scene_node_properties() {
             using namespace lfs::core::prop;
             PropertyGroupBuilder<core::SceneNode>("scene_node", "Scene Node")
@@ -78,6 +121,25 @@ namespace lfs::python {
                 .build();
         }
 
+        void register_crop_polygon_properties() {
+            using namespace lfs::core::prop;
+            PropertyGroupBuilder<core::CropPolygonData>("crop_polygon", "Crop Polygon")
+                .float_prop(&core::CropPolygonData::half_depth, "half_depth", "Half Depth", 1.0f,
+                            core::crop_polygon::kMinHalfDepth, 1.0e6f,
+                            "Half the extrusion depth along the local z axis")
+                .bool_prop(&core::CropPolygonData::inverse, "inverse", "Invert", false,
+                           "Invert crop logic")
+                .bool_prop(&core::CropPolygonData::enabled, "enabled", "Enabled", true,
+                           "Enable crop filtering")
+                .color3_prop(&core::CropPolygonData::color, "color", "Color", glm::vec3(1.0f, 1.0f, 0.0f),
+                             "Visualization color")
+                .float_prop(&core::CropPolygonData::line_width, "line_width", "Line Width", 2.0f, 0.1f,
+                            10.0f, "Border line width")
+                .float_prop(&core::CropPolygonData::flash_intensity, "flash_intensity", "Flash", 0.0f,
+                            0.0f, 1.0f, "Flash effect intensity")
+                .build();
+        }
+
     } // namespace
 
     // Helper to convert glm::mat4 to nb::tuple (row-major for NumPy compatibility)
@@ -94,7 +156,7 @@ namespace lfs::python {
     }
 
     // Helper to convert ndarray to glm::mat4
-    static glm::mat4 ndarray_to_mat4(nb::ndarray<float, nb::shape<4, 4>> arr) {
+    static glm::mat4 ndarray_to_mat4(nb::ndarray<float, nb::device::cpu, nb::shape<4, 4>> arr) {
         glm::mat4 m;
         auto view = arr.view();
         for (int i = 0; i < 4; ++i) {
@@ -174,161 +236,307 @@ namespace lfs::python {
     }
 
     // PySceneNode implementation
-    void PySceneNode::set_local_transform(nb::ndarray<float, nb::shape<4, 4>> transform) {
-        apply_node_transform_with_undo(node_->name, ndarray_to_mat4(transform), scene_);
+    void PySceneNode::set_local_transform(
+        nb::ndarray<float, nb::device::cpu, nb::shape<4, 4>> transform) {
+        apply_node_transform_with_undo(node().name, ndarray_to_mat4(transform), scene_);
     }
 
     nb::tuple PySceneNode::local_transform() const {
-        return mat4_to_tuple(node_->local_transform.get());
+        return mat4_to_tuple(node().local_transform.get());
     }
 
     nb::tuple PySceneNode::world_transform() const {
-        return mat4_to_tuple(scene_->getWorldTransform(node_->id));
+        return mat4_to_tuple(scene_->getWorldTransform(node().id));
     }
 
     std::optional<PySplatData> PySceneNode::splat_data() {
-        if (node_->type != core::NodeType::SPLAT || !node_->model) {
+        auto& live = node();
+        if (live.type != core::NodeType::SPLAT || !live.model) {
             return std::nullopt;
         }
-        return PySplatData(node_->model.get());
+        return PySplatData(live.model.get(), scene_);
     }
 
     std::optional<PyPointCloud> PySceneNode::point_cloud() {
-        if (node_->type != core::NodeType::POINTCLOUD || !node_->point_cloud) {
-            return std::nullopt;
-        }
-        return PyPointCloud(node_->point_cloud.get(), false, node_, scene_);
+        return point_cloud_access(scene_, [&]() -> std::optional<PyPointCloud> {
+            auto& live = node();
+            if (live.type != core::NodeType::POINTCLOUD || !live.point_cloud)
+                return std::nullopt;
+            return PyPointCloud(&live, scene_);
+        });
     }
 
     std::optional<PyMeshInfo> PySceneNode::mesh() {
-        if (node_->type != core::NodeType::MESH || !node_->mesh) {
+        auto& live = node();
+        if (live.type != core::NodeType::MESH || !live.mesh) {
             return std::nullopt;
         }
-        return PyMeshInfo(node_->mesh);
+        return PyMeshInfo(live.mesh);
+    }
+
+    core::SceneNode& PyPointCloud::resolve_node() const {
+        // A scene-backed handle follows node UUID identity, never a freed node pointer.
+        if (scene_ && get_application_scene() == scene_) {
+            if (auto* node = scene_->getNodeByUuid(node_uuid_);
+                node && node->type == core::NodeType::POINTCLOUD && node->point_cloud) {
+                return *node;
+            }
+        }
+        throw std::runtime_error("PointCloud source node has been deleted or is no longer available");
+    }
+
+    std::shared_ptr<core::PointCloud> PyPointCloud::retain_data() const {
+        return point_cloud_access(scene_, [&] {
+            return owner_ ? owner_ : resolve_node().point_cloud;
+        });
+    }
+
+    PyTensor PyPointCloud::means() const {
+        return point_cloud_access(scene_, [&] {
+            const auto pc = retain_data();
+            return PyTensor(pc->means, false);
+        });
+    }
+
+    PyTensor PyPointCloud::colors() const {
+        return point_cloud_access(scene_, [&] {
+            const auto pc = retain_data();
+            return PyTensor(pc->colors, false);
+        });
+    }
+
+    std::optional<PyTensor> PyPointCloud::normals() const {
+        return point_cloud_access(scene_, [&]() -> std::optional<PyTensor> {
+            const auto pc = retain_data();
+            if (!pc->normals.is_valid())
+                return std::nullopt;
+            return PyTensor(pc->normals, false);
+        });
+    }
+
+    std::optional<PyTensor> PyPointCloud::sh0() const {
+        return point_cloud_access(scene_, [&]() -> std::optional<PyTensor> {
+            const auto pc = retain_data();
+            if (!pc->sh0.is_valid())
+                return std::nullopt;
+            return PyTensor(pc->sh0, false);
+        });
+    }
+
+    std::optional<PyTensor> PyPointCloud::shN() const {
+        return point_cloud_access(scene_, [&]() -> std::optional<PyTensor> {
+            const auto pc = retain_data();
+            if (!pc->shN.is_valid())
+                return std::nullopt;
+            return PyTensor(pc->shN, false);
+        });
+    }
+
+    std::optional<PyTensor> PyPointCloud::opacity() const {
+        return point_cloud_access(scene_, [&]() -> std::optional<PyTensor> {
+            const auto pc = retain_data();
+            if (!pc->opacity.is_valid())
+                return std::nullopt;
+            return PyTensor(pc->opacity, false);
+        });
+    }
+
+    std::optional<PyTensor> PyPointCloud::scaling() const {
+        return point_cloud_access(scene_, [&]() -> std::optional<PyTensor> {
+            const auto pc = retain_data();
+            if (!pc->scaling.is_valid())
+                return std::nullopt;
+            return PyTensor(pc->scaling, false);
+        });
+    }
+
+    std::optional<PyTensor> PyPointCloud::rotation() const {
+        return point_cloud_access(scene_, [&]() -> std::optional<PyTensor> {
+            const auto pc = retain_data();
+            if (!pc->rotation.is_valid())
+                return std::nullopt;
+            return PyTensor(pc->rotation, false);
+        });
+    }
+
+    int64_t PyPointCloud::size() const {
+        return point_cloud_access(scene_, [&] {
+            const auto pc = retain_data();
+            return pc->size();
+        });
+    }
+
+    bool PyPointCloud::is_gaussian() const {
+        return point_cloud_access(scene_, [&] {
+            const auto pc = retain_data();
+            return pc->is_gaussian();
+        });
+    }
+
+    std::vector<std::string> PyPointCloud::attribute_names() const {
+        return point_cloud_access(scene_, [&] {
+            const auto pc = retain_data();
+            return pc->attribute_names;
+        });
+    }
+
+    void PyPointCloud::normalize_colors() {
+        return point_cloud_access(scene_, [&] {
+            const auto pc = retain_data();
+            return pc->normalize_colors();
+        });
     }
 
     int64_t PyPointCloud::filter(const PyTensor& keep_mask) {
-        const auto& mask = keep_mask.tensor();
-        assert(mask.dtype() == core::DataType::Bool && "Mask must be boolean");
-        assert(mask.shape().rank() == 1 && "Mask must be 1D");
-        assert(static_cast<size_t>(mask.shape()[0]) == static_cast<size_t>(pc_->size()) && "Mask size must match point count");
+        return point_cloud_access(scene_, [&] {
+            const auto pc = retain_data();
+            const auto& mask = keep_mask.tensor();
+            assert(mask.dtype() == core::DataType::Bool && "Mask must be boolean");
+            assert(mask.shape().rank() == 1 && "Mask must be 1D");
+            assert(static_cast<size_t>(mask.shape()[0]) == static_cast<size_t>(pc->size()) && "Mask size must match point count");
 
-        // Ensure mask is on same device as data
-        const auto device = pc_->means.device();
-        const auto mask_dev = mask.device() == device ? mask : mask.to(device);
+            // Ensure mask is on same device as data
+            const auto device = pc->means.device();
+            const auto mask_dev = mask.device() == device ? mask : mask.to(device);
 
-        const int64_t old_size = pc_->size();
-        pc_->means = pc_->means.is_valid() ? pc_->means[mask_dev] : pc_->means;
-        pc_->colors = pc_->colors.is_valid() ? pc_->colors[mask_dev] : pc_->colors;
-        pc_->normals = pc_->normals.is_valid() ? pc_->normals[mask_dev] : pc_->normals;
-        pc_->sh0 = pc_->sh0.is_valid() ? pc_->sh0[mask_dev] : pc_->sh0;
-        pc_->shN = pc_->shN.is_valid() ? pc_->shN[mask_dev] : pc_->shN;
-        pc_->opacity = pc_->opacity.is_valid() ? pc_->opacity[mask_dev] : pc_->opacity;
-        pc_->scaling = pc_->scaling.is_valid() ? pc_->scaling[mask_dev] : pc_->scaling;
-        pc_->rotation = pc_->rotation.is_valid() ? pc_->rotation[mask_dev] : pc_->rotation;
+            const int64_t old_size = pc->size();
+            pc->means = pc->means.is_valid() ? pc->means[mask_dev] : pc->means;
+            pc->colors = pc->colors.is_valid() ? pc->colors[mask_dev] : pc->colors;
+            pc->normals = pc->normals.is_valid() ? pc->normals[mask_dev] : pc->normals;
+            pc->sh0 = pc->sh0.is_valid() ? pc->sh0[mask_dev] : pc->sh0;
+            pc->shN = pc->shN.is_valid() ? pc->shN[mask_dev] : pc->shN;
+            pc->opacity = pc->opacity.is_valid() ? pc->opacity[mask_dev] : pc->opacity;
+            pc->scaling = pc->scaling.is_valid() ? pc->scaling[mask_dev] : pc->scaling;
+            pc->rotation = pc->rotation.is_valid() ? pc->rotation[mask_dev] : pc->rotation;
 
-        if (scene_) {
-            scene_->setPointCloudModified(true);
-            scene_->notifyMutation(core::Scene::MutationType::MODEL_CHANGED);
-        }
-        return old_size - pc_->size();
+            if (scene_) {
+                scene_->setPointCloudModified(true);
+                scene_->notifyMutation(core::Scene::MutationType::MODEL_CHANGED);
+            }
+            return old_size - pc->size();
+        });
     }
 
     int64_t PyPointCloud::filter_indices(const PyTensor& indices) {
-        const auto& idx = indices.tensor();
-        assert(idx.shape().rank() == 1 && "Indices must be 1D");
+        return point_cloud_access(scene_, [&] {
+            const auto pc = retain_data();
+            const auto& idx = indices.tensor();
+            assert(idx.shape().rank() == 1 && "Indices must be 1D");
 
-        const auto device = pc_->means.device();
-        const auto idx_dev = idx.device() == device ? idx : idx.to(device);
+            const auto device = pc->means.device();
+            const auto idx_dev = idx.device() == device ? idx : idx.to(device);
 
-        const int64_t old_size = pc_->size();
-        pc_->means = pc_->means.is_valid() ? pc_->means[idx_dev] : pc_->means;
-        pc_->colors = pc_->colors.is_valid() ? pc_->colors[idx_dev] : pc_->colors;
-        pc_->normals = pc_->normals.is_valid() ? pc_->normals[idx_dev] : pc_->normals;
-        pc_->sh0 = pc_->sh0.is_valid() ? pc_->sh0[idx_dev] : pc_->sh0;
-        pc_->shN = pc_->shN.is_valid() ? pc_->shN[idx_dev] : pc_->shN;
-        pc_->opacity = pc_->opacity.is_valid() ? pc_->opacity[idx_dev] : pc_->opacity;
-        pc_->scaling = pc_->scaling.is_valid() ? pc_->scaling[idx_dev] : pc_->scaling;
-        pc_->rotation = pc_->rotation.is_valid() ? pc_->rotation[idx_dev] : pc_->rotation;
+            const int64_t old_size = pc->size();
+            pc->means = pc->means.is_valid() ? pc->means[idx_dev] : pc->means;
+            pc->colors = pc->colors.is_valid() ? pc->colors[idx_dev] : pc->colors;
+            pc->normals = pc->normals.is_valid() ? pc->normals[idx_dev] : pc->normals;
+            pc->sh0 = pc->sh0.is_valid() ? pc->sh0[idx_dev] : pc->sh0;
+            pc->shN = pc->shN.is_valid() ? pc->shN[idx_dev] : pc->shN;
+            pc->opacity = pc->opacity.is_valid() ? pc->opacity[idx_dev] : pc->opacity;
+            pc->scaling = pc->scaling.is_valid() ? pc->scaling[idx_dev] : pc->scaling;
+            pc->rotation = pc->rotation.is_valid() ? pc->rotation[idx_dev] : pc->rotation;
 
-        if (scene_) {
-            scene_->setPointCloudModified(true);
-            scene_->notifyMutation(core::Scene::MutationType::MODEL_CHANGED);
-        }
-        return old_size - pc_->size();
+            if (scene_) {
+                scene_->setPointCloudModified(true);
+                scene_->notifyMutation(core::Scene::MutationType::MODEL_CHANGED);
+            }
+            return old_size - pc->size();
+        });
     }
 
     void PyPointCloud::set_data(const PyTensor& points, const PyTensor& colors) {
-        const auto& pts = points.tensor();
-        const auto& cols = colors.tensor();
-        assert(pts.shape().rank() == 2 && pts.shape()[1] == 3);
-        assert(cols.shape().rank() == 2 && cols.shape()[1] == 3);
-        assert(pts.shape()[0] == cols.shape()[0]);
+        return point_cloud_access(scene_, [&] {
+            const auto pc = retain_data();
+            auto* const node = scene_ ? &resolve_node() : nullptr;
+            const auto& pts = points.tensor();
+            const auto& cols = colors.tensor();
+            assert(pts.shape().rank() == 2 && pts.shape()[1] == 3);
+            assert(cols.shape().rank() == 2 && cols.shape()[1] == 3);
+            assert(pts.shape()[0] == cols.shape()[0]);
 
-        pc_->means = pts.to(core::Device::CUDA);
-        pc_->colors = cols.to(core::Device::CUDA);
+            pc->means = pts.to(core::Device::CUDA);
+            pc->colors = cols.to(core::Device::CUDA);
 
-        const int64_t n = pc_->size();
-        if (node_) {
-            node_->gaussian_count.store(static_cast<size_t>(n), std::memory_order_release);
-            if (n > 0) {
-                auto centroid = pc_->means.mean(0).cpu();
-                auto acc = centroid.accessor<float, 1>();
-                node_->centroid = glm::vec3(acc(0), acc(1), acc(2));
+            const int64_t n = pc->size();
+            if (node) {
+                node->gaussian_count.store(static_cast<size_t>(n), std::memory_order_release);
+                if (n > 0) {
+                    auto centroid = pc->means.mean(0).cpu();
+                    auto acc = centroid.accessor<float, 1>();
+                    node->centroid = glm::vec3(acc(0), acc(1), acc(2));
+                }
             }
-        }
-        if (scene_) {
-            scene_->setPointCloudModified(true);
-            scene_->notifyMutation(core::Scene::MutationType::MODEL_CHANGED);
-        }
+            if (scene_) {
+                scene_->setPointCloudModified(true);
+                scene_->notifyMutation(core::Scene::MutationType::MODEL_CHANGED);
+            }
+        });
     }
 
     void PyPointCloud::set_colors(const PyTensor& colors) {
-        const auto& cols = colors.tensor();
-        assert(cols.shape().rank() == 2 && cols.shape()[1] == 3);
-        assert(cols.shape()[0] == pc_->size());
-        pc_->colors = cols.to(pc_->means.device());
-        if (scene_) {
-            scene_->setPointCloudModified(true);
-            scene_->notifyMutation(core::Scene::MutationType::MODEL_CHANGED);
-        }
+        return point_cloud_access(scene_, [&] {
+            const auto pc = retain_data();
+            const auto& cols = colors.tensor();
+            assert(cols.shape().rank() == 2 && cols.shape()[1] == 3);
+            assert(cols.shape()[0] == pc->size());
+            pc->colors = cols.to(pc->means.device());
+            if (scene_) {
+                scene_->setPointCloudModified(true);
+                scene_->notifyMutation(core::Scene::MutationType::MODEL_CHANGED);
+            }
+        });
     }
 
     void PyPointCloud::set_means(const PyTensor& points) {
-        const auto& pts = points.tensor();
-        assert(pts.shape().rank() == 2 && pts.shape()[1] == 3);
-        assert(pts.shape()[0] == pc_->size());
-        pc_->means = pts.to(pc_->colors.device());
-        if (node_ && pc_->size() > 0) {
-            auto centroid = pc_->means.mean(0).cpu();
-            auto acc = centroid.accessor<float, 1>();
-            node_->centroid = glm::vec3(acc(0), acc(1), acc(2));
-        }
-        if (scene_) {
-            scene_->setPointCloudModified(true);
-            scene_->notifyMutation(core::Scene::MutationType::MODEL_CHANGED);
-        }
+        return point_cloud_access(scene_, [&] {
+            const auto pc = retain_data();
+            auto* const node = scene_ ? &resolve_node() : nullptr;
+            const auto& pts = points.tensor();
+            assert(pts.shape().rank() == 2 && pts.shape()[1] == 3);
+            assert(pts.shape()[0] == pc->size());
+            pc->means = pts.to(pc->colors.device());
+            if (node && pc->size() > 0) {
+                auto centroid = pc->means.mean(0).cpu();
+                auto acc = centroid.accessor<float, 1>();
+                node->centroid = glm::vec3(acc(0), acc(1), acc(2));
+            }
+            if (scene_) {
+                scene_->setPointCloudModified(true);
+                scene_->notifyMutation(core::Scene::MutationType::MODEL_CHANGED);
+            }
+        });
     }
 
     std::optional<PyCropBox> PySceneNode::cropbox() {
-        if (node_->type != core::NodeType::CROPBOX || !node_->cropbox) {
+        auto& live = node();
+        if (live.type != core::NodeType::CROPBOX || !live.cropbox) {
             return std::nullopt;
         }
-        return PyCropBox(node_->cropbox.get());
+        return PyCropBox(live.cropbox.get());
     }
 
     std::optional<PyEllipsoid> PySceneNode::ellipsoid() {
-        if (node_->type != core::NodeType::ELLIPSOID || !node_->ellipsoid) {
+        auto& live = node();
+        if (live.type != core::NodeType::ELLIPSOID || !live.ellipsoid) {
             return std::nullopt;
         }
-        return PyEllipsoid(node_->ellipsoid.get());
+        return PyEllipsoid(live.ellipsoid.get());
+    }
+
+    std::optional<PyCropPolygon> PySceneNode::crop_polygon() {
+        auto& live = node();
+        if (live.type != core::NodeType::CROP_POLYGON || !live.crop_polygon) {
+            return std::nullopt;
+        }
+        return PyCropPolygon(live.crop_polygon.get());
     }
 
     std::optional<PyKeyframeData> PySceneNode::keyframe_data() {
-        if (node_->type != core::NodeType::KEYFRAME || !node_->keyframe) {
+        auto& live = node();
+        if (live.type != core::NodeType::KEYFRAME || !live.keyframe) {
             return std::nullopt;
         }
-        const auto& kf = *node_->keyframe;
+        const auto& kf = *live.keyframe;
         return PyKeyframeData{
             .keyframe_index = kf.keyframe_index,
             .time = kf.time,
@@ -389,7 +597,8 @@ namespace lfs::python {
                                const PyTensor& opacity,
                                const int sh_degree,
                                const float scene_scale,
-                               const int32_t parent) {
+                               const int32_t parent,
+                               const bool transient) {
         const auto require_float32 = [](const char* field, const PyTensor& tensor) {
             const auto dtype = tensor.tensor().dtype();
             if (dtype != core::DataType::Float32) {
@@ -404,8 +613,10 @@ namespace lfs::python {
         require_float32("rotation", rotation);
         require_float32("opacity", opacity);
 
+        // A transient node is not part of the document: it is never saved, and
+        // adding it leaves nothing to undo.
         std::optional<vis::op::SceneGraphStateSnapshot> history_before;
-        if (auto* const scene_manager = get_scene_manager()) {
+        if (auto* const scene_manager = get_scene_manager(); scene_manager && !transient) {
             history_before = vis::op::SceneGraphPatchEntry::captureState(*scene_manager, {name});
         }
 
@@ -432,9 +643,12 @@ namespace lfs::python {
         if (node_id == core::NULL_NODE) {
             return core::NULL_NODE;
         }
-        const auto* const added = scene_->getNodeById(node_id);
+        auto* const added = scene_->getNodeById(node_id);
         assert(added);
         const std::string added_name = added ? added->name : name;
+        if (added) {
+            added->transient = transient;
+        }
 
         lfs::core::events::state::PLYAdded{
             .name = added_name,
@@ -449,11 +663,13 @@ namespace lfs::python {
 
         if (auto* const scene_manager = get_scene_manager()) {
             ensure_scene_manager_content_type(*scene_manager, vis::SceneManager::ContentType::SplatFiles);
-            vis::op::undoHistory().push(std::make_unique<vis::op::SceneGraphPatchEntry>(
-                *scene_manager,
-                "Add Splat",
-                std::move(*history_before),
-                vis::op::SceneGraphPatchEntry::captureState(*scene_manager, {added_name})));
+            if (history_before) {
+                vis::op::undoHistory().push(std::make_unique<vis::op::SceneGraphPatchEntry>(
+                    *scene_manager,
+                    "Add Splat",
+                    std::move(*history_before),
+                    vis::op::SceneGraphPatchEntry::captureState(*scene_manager, {added_name})));
+            }
         }
 
         return node_id;
@@ -473,6 +689,8 @@ namespace lfs::python {
         assert(pts.shape().rank() == 2 && pts.shape()[1] == 3);
         assert(cols.shape().rank() == 2 && cols.shape()[1] == 3);
         assert(pts.shape()[0] == cols.shape()[0]);
+        if (cols.dtype() != core::DataType::UInt8 && cols.dtype() != core::DataType::Float32)
+            throw nb::value_error("colors must have dtype uint8 or float32");
 
         auto pc = std::make_shared<core::PointCloud>(pts.to(core::Device::CUDA), cols.to(core::Device::CUDA));
         const int32_t node_id = scene_->addPointCloud(name, std::move(pc), parent);
@@ -516,7 +734,8 @@ namespace lfs::python {
 
         if (colors && colors->tensor().is_valid()) {
             const auto& c = colors->tensor();
-            assert(c.shape().rank() == 2 && c.shape()[0] == verts.shape()[0]);
+            if (c.ndim() != 2 || c.size(0) != verts.size(0) || c.size(1) != 4)
+                throw nb::value_error("colors must have shape [N, 4] matching vertices");
             mesh->colors = c.to(core::DataType::Float32).to(core::Device::CPU);
         }
 
@@ -589,10 +808,39 @@ namespace lfs::python {
 
         const auto& R_tensor = R.tensor();
         const auto& T_tensor = T.tensor();
-        assert(R_tensor.ndim() == 2 && R_tensor.size(0) == 3 && R_tensor.size(1) == 3);
-        assert(T_tensor.numel() == 3);
+        if (!R_tensor.is_valid() || R_tensor.dtype() != core::DataType::Float32 || R_tensor.ndim() != 2 ||
+            R_tensor.size(0) != 3 || R_tensor.size(1) != 3)
+            throw nb::value_error("R must be a float32 tensor of shape [3, 3]");
+        if (!T_tensor.is_valid() || T_tensor.dtype() != core::DataType::Float32 || T_tensor.numel() != 3 ||
+            !(T_tensor.ndim() == 1 || (T_tensor.ndim() == 2 && T_tensor.size(1) == 1)))
+            throw nb::value_error("T must be a float32 tensor of shape [3] or [3, 1]");
+        const auto all_finite = [](const core::Tensor& tensor) {
+            const auto cpu = tensor.cpu().contiguous();
+            const auto* values = cpu.ptr<float>();
+            return std::all_of(values, values + cpu.numel(), [](const float value) { return std::isfinite(value); });
+        };
+        if (!all_finite(R_tensor))
+            throw nb::value_error("R must contain finite values");
+        if (!all_finite(T_tensor))
+            throw nb::value_error("T must contain finite values");
+        if (!std::isfinite(focal_x) || focal_x <= 0.0f || !std::isfinite(focal_y) || focal_y <= 0.0f)
+            throw nb::value_error("focal_x and focal_y must be finite and positive");
+        if (width <= 0 || height <= 0)
+            throw nb::value_error("width and height must be positive");
 
         auto T_flat = T_tensor.ndim() == 2 ? T_tensor.reshape({3}) : T_tensor;
+
+        // A camera without a uid is skipped by uid-keyed features such as the frustum overlay: give it the next free one.
+        if (uid < 0) {
+            uid = 0;
+            for (const auto& existing : *scene_->getAllCamerasCached()) {
+                if (!existing)
+                    continue;
+                if (existing->uid() == std::numeric_limits<int>::max())
+                    throw nb::value_error("Cannot auto-assign a camera uid above INT_MAX");
+                uid = std::max(uid, existing->uid() + 1);
+            }
+        }
 
         auto camera = std::make_shared<lfs::core::Camera>(
             R_tensor.clone(),
@@ -743,6 +991,45 @@ namespace lfs::python {
         return result;
     }
 
+    namespace {
+        bool camera_needs_distortion_handling(const core::Camera& cam) {
+            return cam.radial_distortion().numel() != 0 ||
+                   cam.tangential_distortion().numel() != 0 ||
+                   cam.camera_model_type() != core::CameraModelType::PINHOLE;
+        }
+    } // namespace
+
+    bool PyScene::has_active_distorted_cameras() const {
+        if (!scene_) {
+            return false;
+        }
+        for (const auto& cam : scene_->getActiveCameras()) {
+            if (cam && camera_needs_distortion_handling(*cam)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool PyScene::can_undistort_active_cameras() const {
+        if (!scene_) {
+            return false;
+        }
+        bool has_any = false;
+        for (const auto& cam : scene_->getActiveCameras()) {
+            if (!cam) {
+                continue;
+            }
+            if (camera_needs_distortion_handling(*cam)) {
+                has_any = true;
+                if (!cam->has_distortion()) {
+                    return false;
+                }
+            }
+        }
+        return has_any;
+    }
+
     void PyScene::set_camera_training_enabled(const std::string& name, bool enabled) {
         if (auto* const scene_manager = get_scene_manager()) {
             const auto* node = scene_->getNode(name);
@@ -765,7 +1052,9 @@ namespace lfs::python {
         return mat4_to_tuple(scene_->getWorldTransform(node_id));
     }
 
-    void PyScene::set_node_transform(const std::string& name, nb::ndarray<float, nb::shape<4, 4>> transform) {
+    void PyScene::set_node_transform(
+        const std::string& name,
+        nb::ndarray<float, nb::device::cpu, nb::shape<4, 4>> transform) {
         apply_node_transform_with_undo(name, ndarray_to_mat4(transform), scene_);
     }
 
@@ -791,6 +1080,94 @@ namespace lfs::python {
         return PySplatData(model);
     }
 
+    void PyScene::apply_crop_filter(PyTensor& mask) {
+        if (mask.tensor().numel() == 0)
+            return;
+        const auto boxes = scene_->getRenderableCropBoxes();
+        const auto ellipsoids = scene_->getRenderableEllipsoids();
+        const auto polygons = scene_->getRenderableCropPolygons();
+        const auto enabled = [](const auto& volume) {
+            return volume.data && volume.data->enabled && volume.parent_node_index >= 0;
+        };
+        if (!std::any_of(boxes.begin(), boxes.end(), enabled) &&
+            !std::any_of(ellipsoids.begin(), ellipsoids.end(), enabled) &&
+            !std::any_of(polygons.begin(), polygons.end(), enabled)) {
+            return;
+        }
+
+        const auto* model = scene_->getCombinedModel();
+        auto& selection = mask.tensor();
+        if (!model || selection.ndim() != 1 || selection.size(0) != model->size() ||
+            selection.dtype() != core::DataType::Bool || !selection.is_contiguous() ||
+            selection.device() != core::Device::CUDA) {
+            throw std::invalid_argument("Crop filtering requires a contiguous CUDA bool mask matching the combined model");
+        }
+        const auto& means = model->means();
+        const auto transforms = scene_->getVisibleNodeTransforms();
+        std::vector<float> transform_values;
+        transform_values.reserve(transforms.size() * 16);
+        for (const auto& transform : transforms) {
+            for (int row = 0; row < 4; ++row) {
+                for (int col = 0; col < 4; ++col) {
+                    transform_values.push_back(transform[col][row]);
+                }
+            }
+        }
+        const auto model_transforms = core::Tensor::from_vector(
+            transform_values, {transforms.size(), 4, 4}, core::Device::CUDA);
+        // The single-model kernel already defaults to slot zero. Avoid creating
+        // a full-size index tensor for scenes that do not otherwise need one.
+        const auto indices = transforms.size() > 1 ? scene_->getTransformIndices() : nullptr;
+        const auto upload_transform = [](const glm::mat4& world) {
+            const auto inverse = glm::inverse(world);
+            const auto* ptr = glm::value_ptr(inverse);
+            return core::Tensor::from_vector(std::vector<float>(ptr, ptr + 16), {4, 4}, core::Device::CUDA);
+        };
+        const auto upload_vec = [](const glm::vec3& value) {
+            return core::Tensor::from_vector({value.x, value.y, value.z}, {3}, core::Device::CUDA);
+        };
+        for (const auto& box : boxes) {
+            if (!enabled(box))
+                continue;
+            const auto transform = upload_transform(box.world_transform);
+            const auto min = upload_vec(box.data->min);
+            const auto max = upload_vec(box.data->max);
+            rendering::filter_selection_by_crop(selection, means, &transform, &min, &max, box.data->inverse,
+                                                nullptr, nullptr, false, &model_transforms, indices.get(),
+                                                box.parent_node_index);
+        }
+        for (const auto& ellipsoid : ellipsoids) {
+            if (!enabled(ellipsoid))
+                continue;
+            const auto transform = upload_transform(ellipsoid.world_transform);
+            // Match the renderer's treatment of degenerate ellipsoid axes.
+            const auto radii = upload_vec(glm::max(glm::abs(ellipsoid.data->radii), glm::vec3(1e-8f)));
+            rendering::filter_selection_by_crop(selection, means, nullptr, nullptr, nullptr, false,
+                                                &transform, &radii, ellipsoid.data->inverse, &model_transforms,
+                                                indices.get(), ellipsoid.parent_node_index);
+        }
+        for (const auto& polygon : polygons) {
+            if (!enabled(polygon))
+                continue;
+            const auto transform = upload_transform(polygon.world_transform);
+            std::vector<float> outline;
+            outline.reserve(polygon.data->vertices.size() * 2);
+            for (const glm::vec2& vertex : polygon.data->vertices)
+                outline.insert(outline.end(), {vertex.x, vertex.y});
+            const auto vertices =
+                core::Tensor::from_vector(outline, {polygon.data->vertices.size(), size_t{2}}, core::Device::CUDA);
+            const rendering::SelectionCropPolygon filter{
+                .transform = &transform,
+                .vertices = &vertices,
+                .half_depth = polygon.data->half_depth,
+                .inverse = polygon.data->inverse,
+            };
+            rendering::filter_selection_by_crop(selection, means, nullptr, nullptr, nullptr, false,
+                                                nullptr, nullptr, false, &model_transforms, indices.get(),
+                                                polygon.parent_node_index, &filter);
+        }
+    }
+
     std::optional<PySplatData> PyScene::training_model() {
         auto* model = scene_->getTrainingModel();
         if (!model)
@@ -799,6 +1176,18 @@ namespace lfs::python {
     }
 
     void PyScene::set_training_model_node(const std::string& name) {
+        // Binding a transient preview leaves nothing to undo, like adding it.
+        // A preview is for display only: it must not take the place of a
+        // saved training model, which training continues from and saves.
+        if (const auto* const target = scene_->getNode(name); target && target->transient) {
+            if (const auto* const bound = scene_->getNodeByUuid(scene_->getTrainingModelNodeUuid());
+                bound && !bound->transient) {
+                throw std::runtime_error("set_training_model_node: transient node '" + name +
+                                         "' cannot replace the training model '" + bound->name + "'");
+            }
+            scene_->setTrainingModelNode(name);
+            return;
+        }
         if (auto* const scene_manager = get_scene_manager()) {
             const auto options = scene_graph_history_options(false, true);
             auto before = vis::op::SceneGraphPatchEntry::captureState(*scene_manager, {}, options);
@@ -811,6 +1200,30 @@ namespace lfs::python {
             return;
         }
         scene_->setTrainingModelNode(name);
+    }
+
+    bool PyScene::set_node_transient(const std::string& name, const bool transient) {
+        auto* const node = scene_->getMutableNode(name);
+        if (!node) {
+            return false;
+        }
+        if (node->transient == transient) {
+            return true;
+        }
+        // A bound transient model is only a preview and a bound saved one is
+        // what training continues from, so neither may cross over while bound.
+        const auto* const bound = scene_->getNodeByUuid(scene_->getTrainingModelNodeUuid());
+        for (const auto* holder = bound; holder; holder = scene_->getNodeById(holder->parent_id)) {
+            if (holder == node && (holder == bound || (transient && !bound->transient))) {
+                throw std::runtime_error("set_node_transient: '" + name + "' holds the training model '" +
+                                         bound->name + "'");
+            }
+        }
+        node->transient = transient;
+        // The node leaves or joins the document, so the project has changes to save.
+        scene_->notifyMutation(transient ? core::Scene::MutationType::NODE_REMOVED
+                                         : core::Scene::MutationType::NODE_ADDED);
+        return true;
     }
 
     std::optional<std::tuple<std::tuple<float, float, float>, std::tuple<float, float, float>>>
@@ -1058,6 +1471,70 @@ namespace lfs::python {
     }
 
     void register_scene(nb::module_& m) {
+        const auto collision_access = [](auto&& action) {
+            auto* manager = get_scene_manager();
+            return point_cloud_access(manager ? &manager->getScene() : nullptr, [&] {
+                auto* viewer = dynamic_cast<vis::VisualizerImpl*>(get_visualizer());
+                if (!viewer || !viewer->getGuiManager())
+                    throw core::collisionError("collision.gui_required", "Collision authoring requires the GUI");
+                return action(viewer->getGuiManager()->asyncTasks(), manager);
+            });
+        };
+        m.def("generate_collision", [collision_access](float size, float opacity, bool automatic, bool cleanup, float max_area) {
+            const core::CollisionSettings settings{.voxel_size = size, .opacity = opacity, .max_gaussian_area = max_area,
+                                                    .auto_resolution = automatic, .cleanup = cleanup};
+            collision_access([&](auto& tasks, auto*) { tasks.startCollision(settings); }); }, nb::arg("voxel_size") = .05f, nb::arg("opacity") = .1f, nb::arg("auto_resolution") = false, nb::arg("cleanup") = true, nb::arg("max_gaussian_area") = 0.f);
+        m.def("export_collision", [collision_access](const std::string& uuid, const std::string& path) {
+            const auto parsed = core::Uuid::from_string(uuid);
+            if (!parsed)
+                throw core::collisionError("collision.select_export", "Invalid collision target UUID", ErrorCode::InvalidArgument);
+            collision_access([&](auto& tasks, auto*) {
+                tasks.startCollisionExport(*parsed, core::utf8_to_path(path));
+            }); }, nb::arg("uuid"), nb::arg("path"));
+        m.def("cancel_collision", [collision_access] {
+            collision_access([](auto& tasks, auto*) { tasks.cancelCollision(); });
+        });
+        m.def("get_collision_state", [collision_access] {
+            nb::dict result;
+            collision_access([&](auto& tasks, auto* manager) {
+                // Posted access releases the caller's GIL while the viewer fills this snapshot.
+                nb::gil_scoped_acquire acquire;
+                const auto job = tasks.collisionJob();
+                const auto settings = tasks.collisionGenerationSettings();
+                const auto* input = vis::InputController::instance();
+                const auto walk = input ? input->walk_settings : core::WalkSettings{};
+                const auto* target = manager ? manager->getScene().getNode(manager->getSelectedNodeName()) : nullptr;
+                const bool collider = target && target->type == core::NodeType::COLLISION && target->collision;
+                const bool source = target && target->type == core::NodeType::SPLAT && manager->getSelectedNodeIds().size() == 1 && (target->model || manager->getScene().isConsolidated());
+                result["active"] = job && job->running();
+                result["progress"] = job ? job->progress : 0.f;
+                result["stage"] = job ? job->stage : "";
+                result["error"] = job ? job->error : "";
+                result["walk_error"] = input ? input->walk_error : "";
+                result["has_collision"] = manager && std::ranges::any_of(manager->getScene().getNodes(), [](const auto* node) {
+                                              return node && bool(node->collision);
+                                          });
+                result["walking"] = input && input->cameraNavigationMode() == vis::InputController::CameraNavigationMode::Walk;
+                result["walk_settings"] = nb::make_tuple(walk.height, walk.radius, walk.step, walk.speed);
+                result["target_uuid"] = collider ? target->uuid.to_string() : "";
+                result["target_name"] = collider ? target->name : "";
+                result["source_name"] = source ? target->name : "";
+                result["resolved_voxel_size"] = tasks.collisionResolvedSize();
+                result["generation_settings"] = nb::make_tuple(settings.voxel_size, settings.opacity,
+                                                               settings.auto_resolution, settings.cleanup, settings.max_gaussian_area);
+            });
+            return result;
+        });
+        m.def("set_walk_settings", [](float height, float radius, float step, float speed) {
+            const core::WalkSettings settings{height, radius, step, speed};
+            settings.validate();
+            auto* manager = get_scene_manager();
+            point_cloud_access(manager ? &manager->getScene() : nullptr, [&] {
+                auto* input = vis::InputController::instance();
+                if (!input)
+                    throw std::runtime_error("No input controller");
+                input->setWalkSettings(settings);
+            }); }, nb::arg("height"), nb::arg("radius"), nb::arg("step"), nb::arg("speed"));
         nb::class_<PySceneSplatSnapshot>(m, "SceneSplatSnapshot")
             .def_prop_ro("transform", [](const PySceneSplatSnapshot& value) {
                 return mat4_to_tuple(value.snapshot().world_transform);
@@ -1075,6 +1552,7 @@ namespace lfs::python {
         register_scene_node_properties();
         register_cropbox_properties();
         register_ellipsoid_properties();
+        register_crop_polygon_properties();
 
         // NodeType enum
         nb::enum_<core::NodeType>(m, "NodeType")
@@ -1090,8 +1568,10 @@ namespace lfs::python {
             .value("IMAGE_GROUP", core::NodeType::IMAGE_GROUP)
             .value("IMAGE", core::NodeType::IMAGE)
             .value("MESH", core::NodeType::MESH)
+            .value("COLLISION", core::NodeType::COLLISION)
             .value("KEYFRAME_GROUP", core::NodeType::KEYFRAME_GROUP)
-            .value("KEYFRAME", core::NodeType::KEYFRAME);
+            .value("KEYFRAME", core::NodeType::KEYFRAME)
+            .value("CROP_POLYGON", core::NodeType::CROP_POLYGON);
 
         nb::class_<PyMeshInfo>(m, "MeshInfo")
             .def_prop_ro("vertex_count", &PyMeshInfo::vertex_count)
@@ -1161,8 +1641,36 @@ namespace lfs::python {
                 })
             .def("__dir__", &PyEllipsoid::python_dir, "List available attributes");
 
+        nb::class_<PyCropPolygon>(m, "CropPolygon")
+            .def_prop_ro("__property_group__", &PyCropPolygon::property_group, "Property group name for introspection")
+            .def_prop_ro("vertices", &PyCropPolygon::vertices, "Outline vertices (x, y) in the node's local XY plane")
+            .def("get", &PyCropPolygon::get, nb::arg("name"), "Get property value by name")
+            .def("set", &PyCropPolygon::set, nb::arg("name"), nb::arg("value"), "Set property value by name")
+            .def("prop_info", &PyCropPolygon::prop_info, nb::arg("name"), "Get metadata for a property")
+            .def(
+                "__getattr__",
+                [](PyCropPolygon& self, const std::string& name) -> nb::object {
+                    if (!self.has_prop(name)) {
+                        throw nb::attribute_error(("CropPolygon has no attribute '" + name + "'").c_str());
+                    }
+                    return self.prop_getattr(name);
+                })
+            .def(
+                "__setattr__",
+                [](PyCropPolygon& self, const std::string& name, nb::object value) {
+                    if (!self.has_prop(name)) {
+                        throw nb::attribute_error(("Cannot set attribute '" + name + "'").c_str());
+                    }
+                    self.prop_setattr(name, value);
+                })
+            .def("__dir__", &PyCropPolygon::python_dir, "List available attributes");
+
         // PointCloud class
-        nb::class_<PyPointCloud>(m, "PointCloud")
+        nb::class_<PyPointCloud>(m, "PointCloud",
+                                 "Point-cloud data owned by a load result or referenced by scene node identity.\n\n"
+                                 "Loaded data remains usable after its LoadResult is released. Scene-backed\n"
+                                 "handles raise RuntimeError while their source node is absent; undo restoring\n"
+                                 "the same node makes the handle usable again.")
             .def_prop_ro("means", &PyPointCloud::means, "Position tensor [N, 3]")
             .def_prop_ro("colors", &PyPointCloud::colors, "Color tensor [N, 3]")
             .def_prop_ro("normals", &PyPointCloud::normals, "Normal tensor [N, 3]")
@@ -1211,6 +1719,7 @@ namespace lfs::python {
             .def("mesh", &PySceneNode::mesh, "Get MeshInfo for MESH nodes (None otherwise)")
             .def("cropbox", &PySceneNode::cropbox, "Get CropBox for CROPBOX nodes (None otherwise)")
             .def("ellipsoid", &PySceneNode::ellipsoid, "Get Ellipsoid for ELLIPSOID nodes (None otherwise)")
+            .def("crop_polygon", &PySceneNode::crop_polygon, "Get CropPolygon for CROP_POLYGON nodes (None otherwise)")
             .def("keyframe_data", &PySceneNode::keyframe_data, "Get KeyframeData for KEYFRAME nodes (None otherwise)")
             // Camera specific (read-only)
             .def_prop_ro("camera_uid", &PySceneNode::camera_uid, "Camera unique identifier")
@@ -1220,6 +1729,7 @@ namespace lfs::python {
             .def_prop_ro("has_camera", &PySceneNode::has_camera, "Whether this node has camera data")
             .def_prop_ro("has_mask", &PySceneNode::has_mask, "Whether this camera node has a mask file")
             .def_prop_ro("has_depth", &PySceneNode::has_depth, "Whether this camera node has a depth map file")
+            .def_prop_ro("has_distortion", &PySceneNode::has_distortion, "Whether this camera node has lens distortion or non-pinhole camera model")
             .def("load_mask", &PySceneNode::load_mask,
                  nb::arg("resize_factor") = 1, nb::arg("max_width") = 0,
                  nb::arg("invert") = false, nb::arg("threshold") = 0.5f,
@@ -1287,6 +1797,7 @@ namespace lfs::python {
                  nb::arg("sh_degree") = 0,
                  nb::arg("scene_scale") = 1.0f,
                  nb::arg("parent") = core::NULL_NODE,
+                 nb::arg("transient") = false,
                  R"doc(Add a new splat node from tensor data.
 
 Args:
@@ -1300,6 +1811,7 @@ Args:
     sh_degree: SH degree (0 for RGB only)
     scene_scale: Scene scale factor
     parent: Parent node ID (-1 for root)
+    transient: Show the node but leave it out of project saves and undo history
 
 Returns:
     Node ID of created splat
@@ -1309,7 +1821,7 @@ Returns:
                  nb::arg("points"),
                  nb::arg("colors"),
                  nb::arg("parent") = core::NULL_NODE,
-                 "Add a point cloud node from tensor data [N,3] positions and colors")
+                 "Add a point cloud node from [N,3] positions and uint8 or float32 colors; other color dtypes raise ValueError")
             .def("add_mesh", &PyScene::add_mesh,
                  nb::arg("name"),
                  nb::arg("vertices"),
@@ -1317,7 +1829,7 @@ Returns:
                  nb::arg("colors") = nb::none(),
                  nb::arg("normals") = nb::none(),
                  nb::arg("parent") = core::NULL_NODE,
-                 "Add a mesh node from [V,3] vertices, [F,3] face indices, optional [V,4] colors and [V,3] normals")
+                 "Add a mesh node from [V,3] vertices, [F,3] face indices, optional [V,4] colors and [V,3] normals; invalid color shapes raise ValueError")
             .def("add_camera_group", &PyScene::add_camera_group,
                  nb::arg("name"),
                  nb::arg("parent"),
@@ -1396,13 +1908,15 @@ Returns:
             .def("is_node_effectively_visible", &PyScene::is_node_effectively_visible, nb::arg("id"), "Check if a node is visible considering parent visibility")
             // Transforms
             .def("get_world_transform", &PyScene::get_world_transform, nb::arg("node_id"), "Get world-space transform as 4x4 row-major tuple")
-            .def("set_node_transform", &PyScene::set_node_transform, nb::arg("name"), nb::arg("transform"), "Set node local transform from a [4, 4] ndarray")
             .def("set_node_transform", &PyScene::set_node_transform_tensor, nb::arg("name"), nb::arg("transform"), "Set node local transform from a [4, 4] Tensor")
+            .def("set_node_transform", &PyScene::set_node_transform, nb::arg("name"), nb::arg("transform"), "Set node local transform from a [4, 4] ndarray")
             // Combined/training model
             .def("combined_model", &PyScene::combined_model, "Get the merged SplatData for all visible splats (None if empty)")
+            .def("apply_crop_filter", &PyScene::apply_crop_filter, nb::arg("mask"), "Filter a combined-model CUDA bool mask in place by enabled render crop boxes, ellipsoids and polygons. Scene selection is unchanged.")
             .def("training_model", &PyScene::training_model, "Get the SplatData used for training (None if unavailable)")
-            .def("set_training_model_node", &PyScene::set_training_model_node, nb::arg("name"), "Set which node provides the training model")
+            .def("set_training_model_node", &PyScene::set_training_model_node, nb::arg("name"), "Set which node provides the training model. A transient node may not replace a saved training model (RuntimeError)")
             .def_prop_ro("training_model_node_name", &PyScene::training_model_node_name, "Name of the node providing the training model")
+            .def("set_node_transient", &PyScene::set_node_transient, nb::arg("name"), nb::arg("transient"), "Show a node in the viewer but leave it and everything under it out of project saves; False if there is no such node. Raises RuntimeError if the node holds the training model")
             // Bounds (by id)
             .def("get_node_bounds", &PyScene::get_node_bounds, nb::arg("id"), "Get axis-aligned bounding box as ((min_x, min_y, min_z), (max_x, max_y, max_z))")
             .def("get_node_bounds_center", &PyScene::get_node_bounds_center, nb::arg("id"), "Get center of the node bounding box as (x, y, z)")
@@ -1447,6 +1961,8 @@ Returns:
             .def("set_camera_training_enabled", &PyScene::set_camera_training_enabled, nb::arg("name"), nb::arg("enabled"), "Enable or disable a camera for training by name")
             .def_prop_ro("active_camera_count", &PyScene::active_camera_count, "Number of cameras enabled for training")
             .def("get_active_cameras", &PyScene::get_active_cameras, "Get camera nodes enabled for training")
+            .def("has_active_distorted_cameras", &PyScene::has_active_distorted_cameras, "Check if any active camera enabled for training has distortion or non-pinhole model")
+            .def("can_undistort_active_cameras", &PyScene::can_undistort_active_cameras, "Check if all active cameras needing distortion handling can be undistorted")
             // Training data
             .def("has_training_data", &PyScene::has_training_data, "Check if training dataset is loaded")
             .def_prop_rw("is_point_cloud_modified", &PyScene::is_point_cloud_modified, &PyScene::set_point_cloud_modified, "Whether the point cloud has been modified since loading")

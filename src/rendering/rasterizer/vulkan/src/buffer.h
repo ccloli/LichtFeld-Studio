@@ -192,7 +192,10 @@ struct VulkanGSPipelineBuffers {
     Buffer<float> depths;             // (N, 1)
     Buffer<float> inv_cov_vs_opacity; // (N, 4)
     Buffer<float> rgb;                // (N, 3)
-    // 3-bit payload (DIM|NONSELECTABLE|FLASH), one byte per splat. Byte-address
+    // Custom effect 3DGUT draws only: effected world center and opacity plus
+    // three inverse scale/rotation rows per render slot, (N, 4, 4).
+    Buffer<float> custom_geometry;
+    // 2-bit payload (DIM|NONSELECTABLE), one byte per splat. Byte-address
     // access rounds the descriptor up to a whole 32-bit word. Projection clears
     // the words before atomically ORing each byte; raster-only refreshes reuse
     // them. With writes disabled, bit 6 is clear and a one-word dummy is bound.
@@ -235,9 +238,10 @@ struct VulkanGSPipelineBuffers {
 
     // HiGS macro raster: half4 partials per (pool batch, render tile, pixel),
     // per-batch active-tile mask, and per-wave raster+compose indirect args.
-    Buffer<uint16_t> macro_partials;    // (pool_batches, 32, 256, 4) halfs
-    Buffer<uint32_t> macro_active_mask; // (total batches,)
-    Buffer<uint32_t> macro_wave_args;   // MacroWaveDispatch: raster + compose command per wave
+    Buffer<uint16_t> macro_partials;          // (pool_batches, 32, 256, 4) halfs
+    Buffer<uint32_t> exact_depth_sample_mask; // one bit per 4x4 output region
+    Buffer<uint32_t> macro_active_mask;       // batch activity header + optional pooled exact-depth ballots
+    Buffer<uint32_t> macro_wave_args;         // MacroWaveDispatch: raster + compose command per wave
 
     // tiles
     Buffer<int32_t> index_buffer_offset;       // N
@@ -264,8 +268,14 @@ struct VulkanGSPipelineBuffers {
     Buffer<int32_t> tile_batch_n_contributors; // (num_batches, TILE_SIZE)
     Buffer<float> pixel_state;                 // (H, W, 4)
     Buffer<float> pixel_depth;                 // (H, W, 1), median view-space depth
-    Buffer<float> pixel_depth_weight;          // (H, W, 1), expected-depth denominator
-    Buffer<int32_t> n_contributors;            // (H, W, 1)
+    Buffer<uint32_t> outline_tiles;            // Tile selected-rank bounds followed by inverse visible-slot depth ranks
+    Buffer<uint32_t> outline_seeds;
+    Buffer<uint32_t> outline_nearest;
+    Buffer<uint32_t> outline_background;     // Optional exterior background disjoint-set forest
+    Buffer<uint32_t> pixel_outline_ids;      // Optional [H,W]: node+2, bit 30 below coverage threshold, bit 31 occluded
+    Buffer<float> pixel_outline_scene_depth; // Optional [H,W,4]: scene/selected depths and accumulated coverage
+    Buffer<float> pixel_depth_weight;        // (H, W, 1), expected-depth denominator
+    Buffer<int32_t> n_contributors;          // (H, W, 1)
 
     // intermediate buffers
     Buffer<int32_t> _cumsum_blockSums;

@@ -1,12 +1,15 @@
 # SPDX-FileCopyrightText: 2026 LichtFeld Studio Authors
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Read only the private, numeric staging files produced by native scene capture."""
+from _lfs_path_io import TemporaryDirectory
+from _lfs_path_io import native_path
 import json
-from pathlib import Path
+from _lfs_path_io import Path
 import re
 import stat
 import uuid
 
+from .private_directory import mkdir_private
 from . import gallery_validation
 from .gallery_logging import failure as log_failure
 
@@ -96,7 +99,7 @@ def unpack_project(root, source, destination, *, progress=None):
     """Prepare embedded splats for merging; keep the .licht source authoritative."""
     from .portable_project import ProjectFile
     destination = staging_path(root, destination)
-    destination.mkdir(mode=0o700)
+    mkdir_private(destination)
     outputs = []
     try:
         with Path(source).open('rb') as stream:
@@ -188,7 +191,7 @@ def publication_preview(png):
     import lichtfeld as lf
     # Reuse the native 512-pixel project thumbnail encoder, including on Windows.
     # Keep the selected preview pinned; never read a later project generation.
-    with tempfile.TemporaryDirectory(prefix="lfs-gallery-preview-") as directory:
+    with TemporaryDirectory(prefix="lfs-gallery-preview-") as directory:
         source = Path(directory) / "preview.png"
         source.write_bytes(png)
         bounded = lf.io.encode_preview_from_image_file(source)
@@ -289,6 +292,6 @@ def attach_preview(path, png, *, cancel=None):
                 raise ValueError("The prepared project changed.")
         with temporary.open("rb") as result:
             ProjectFile(result)
-        os.replace(temporary, path)
+        os.replace(native_path(temporary), native_path(path))
     finally:
         temporary.unlink(missing_ok=True)

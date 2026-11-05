@@ -6,6 +6,7 @@
 
 #include "core/camera.hpp"
 #include "core/cuda/memory_arena.hpp"
+#include "core/error.hpp"
 #include "core/splat_data.hpp"
 #include "gsplat/Common.h"
 #include "gsplat/TileBatch.h"
@@ -21,16 +22,18 @@ namespace lfs::training {
 
     // Render modes for gsplat rasterizer
     enum class GsplatRenderMode {
-        RGB = 0,   // RGB only
-        D = 1,     // Depth only
-        ED = 2,    // Expected depth
-        RGB_D = 3, // RGB + depth
-        RGB_ED = 4 // RGB + expected depth
+        RGB = 0,    // RGB only
+        D = 1,      // Depth only
+        ED = 2,     // Expected depth
+        RGB_D = 3,  // RGB + depth
+        RGB_ED = 4, // RGB + expected depth
+        RGB_D_N = 5 // RGB + accumulated depth + camera-space normals
     };
 
     // Forward pass context - holds raw pointers needed for backward (arena allocated)
     struct GsplatRasterizeContext {
         // Raw pointers to arena-allocated intermediate buffers
+        lfs::core::Tensor camera_rays;       // [H,W,3], depth-to-camera-position multiplier
         float* render_colors_ptr = nullptr;  // [C, channels, H, W]
         float* render_alphas_ptr = nullptr;  // [C, 1, H, W]
         int32_t* radii_ptr = nullptr;        // [C, N, 2]
@@ -53,13 +56,16 @@ namespace lfs::training {
         int32_t n_sort = 0;
 
         // Saved input tensors (references, not copies)
-        lfs::core::Tensor means;     // [N, 3]
-        lfs::core::Tensor quats;     // [N, 4]
-        lfs::core::Tensor scales;    // [N, 3]
-        lfs::core::Tensor opacities; // [N]
-        lfs::core::Tensor sh0;       // [N, 1, 3]
-        lfs::core::Tensor shN;       // swizzled 1D SH-rest buffer
-        lfs::core::Tensor bg_color;  // [3] or [C, 3]
+        lfs::core::Tensor means;               // [N, 3]
+        lfs::core::Tensor quats;               // [N, 4]
+        lfs::core::Tensor scales;              // [N, 3]
+        lfs::core::Tensor opacities;           // [N]
+        lfs::core::Tensor sh0;                 // [N, 1, 3]
+        lfs::core::Tensor shN;                 // Resident FP32 or q16 SH-rest buffer
+        lfs::core::Tensor shN_value_bounds;    // [ceil(N/256)] q16 bounds; empty for FP32
+        const float* shN_ptr = nullptr;        // what the SH kernels read (kept alive by shN)
+        const float* shN_bounds_ptr = nullptr; // null for FP32 (kept alive by shN_value_bounds)
+        lfs::core::Tensor bg_color;            // [3] or [C, 3]
 
         // Camera pointers (kept alive by K_tensor)
         const float* viewmat_ptr = nullptr; // [C, 4, 4]
@@ -111,6 +117,10 @@ namespace lfs::training {
         lfs::core::Tensor bg_image;
     };
 
+    // Accumulates FP64 removal energy into aligned CUDA UInt8 [N, sizeof(double)] storage.
+    // The caller zeros these bytes once; each call adds a view without clearing them.
+    lfs::Status gsplat_accumulate_pop_scores(const GsplatRasterizeContext& ctx, lfs::core::Tensor& scores);
+
     // Forward pass with optional tiling (tile_width/height=0 = full image)
     // bg_image is optional - if provided, uses per-pixel background blending instead of solid color
     std::expected<std::pair<RenderOutput, GsplatRasterizeContext>, std::string> gsplat_rasterize_forward(
@@ -136,7 +146,10 @@ namespace lfs::training {
         AdamOptimizer& optimizer,
         const lfs::core::Tensor& pixel_error_map = {},
         const lfs::core::Tensor& edge_weight_map = {},
-        lfs::core::Tensor edge_score_out = {});
+        lfs::core::Tensor edge_score_out = {},
+        const lfs::core::Tensor& grad_depth = {},
+        const lfs::core::Tensor& grad_normal = {},
+        float flatten_weight = 0.f);
 
     // Release per-thread renderer caches before the owning CUDA stream is torn down.
     bool release_gsplat_rasterizer_thread_local_caches() noexcept;

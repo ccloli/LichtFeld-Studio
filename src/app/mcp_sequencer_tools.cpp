@@ -5,6 +5,7 @@
 
 #include "app/include/app/mcp_app_utils.hpp"
 #include "app/include/app/view_info_json.hpp"
+#include "core/error_envelope.hpp"
 #include "mcp/mcp_tools.hpp"
 #include "python/python_runtime.hpp"
 #include "rendering/coordinate_conventions.hpp"
@@ -63,6 +64,17 @@ namespace lfs::app {
             const glm::vec3 direction = target - eye;
             if (!std::isfinite(glm::length(direction)) || glm::length(direction) <= 1.0e-6f)
                 return "Camera eye and target must not coincide";
+            return std::nullopt;
+        }
+
+        std::optional<std::string> explicit_up_error(const glm::vec3& eye, const glm::vec3& target,
+                                                     const glm::vec3& up) {
+            const float up_length = glm::length(up);
+            if (!std::isfinite(up_length) || up_length <= 1.0e-6f)
+                return "Camera up vector must have finite length greater than 1e-6";
+            const glm::vec3 forward = glm::normalize(target - eye);
+            if (glm::length(glm::cross(forward, up / up_length)) <= 1.0e-6f)
+                return "Camera up vector must not be parallel to the view direction";
             return std::nullopt;
         }
 
@@ -142,7 +154,7 @@ namespace lfs::app {
             const auto& timeline = controller.timeline();
             const bool has_ply_sequence = controller.hasPlySequence();
             const bool has_any_timeline_state =
-                timeline.realKeyframeCount() > 0 || timeline.hasAnimationClip() || has_ply_sequence;
+                timeline.realKeyframeCount() > 0 || timeline.hasAnimationClip() || timeline.revealClip().has_value() || has_ply_sequence;
             json keyframe_list = json::array();
             int64_t visible_index = 0;
             for (const auto& keyframe : timeline.keyframes()) {
@@ -165,6 +177,11 @@ namespace lfs::app {
                 {"ply_sequence_frame_count", has_ply_sequence ? controller.plySequence()->frames.size() : 0},
                 {"show_camera_path", ui_state ? ui_state->show_camera_path : true},
                 {"follow_playback", ui_state ? ui_state->follow_playback : false},
+                {"camera_width", ui_state ? ui_state->camera_width : 16},
+                {"camera_height", ui_state ? ui_state->camera_height : 9},
+                {"video_framerate_numerator", ui_state ? ui_state->framerate : 30},
+                {"video_framerate_denominator", ui_state ? ui_state->framerate_denominator : 1},
+                {"export_fit", ui_state ? ui_state->export_fit : 0},
                 {"keyframe_count", keyframe_list.size()},
                 {"keyframes", keyframe_list},
             };
@@ -224,6 +241,68 @@ namespace lfs::app {
             });
 
         registry.register_tool(
+            McpTool{.name = "sequencer.reveal_get",
+                    .description = "Read the live sequencer reveal clip",
+                    .input_schema = {.type = "object", .properties = json::object(), .required = {}},
+                    .metadata =
+                        {.category = "sequencer", .kind = "query", .runtime = "gui", .thread_affinity = "gui_thread"}},
+            [viewer, backend](const json&) -> json {
+                return post_and_wait(viewer, [backend]() -> json {
+                    auto controller = ensure_ready_controller(backend);
+                    if (!controller)
+                        return json{{"error", controller.error()}};
+                    const auto& clip = (*controller)->timeline().revealClip();
+                    return json{{"success", true}, {"reveal", clip ? clip->toJson() : json(nullptr)}};
+                });
+            });
+
+        registry.register_tool(McpTool{.name = "sequencer.reveal_set",
+                                       .description = "Set the live sequencer reveal clip",
+                                       .input_schema = {.type = "object",
+                                                        .properties = json{{"start", {{"type", "number"}}},
+                                                                           {"end", {{"type", "number"}}},
+                                                                           {"softness", {{"type", "number"}}},
+                                                                           {"effect", {{"type", "integer"}}},
+                                                                           {"shader_id", {{"type", "string"}}}},
+                                                        .required = {"start", "end", "softness", "effect"}},
+                                       .metadata = {.category = "sequencer",
+                                                    .kind = "mutation",
+                                                    .runtime = "gui",
+                                                    .thread_affinity = "gui_thread"}},
+                               [viewer, backend](const json& args) -> json {
+                                   const auto clip = sequencer::RevealClip::fromJson(args);
+                                   if (!clip)
+                                       return json{{"error", core::to_wire_envelope(clip.error())}};
+                                   return post_and_wait(viewer, [backend, clip = *clip]() -> json {
+                                       auto controller = ensure_ready_controller(backend);
+                                       if (!controller)
+                                           return json{{"error", controller.error()}};
+                                       if (auto changed = (*controller)->setRevealClip(clip); !changed)
+                                           return json{{"error", core::to_wire_envelope(changed.error())}};
+                                       return json{{"success", true}};
+                                   });
+                               });
+
+        registry.register_tool(
+            McpTool{.name = "sequencer.reveal_remove",
+                    .description = "Remove the live sequencer reveal clip",
+                    .input_schema = {.type = "object", .properties = json::object(), .required = {}},
+                    .metadata = {.category = "sequencer",
+                                 .kind = "mutation",
+                                 .runtime = "gui",
+                                 .thread_affinity = "gui_thread"}},
+            [viewer, backend](const json&) -> json {
+                return post_and_wait(viewer, [backend]() -> json {
+                    auto controller = ensure_ready_controller(backend);
+                    if (!controller)
+                        return json{{"error", controller.error()}};
+                    if (auto removed = (*controller)->setRevealClip(std::nullopt); !removed)
+                        return json{{"error", core::to_wire_envelope(removed.error())}};
+                    return json{{"success", true}};
+                });
+            });
+
+        registry.register_tool(
             McpTool{
                 .name = "sequencer.add_keyframe",
                 .description = "Add a keyframe at the current viewport camera, optionally setting the camera first",
@@ -252,6 +331,10 @@ namespace lfs::app {
                 if (eye->has_value()) {
                     if (auto error = view_vectors_error(**eye, **target))
                         return mcp::invalid_argument_result(*error, "eye");
+                    if (up->has_value()) {
+                        if (auto error = explicit_up_error(**eye, **target, **up))
+                            return mcp::invalid_argument_result(*error, "up");
+                    }
                 }
 
                 const std::optional<float> fov = args.contains("fov_degrees")
@@ -308,6 +391,10 @@ namespace lfs::app {
                 if (eye->has_value()) {
                     if (auto error = view_vectors_error(**eye, **target))
                         return mcp::invalid_argument_result(*error, "eye");
+                    if (up->has_value()) {
+                        if (auto error = explicit_up_error(**eye, **target, **up))
+                            return mcp::invalid_argument_result(*error, "up");
+                    }
                 }
 
                 const std::optional<float> fov = args.contains("fov_degrees")
@@ -433,6 +520,8 @@ namespace lfs::app {
                         {"keyframe_id", json{{"type", "integer"}, {"description", "Stable keyframe id"}}},
                         {"easing", json{{"oneOf", json::array({json{{"type", "integer"}},
                                                                json{{"type", "string"}, {"enum", json::array({"linear", "ease_in", "ease_out", "ease_in_out"})}}})},
+                                        {"minimum", 0},
+                                        {"maximum", 3},
                                         {"description", "Easing mode as integer or name"}}}},
                     .required = {"keyframe_id", "easing"}}},
             [viewer, backend](const json& args) -> json {
@@ -594,7 +683,7 @@ namespace lfs::app {
                     .type = "object",
                     .properties = json{
                         {"directory", json{{"type", "string"}, {"description", "Directory containing ordered .ply frames"}}},
-                        {"fps", json{{"type", "number"}, {"description", "Playback frame rate (1-240, default 24)"}}},
+                        {"fps", json{{"type", "number"}, {"minimum", 1}, {"maximum", 240}, {"description", "Playback frame rate (1-240, default 24)"}}},
                         {"show_sequencer", json{{"type", "boolean"}, {"description", "Show the sequencer panel (default: true)"}}}},
                     .required = {"directory"}}},
             [viewer, backend](const json& args) -> json {
@@ -611,7 +700,8 @@ namespace lfs::app {
                         backend.set_visible(true);
                     if (!backend.load_ply_sequence)
                         return json{{"error", "load_ply_sequence backend unavailable"}};
-                    backend.load_ply_sequence(directory, fps);
+                    if (const auto loaded = backend.load_ply_sequence(directory, fps); !loaded)
+                        return json{{"error", loaded.error().user_message()}};
 
                     json result = sequencer_state_json(backend, **controller);
                     result["directory"] = directory;
@@ -622,7 +712,7 @@ namespace lfs::app {
         registry.register_tool(
             McpTool{
                 .name = "sequencer.scrub",
-                .description = "Move the sequencer playhead to a time (seconds) or PLY-sequence frame index, optionally updating the viewport camera",
+                .description = "Move the sequencer playhead to a time (seconds) or PLY-sequence frame index, optionally updating the viewport camera. PLY seeks are asynchronous: success is false and pending is true until the requested frame is displayed. Poll sequencer.get ply_player.on_target and requested_frame_failed for completion",
                 .input_schema = {
                     .type = "object",
                     .properties = json{
@@ -657,6 +747,17 @@ namespace lfs::app {
                     json result = sequencer_state_json(backend, **controller);
                     result["scrubbed_to_time"] = target_time;
                     result["camera_updated"] = camera_updated;
+                    if (const auto player = result.find("ply_player"); player != result.end()) {
+                        const bool displayed = player->value("on_target", false);
+                        const bool failed = !displayed && player->value("requested_frame_failed", false);
+                        result["success"] = displayed;
+                        result["pending"] = !displayed && !failed;
+                        if (failed) {
+                            result["error"] = std::format(
+                                "Failed to load requested PLY sequence frame {} (displayed frame: {})",
+                                player->value("requested_frame", -1ll), player->value("displayed_frame", -1ll));
+                        }
+                    }
                     return result;
                 });
             });

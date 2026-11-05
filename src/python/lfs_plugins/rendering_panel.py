@@ -8,9 +8,14 @@ import os
 import lichtfeld as lf
 
 from . import rml_widgets as w
+from .default_reset import LabelDefaultReset, values_match
+from .rendering_defaults import confirm_apply_defaults
 from .scrub_fields import ScrubFieldController, ScrubFieldSpec
+from .collision_panel import CollisionPanel
+from .selection_groups import GROUPS_LIST_ID, SelectionGroupsSection
 from .types import Panel
-from .ui import RuntimeState, PanelStateBinding, native_value as _native_store_value
+from .selected_splat import active_splat_node
+from .ui import RuntimeState, PanelStateBinding
 
 __lfs_panel_classes__ = ["RenderingPanel"]
 __lfs_panel_ids__ = ["lfs.rendering"]
@@ -28,8 +33,6 @@ def _tr_fallback(key: str, fallback: str) -> str:
     return fallback
 
 
-def _theme():
-    return lf.ui.theme()
 
 
 def _vulkan_capabilities():
@@ -50,33 +53,19 @@ def _mesh_wide_lines_supported():
     return bool(_vulkan_capabilities().get("wide_lines", False))
 
 
-def _theme_vignette():
-    theme = _theme()
-    return theme.vignette if theme else None
 
 
-def _set_theme_vignette_style(*, intensity=None, radius=None, softness=None):
-    vignette = _theme_vignette()
-    if vignette is None:
-        return
-    lf.ui.set_theme_vignette_style(
-        float(vignette.intensity if intensity is None else intensity),
-        float(vignette.radius if radius is None else radius),
-        float(vignette.softness if softness is None else softness),
-    )
 
 
 SENSOR_HALF_HEIGHT_MM = 12.0
-DEFAULT_SIMPLIFY_TARGET_RATIO = 0.5
-DEFAULT_SIMPLIFY_LOD_BASE = 2.0
-DEFAULT_SIMPLIFY_OPACITY_PRUNE_THRESHOLD = 0.1
 LOD_BUDGET_MIN = 1
 LOD_BUDGET_FALLBACK_MAX = 5_000_000
 LOD_BUDGET_HARD_MAX = 500_000_000
 
 BOOL_PROPS = [
-    "show_coord_axes", "show_pivot", "show_grid", "show_camera_frustums",
-    "point_cloud_mode", "desaturate_unselected", "desaturate_cropping", "hide_outside_depth_box",
+    "selection_outline_holes",
+    "show_coord_axes", "show_pivot", "show_grid", "show_camera_frustums", "hide_disabled_camera_frustums",
+    "point_cloud_mode", "selection_outline", "desaturate_unselected", "desaturate_cropping", "hide_outside_depth_box",
     "equirectangular", "mip_filter",
     "mesh_wireframe", "mesh_backface_culling", "mesh_shadow_enabled",
     "apply_appearance_correction", "ppisp_vignette_enabled",
@@ -84,7 +73,9 @@ BOOL_PROPS = [
 ]
 
 SLIDER_PROPS = [
-    "axes_size", "grid_opacity", "camera_frustum_scale", "voxel_size",
+    "stochastic_max_frames",
+    "selection_outline_opacity", "selection_outline_width", "selection_outline_threshold",
+    "axes_size", "grid_opacity", "collision_preview_opacity", "camera_frustum_scale", "voxel_size",
     "focal_length_mm", "render_scale", "color_exposure", "environment_exposure", "environment_rotation_degrees",
     "mesh_wireframe_width", "mesh_light_intensity", "mesh_ambient",
     "ppisp_exposure", "ppisp_vignette_strength", "ppisp_gamma_multiplier",
@@ -95,7 +86,13 @@ SLIDER_PROPS = [
 ]
 
 SCRUB_FIELD_DEFS = {
+    "stochastic_max_frames": ScrubFieldSpec(1, 1024, 1, "%d", data_type=int),
+    "selection_outline_opacity": ScrubFieldSpec(0, 1, 0.01, "%.2f"),
+    "selection_outline_width": ScrubFieldSpec(1, 12, 0.01, "%.2f"),
+    "selection_outline_threshold": ScrubFieldSpec(0.05, 0.95, 0.01, "%.2f"),
+
     "axes_size": ScrubFieldSpec(0.5, 10.0, 0.01, "%.3f"),
+    "collision_preview_opacity": ScrubFieldSpec(0, 1, .01, "%.2f"),
     "grid_opacity": ScrubFieldSpec(0.0, 1.0, 0.01, "%.3f"),
     "camera_frustum_scale": ScrubFieldSpec(0.01, 10.0, 0.01, "%.3f"),
     "voxel_size": ScrubFieldSpec(0.001, 0.1, 0.001, "%.3f"),
@@ -115,12 +112,6 @@ SCRUB_FIELD_DEFS = {
     "ppisp_gamma_blue": ScrubFieldSpec(-0.5, 0.5, 0.01, "%.2f"),
     "ppisp_crf_toe": ScrubFieldSpec(-1.0, 1.0, 0.01, "%.2f"),
     "ppisp_crf_shoulder": ScrubFieldSpec(-1.0, 1.0, 0.01, "%.2f"),
-    "theme_vignette_intensity": ScrubFieldSpec(0.0, 1.0, 0.01, "%.2f"),
-    "theme_vignette_radius": ScrubFieldSpec(0.0, 1.0, 0.01, "%.2f"),
-    "theme_vignette_softness": ScrubFieldSpec(0.0, 1.0, 0.01, "%.2f"),
-    "simplify_target": ScrubFieldSpec(1.0, 1.0, 1.0, "%d", data_type=int),
-    "simplify_lod_base": ScrubFieldSpec(0.1, 10.0, 0.1, "%.1f"),
-    "simplify_opacity_prune_threshold": ScrubFieldSpec(0.0, 1.0, 0.01, "%.2f"),
     "lod_max_splats": ScrubFieldSpec(
         float(LOD_BUDGET_MIN),
         float(LOD_BUDGET_FALLBACK_MAX),
@@ -139,6 +130,7 @@ SCRUB_FIELD_DEFS = {
 
 SELECT_PROPS = [
     "grid_plane", "sh_degree", "raster_backend", "camera_metrics_mode", "mesh_shadow_resolution", "color_tonemapping",
+    "transparency_mode",
 ]
 RASTER_BACKENDS = {"3dgs", "3dgut"}
 
@@ -159,34 +151,49 @@ CHROM_FLOAT_PROPS = [
 BACKGROUND_COLOR_PROP = "background_color"
 
 COLOR_PROPS = [
+    "selection_outline_color",
     BACKGROUND_COLOR_PROP,
-    "selection_color_committed", "selection_color_preview",
+    "selection_color_preview",
     "selection_color_center_marker",
     "mesh_wireframe_color",
 ]
 
 SECTION_NAMES = (
     "viewport",
+    "quality",
+    "quality_advanced",
+    "environment",
     "camera",
     "lod",
-    "simplify",
+    "lod_advanced",
     "selection",
     "mesh",
+    "collision",
     "post_process",
     "ppisp_crf",
 )
 
 LOCALE_KEY = {
+    "selection_outline_opacity": "main_panel.selection_outline_opacity",
+    "selection_outline_width": "main_panel.selection_outline_width",
+    "selection_outline_threshold": "main_panel.selection_outline_threshold",
+    "selection_outline_holes": "main_panel.selection_outline_holes",
+    "selection_outline_color": "main_panel.selection_outline_color",
+
     "show_coord_axes": "main_panel.show_coord_axes",
     "show_pivot": "main_panel.show_pivot",
     "show_grid": "main_panel.show_grid",
     "show_camera_frustums": "main_panel.camera_frustums",
+    "hide_disabled_camera_frustums": "main_panel.hide_disabled_camera_frustums",
     "point_cloud_mode": "main_panel.point_cloud_mode",
+    "selection_outline": "main_panel.selection_outline",
     "desaturate_unselected": "main_panel.desaturate_unselected",
     "desaturate_cropping": "main_panel.desaturate_cropping",
     "hide_outside_depth_box": "main_panel.hide_outside_depth_box",
     "equirectangular": "main_panel.equirectangular",
     "raster_backend": "main_panel.raster_backend",
+    "transparency_mode": "main_panel.transparency_mode",
+    "stochastic_max_frames": "main_panel.stochastic_max_frames",
     "mip_filter": "main_panel.mip_filter",
     "axes_size": "main_panel.axes_size",
     "grid_opacity": "main_panel.grid_opacity",
@@ -202,7 +209,6 @@ LOCALE_KEY = {
     "sh_degree": "main_panel.sh_degree",
     "grid_plane": "main_panel.plane",
     "background_color": "main_panel.color",
-    "selection_color_committed": "main_panel.committed",
     "selection_color_preview": "main_panel.preview",
     "selection_color_center_marker": "main_panel.center_marker",
     "mesh_wireframe": "main_panel.mesh_wireframe",
@@ -276,6 +282,7 @@ def _color_channel_field(prop_id, suffix):
 
 
 RENDERING_INITIALLY_COLLAPSED = {
+    "viewport", "environment", "quality_advanced", "lod_advanced",
     "lod",
     "selection",
     "mesh",
@@ -283,10 +290,25 @@ RENDERING_INITIALLY_COLLAPSED = {
     "ppisp_crf",
 }
 
+# Border box of the color picker popup at 100% UI scale: 160dp picker,
+# 4dp padding and a 1dp border on each side. The horizontal offset is 210.
+_COLOR_PICKER_POPUP_HEIGHT = 170
+
+
+def color_picker_popup_top(mouse_y, panel_height, popup_height, gap=2):
+    """Keep the popup inside the panel, opening above the cursor when needed."""
+    top = int(mouse_y) + gap
+    if panel_height <= 0 or popup_height <= 0 or top + popup_height <= panel_height:
+        return top
+    above = int(mouse_y) - int(popup_height) - gap
+    if above >= 0:
+        return above
+    return max(0, int(panel_height) - int(popup_height))
+
 
 class RenderingPanel(Panel):
     id = "lfs.rendering"
-    label = "Rendering"
+    label = "window.rendering"
     space = lf.ui.PanelSpace.MAIN_PANEL_TAB
     order = 10
     template = "rmlui/rendering.rml"
@@ -296,39 +318,34 @@ class RenderingPanel(Panel):
     def __init__(self):
         self._handle = None
         self._color_edit_prop = None
+        self._color_edit_group = None
+        self._selection_groups = SelectionGroupsSection(self._show_group_color_picker)
         self._collapsed = set(RENDERING_INITIALLY_COLLAPSED)
         self._popup_el = None
         self._doc = None
         self._picker_click_handled = False
         self._last_swatch_colors = {}
         self._color_text_bufs = {}
-        self._last_panel_label = ""
-        self._simplify_target_count = 0
-        self._simplify_target_touched = False
-        self._simplify_lod_base = DEFAULT_SIMPLIFY_LOD_BASE
-        self._simplify_lod_base_touched = False
-        self._simplify_opacity_prune_threshold = DEFAULT_SIMPLIFY_OPACITY_PRUNE_THRESHOLD
-        self._simplify_source_name = ""
-        self._simplify_original_count = 0
-        self._simplify_task_active = False
-        self._simplify_progress_value = "0"
-        self._simplify_progress_stage = ""
-        self._simplify_error_text = ""
         self._last_environment_state = None
         self._last_projection_state = None
         self._last_custom_environment_map_path = ""
         self._last_lod_budget = 0
         self._last_lod_budget_slider_max = 0
+        self._chrom_edit_pending = False
+        self._render_slider_pending = False
         self._escape_revert = w.EscapeRevertController()
+        self._default_reset = LabelDefaultReset(self._reset_default, self._apply_reset)
         self._scrub_fields = ScrubFieldController(
             SCRUB_FIELD_DEFS,
             self._get_scrub_value,
             self._set_scrub_value,
+            commit_value=self._commit_render_setting,
         )
         self._reactive_binding = PanelStateBinding()
+        self._collision = CollisionPanel()
 
     def capture_chrome(self):
-        return {"collapsed": sorted(self._collapsed)}
+        return {"version": 2, "collapsed": sorted(self._collapsed)}
 
     def apply_chrome(self, payload):
         self._collapsed = set(RENDERING_INITIALLY_COLLAPSED)
@@ -336,25 +353,20 @@ class RenderingPanel(Panel):
             collapsed = payload.get("collapsed")
             if isinstance(collapsed, (list, tuple)):
                 self._collapsed = {str(name) for name in collapsed}
+                if payload.get("version", 1) < 2:
+                    self._collapsed.update({"environment", "quality_advanced", "lod_advanced"})
         if self._handle:
             self._handle.dirty_all()
 
-    def _sync_panel_label(self):
-        label = tr("window.rendering")
-        if not label or label == self._last_panel_label:
-            return
-        if lf.ui.set_panel_label(self.id, label):
-            self._last_panel_label = label
-
     def on_mount(self, doc):
         self._doc = doc
-        self._sync_panel_label()
         self._popup_el = doc.get_element_by_id("color-picker-popup")
         if self._popup_el:
             self._popup_el.add_event_listener("click", self._on_popup_click)
         body = doc.get_element_by_id("body")
         if body:
             body.add_event_listener("click", self._on_body_click)
+            body.add_event_listener("mouseup", self._on_body_mouseup)
         for el in doc.query_selector_all("input.color-hex"):
             w.bind_select_all_on_focus(el)
             data_value = el.get_attribute("data-value", "")
@@ -369,9 +381,8 @@ class RenderingPanel(Panel):
                 lambda p=prop_id: self._capture_color_snapshot(p),
                 lambda snapshot, p=prop_id: self._restore_color_snapshot(p, snapshot),
             )
-            if prop_id == BACKGROUND_COLOR_PROP:
-                el.add_event_listener("change", self._on_color_text_change)
-                el.add_event_listener("blur", self._on_color_text_blur)
+            el.add_event_listener("change", self._on_color_text_change)
+            el.add_event_listener("blur", self._on_color_text_blur)
         for el in doc.query_selector_all("input.color-channel"):
             w.bind_select_all_on_focus(el)
             data_value = el.get_attribute("data-value", "")
@@ -387,8 +398,10 @@ class RenderingPanel(Panel):
             )
             el.add_event_listener("change", self._on_color_text_change)
             el.add_event_listener("blur", self._on_color_text_blur)
-        self._refresh_simplify_source(force=True)
         self._scrub_fields.mount(doc)
+        self._collision.mount(doc)
+        self._default_reset.mount(doc)
+        self._selection_groups.mount(doc)
         self._sync_section_states()
         self._subscribe_reactive_state()
         self._request_reactive_update()
@@ -403,8 +416,8 @@ class RenderingPanel(Panel):
             RuntimeState.active_tool,
             RuntimeState.transform_space,
             RuntimeState.pivot_mode,
-            RuntimeState.splat_simplify_state,
             RuntimeState.language_generation,
+            RuntimeState.viewport_toolbar_generation,
         )
         self._reactive_binding.set_handle(self._handle).watch(*native_signals)
         self._reactive_binding.watch(RuntimeState.render_settings_generation, dirty="*")
@@ -422,6 +435,9 @@ class RenderingPanel(Panel):
             return
 
         s = lf.get_render_settings
+        self._collision.bind(model)
+        model.bind("navigation_up_idx", self._navigation_up_index, self._set_navigation_up_index)
+        model.bind_event("align_navigation_grid", self._align_navigation_grid)
 
         for prop_id in BOOL_PROPS:
             if prop_id == "equirectangular":
@@ -431,21 +447,21 @@ class RenderingPanel(Panel):
             elif prop_id == "lod_debug_mode":
                 model.bind(prop_id,
                            lambda: getattr(s(), "lod_debug_colors", False),
-                           lambda v: setattr(s(), "lod_debug_colors", v) if s() else None)
+                           lambda v: self._set_render_property("lod_debug_colors", v))
             elif prop_id == "mesh_wireframe":
                 model.bind(prop_id,
                            lambda: _mesh_wireframe_supported() and getattr(s(), "mesh_wireframe", False),
-                           lambda v: setattr(s(), "mesh_wireframe", bool(v))
-                           if s() and _mesh_wireframe_supported() else None)
+                           lambda v, p=prop_id: self._set_render_property(p, bool(v))
+                           if _mesh_wireframe_supported() else None)
             else:
                 model.bind(prop_id,
                            lambda p=prop_id: getattr(s(), p, False),
-                           lambda v, p=prop_id: setattr(s(), p, v) if s() else None)
+                           lambda v, p=prop_id: self._set_render_property(p, v))
 
         for prop_id in SLIDER_PROPS:
             model.bind(prop_id,
                        lambda p=prop_id: float(getattr(s(), p, 0.0)),
-                       lambda v, p=prop_id: setattr(s(), p, float(v)) if s() else None)
+                       lambda v, p=prop_id: self._set_render_slider(p, v))
 
         model.bind("lod_max_splats",
                    lambda: float(self._current_lod_budget()),
@@ -459,7 +475,7 @@ class RenderingPanel(Panel):
             else:
                 model.bind(prop_id,
                            lambda p=prop_id: str(getattr(s(), p, "")),
-                           lambda v, p=prop_id: setattr(s(), p, v) if s() else None)
+                           lambda v, p=prop_id: self._set_render_property(p, v))
 
         model.bind("environment_mode",
                    lambda: str(getattr(s(), "environment_mode", "")),
@@ -535,66 +551,40 @@ class RenderingPanel(Panel):
                 ),
             )
             hex_field = f"{prop_id}_hex"
+            self._color_text_bufs[hex_field] = None
             model.bind(
                 hex_field,
-                lambda p=prop_id: w.color_to_hex(getattr(s(), p, (0, 0, 0))),
-                lambda v, p=prop_id: self._set_color_hex(p, v),
+                lambda f=hex_field, p=prop_id: self._color_text_value(
+                    f, lambda: w.color_to_hex(getattr(s(), p, (0, 0, 0)))
+                ),
+                lambda v, f=hex_field: self._set_color_text_buf(f, v),
             )
 
         for prop_id in CHROM_FLOAT_PROPS:
             model.bind(prop_id,
                        lambda p=prop_id: float(getattr(s(), p, 0.0)),
-                       lambda v, p=prop_id: setattr(s(), p, float(v)) if s() else None)
-
-        model.bind("simplify_target",
-                   lambda: f"{self._compute_simplify_target_count():,}",
-                   lambda v: self._set_simplify_target_count(v))
-        model.bind("simplify_lod_base",
-                   lambda: f"{self._compute_simplify_lod_base():.1f}",
-                   lambda v: self._set_simplify_lod_base(v))
-        model.bind("simplify_opacity_prune_threshold",
-                   lambda: f"{self._compute_simplify_opacity_prune_threshold():.2f}",
-                   lambda v: self._set_simplify_opacity_prune_threshold(v))
+                       lambda v, p=prop_id: self._set_render_slider(p, v))
 
         model.bind_func("ppisp_auto",
                          lambda: s() is not None and getattr(s(), "ppisp_mode", "") != "MANUAL")
 
+        model.bind_func("label_hdr_quality", lambda: tr("rendering_panel.section_quality"))
+        model.bind_func("label_hdr_environment", lambda: tr("rendering_panel.section_environment"))
+        model.bind_func("label_hdr_advanced", lambda: tr("rendering_panel.advanced"))
         model.bind_func("label_hdr_viewport",
-                         lambda: _tr_fallback("rendering_panel.section_viewport", "Viewport"))
+                         lambda: _tr_fallback("rendering_panel.section_viewport", "Viewport & Guides"))
         model.bind_func("label_hdr_camera",
                          lambda: _tr_fallback("rendering_panel.section_camera", "Camera & Projection"))
         model.bind_func("label_hdr_lod",
                          lambda: _tr_fallback("rendering_panel.section_lod", "LOD"))
-        model.bind_func("label_hdr_simplify",
-                         lambda: _tr_fallback("rendering_panel.section_simplify", "Splat Simplify"))
         model.bind_func("label_hdr_selection",
                          lambda: _tr_fallback("rendering_panel.section_selection", "Selection & Overlays"))
         model.bind_func("label_hdr_mesh",
                          lambda: lf.ui.tr("main_panel.mesh") or "Mesh")
         model.bind_func("label_hdr_post_process",
-                         lambda: _tr_fallback("rendering_panel.section_post_process", "Post Processing"))
+                         lambda: _tr_fallback("rendering_panel.section_post_process", "Color & Appearance"))
         model.bind_func("label_environment_map_browse",
                          lambda: lf.ui.tr("common.browse") or "Browse...")
-        model.bind_func("label_simplify_source",
-                         lambda: _entry_label(_tr_fallback("rendering_panel.simplify_source", "Source")))
-        model.bind_func("label_simplify_select_source",
-                         lambda: _tr_fallback("rendering_panel.simplify_select_source", "Select a splat node"))
-        model.bind_func("label_simplify_target",
-                         lambda: _entry_label(_tr_fallback("rendering_panel.simplify_target", "Target")))
-        model.bind_func("label_simplify_target_stat",
-                         lambda: _tr_fallback("rendering_panel.simplify_target", "Target"))
-        model.bind_func("label_simplify_lod_base",
-                         lambda: _entry_label(_tr_fallback("rendering_panel.simplify_lod_base", "LOD Base")))
-        model.bind_func("label_simplify_opacity_prune",
-                         lambda: _entry_label(_tr_fallback("rendering_panel.simplify_opacity_prune", "Opacity Prune")))
-        model.bind_func("label_simplify_original",
-                         lambda: _tr_fallback("rendering_panel.simplify_original", "Original"))
-        model.bind_func("label_simplify_output",
-                         lambda: _entry_label(_tr_fallback("rendering_panel.simplify_output", "Output")))
-        model.bind_func("label_simplify_apply",
-                         lambda: _tr_fallback("common.apply", "Apply"))
-        model.bind_func("label_simplify_cancel",
-                         lambda: _tr_fallback("common.cancel", "Cancel"))
         model.bind_func("label_ppisp_color_balance",
                          lambda: _entry_label(
                              lf.ui.tr("main_panel.ppisp_color_balance") or "Color Correction"))
@@ -602,81 +592,78 @@ class RenderingPanel(Panel):
                          lambda: lf.ui.tr("main_panel.ppisp_crf_advanced") or "CRF")
 
         model.bind_func("fov_display", self._compute_fov)
+        model.bind_func("show_fov_controls", self._show_fov_controls)
 
-        model.bind_func("picker_r",
-                         lambda: float(getattr(s(), self._color_edit_prop, (0, 0, 0))[0])
-                         if self._color_edit_prop and s() else 0.0)
-        model.bind_func("picker_g",
-                         lambda: float(getattr(s(), self._color_edit_prop, (0, 0, 0))[1])
-                         if self._color_edit_prop and s() else 0.0)
-        model.bind_func("picker_b",
-                         lambda: float(getattr(s(), self._color_edit_prop, (0, 0, 0))[2])
-                         if self._color_edit_prop and s() else 0.0)
+        model.bind_func("picker_r", lambda: float(self._picker_color()[0]))
+        model.bind_func("picker_g", lambda: float(self._picker_color()[1]))
+        model.bind_func("picker_b", lambda: float(self._picker_color()[2]))
         model.bind_func(
             "editing_background_color",
             lambda: self._color_edit_prop == BACKGROUND_COLOR_PROP,
         )
 
         model.bind_func("is_windows", lambda: lf.ui.is_windows_platform())
-        model.bind_func("label_console",
-                         lambda: lf.ui.tr("main_panel.console") or "Console")
-        model.bind_func("simplify_has_source", lambda: bool(self._simplify_source_name))
-        model.bind_func("simplify_source_name", lambda: self._simplify_source_name)
-        model.bind_func("simplify_original_count", lambda: f"{self._simplify_original_count:,}")
-        model.bind_func("simplify_target_count", lambda: f"{self._compute_simplify_target_count():,}")
-        model.bind_func("simplify_output_name", self._simplify_output_name)
-        model.bind_func("simplify_can_apply", self._can_run_simplify)
-        model.bind_func("simplify_show_progress", lambda: self._simplify_task_active)
-        model.bind_func("simplify_progress_value", lambda: self._simplify_progress_value)
-        model.bind_func("simplify_progress_pct", self._simplify_progress_pct)
-        model.bind_func("simplify_progress_stage", lambda: self._simplify_progress_stage)
-        model.bind_func("simplify_show_error", lambda: bool(self._simplify_error_text))
-        model.bind_func("simplify_error_text", lambda: self._simplify_error_text)
-
-        model.bind("theme_vignette_enabled",
-                   lambda: bool((vignette := _theme_vignette()) and vignette.enabled),
-                   lambda v: lf.ui.set_theme_vignette_enabled(bool(v)))
-        model.bind("theme_vignette_intensity",
-                   lambda: float(vignette.intensity) if (vignette := _theme_vignette()) else 0.3,
-                   lambda v: lf.ui.set_theme_vignette_intensity(float(v)))
-        model.bind("theme_vignette_radius",
-                   lambda: float(vignette.radius) if (vignette := _theme_vignette()) else 0.75,
-                   lambda v: _set_theme_vignette_style(radius=float(v)))
-        model.bind("theme_vignette_softness",
-                   lambda: float(vignette.softness) if (vignette := _theme_vignette()) else 0.45,
-                   lambda v: _set_theme_vignette_style(softness=float(v)))
-        model.bind_func("label_theme_vignette_enabled",
-                         lambda: _entry_label(lf.ui.tr("main_panel.theme_vignette") or "Vignette"))
-        model.bind_func("label_theme_vignette_intensity",
-                         lambda: _entry_label(
-                             lf.ui.tr("main_panel.theme_vignette_intensity") or "Intensity"))
-        model.bind_func("label_theme_vignette_radius",
-                         lambda: _entry_label(
-                             lf.ui.tr("main_panel.theme_vignette_radius") or "Radius"))
-        model.bind_func("label_theme_vignette_softness",
-                         lambda: _entry_label(
-                             lf.ui.tr("main_panel.theme_vignette_softness") or "Softness"))
-
+        model.bind_event("save_defaults", lambda *_: lf.ui.capture_rendering_defaults())
+        model.bind_event("apply_defaults", self._confirm_apply_defaults)
         model.bind_event("toggle_section", self._on_toggle_section)
         model.bind_event("color_click", self._on_color_click)
         model.bind_event("chrom_change", self._on_chrom_change)
         model.bind_event("picker_change", self._on_picker_change)
-        model.bind_event("simplify_apply", self._on_simplify_apply)
-        model.bind_event("simplify_cancel", self._on_simplify_cancel)
-        model.bind_event("toggle_console",
-                         lambda h, e, a: lf.ui.toggle_system_console())
         model.bind_event("browse_environment_map", self._on_browse_environment_map)
+        self._selection_groups.bind(model)
 
         self._handle = model.get_handle()
-        self._sync_panel_label()
+        self._selection_groups.attach(self._handle)
+
+    def _navigation_up_index(self):
+        return "1" if lf.get_navigation_up_axis() == "data_z" else "0"
+
+    def _set_navigation_up_index(self, value):
+        axis = {"0": "legacy_y", "1": "data_z"}.get(str(value))
+        if axis is not None:
+            lf.set_navigation_up_axis(axis)
+            if self._handle:
+                self._handle.dirty("navigation_up_idx")
+
+    def _align_navigation_grid(self, *_):
+        lf.set_navigation_up_axis(lf.get_navigation_up_axis(), align_grid=True)
+        if self._handle:
+            self._handle.dirty("grid_plane")
+
+    def _commit_render_setting(self, prop, value):
+        if prop in SLIDER_PROPS + ["lod_max_splats"] and prop in SCRUB_FIELD_DEFS:
+            self._mark_view_setting_commit()
+
+    @staticmethod
+    def _mark_view_setting_commit():
+        lf.ui.mark_project_session_chapter_committed("VIEW")
+
+    def _set_render_property(self, prop, value):
+        settings = lf.get_render_settings()
+        if settings is None:
+            return
+        if getattr(settings, prop, object()) == value:
+            return
+        settings._set_without_session_dirty(prop, value)
+        self._mark_view_setting_commit()
+
+    def _set_render_slider(self, prop, value):
+        settings = lf.get_render_settings()
+        if settings is None:
+            return
+        typed_value = int(round(float(value))) if prop == "stochastic_max_frames" else float(value)
+        settings._set_without_session_dirty(prop, typed_value)
+        self._render_slider_pending = True
 
     def on_update(self, doc):
-        self._sync_panel_label()
         s = lf.get_render_settings()
         if not s:
             return False
 
-        dirty = False
+        dirty = self._collision.update()
+        if not getattr(s, "selection_outline", False) and self._color_edit_prop == "selection_outline_color":
+            self._hide_picker()
+            dirty = True
         dirty |= self._sync_environment_state()
         dirty |= self._sync_projection_state()
         dirty |= self._sync_lod_budget()
@@ -696,9 +683,8 @@ class RenderingPanel(Panel):
                 swatch.set_property("background-color", f"rgb({key[1]},{key[2]},{key[3]})")
                 dirty = True
             self._dirty_color_bindings(prop_id)
-        dirty |= self._refresh_simplify_source(force=False)
-        dirty |= self._sync_simplify_task_state(force=False)
         dirty |= self._scrub_fields.sync_all()
+        dirty |= self._selection_groups.sync(visible=self._selection_section_expanded())
         return dirty
 
     def _environment_state_snapshot(self):
@@ -725,6 +711,12 @@ class RenderingPanel(Panel):
             return False
         self._last_environment_state = state
         self._dirty_environment_bindings()
+        if self._doc and current_path and current_path not in ENVIRONMENT_PRESET_PATHS:
+            select = self._doc.get_element_by_id("environment-map-preset")
+            if select and select.get_attribute("value", "") == CUSTOM_ENVIRONMENT_PRESET_VALUE:
+                # RmlUi caches the closed label even when the selected option's
+                # text changes. Reapply the value to refresh that copy on update.
+                select.set_attribute("value", CUSTOM_ENVIRONMENT_PRESET_VALUE)
         return True
 
     def _projection_state_snapshot(self):
@@ -737,7 +729,11 @@ class RenderingPanel(Panel):
         )
 
     def _dirty_projection_bindings(self):
-        self._dirty_model("raster_backend", "equirectangular")
+        self._dirty_model("raster_backend", "equirectangular", "show_fov_controls")
+
+    def _show_fov_controls(self):
+        settings = lf.get_render_settings()
+        return not bool(getattr(settings, "equirectangular", False)) if settings else True
 
     def _sync_projection_state(self):
         state = self._projection_state_snapshot()
@@ -751,7 +747,8 @@ class RenderingPanel(Panel):
         settings = lf.get_render_settings()
         if not settings:
             return
-        settings.environment_mode = value
+        settings._set_without_session_dirty("environment_mode", value)
+        self._mark_view_setting_commit()
         self._sync_environment_state()
 
     def _set_raster_backend(self, value):
@@ -759,18 +756,16 @@ class RenderingPanel(Panel):
         if not settings:
             return
         backend = _normalize_raster_backend(value)
-        settings.raster_backend = backend
+        settings._set_without_session_dirty("raster_backend", backend)
+        self._mark_view_setting_commit()
         self._sync_projection_state()
 
     def _set_equirectangular(self, value):
         settings = lf.get_render_settings()
         if not settings:
             return
-        enabled = bool(value)
-        current_backend = _normalize_raster_backend(getattr(settings, "raster_backend", ""))
-        if enabled and current_backend != "3dgut":
-            settings.raster_backend = "3dgut"
-        settings.equirectangular = enabled
+        settings._set_without_session_dirty("equirectangular", bool(value))
+        self._mark_view_setting_commit()
         self._sync_projection_state()
 
     def _environment_map_is_custom(self):
@@ -840,7 +835,8 @@ class RenderingPanel(Panel):
             self._dirty_environment_bindings()
             return
         self._remember_custom_environment_map(selected_path)
-        settings.environment_map_path = selected_path
+        settings._set_without_session_dirty("environment_map_path", selected_path)
+        self._mark_view_setting_commit()
         self._sync_environment_state()
 
     def _get_environment_map_preset(self):
@@ -865,7 +861,10 @@ class RenderingPanel(Panel):
                 self._dirty_environment_bindings()
                 return
             if self._last_custom_environment_map_path:
-                settings.environment_map_path = self._last_custom_environment_map_path
+                settings._set_without_session_dirty(
+                    "environment_map_path", self._last_custom_environment_map_path
+                )
+                self._mark_view_setting_commit()
                 self._sync_environment_state()
             else:
                 self._dirty_environment_bindings()
@@ -874,7 +873,8 @@ class RenderingPanel(Panel):
             preset_index = int(value)
         except (TypeError, ValueError):
             if value:
-                settings.environment_map_path = value
+                settings._set_without_session_dirty("environment_map_path", value)
+                self._mark_view_setting_commit()
                 self._sync_environment_state()
             else:
                 self._dirty_environment_bindings()
@@ -883,7 +883,8 @@ class RenderingPanel(Panel):
             self._dirty_environment_bindings()
             return
         preset_path = ENVIRONMENT_PRESET_PATHS[preset_index]
-        settings.environment_map_path = preset_path
+        settings._set_without_session_dirty("environment_map_path", preset_path)
+        self._mark_view_setting_commit()
         self._sync_environment_state()
 
     def _on_browse_environment_map(self, handle, event, args):
@@ -896,37 +897,63 @@ class RenderingPanel(Panel):
             return False
 
         dirty = False
-        dirty |= self._refresh_simplify_source(force=False)
-        dirty |= self._sync_simplify_task_state(force=False)
+        self._selection_groups.invalidate()
+        dirty |= self._selection_groups.sync(visible=self._selection_section_expanded())
         return dirty
 
     def on_unmount(self, doc):
         self._unsubscribe_reactive_state()
+        self._selection_groups.unmount()
         doc.remove_data_model("rendering")
         self._handle = None
         self._popup_el = None
         self._doc = None
         self._escape_revert.clear()
         self._scrub_fields.unmount()
+        self._collision.scrubs.unmount()
+        self._collision.handle = None
+        self._default_reset.unmount()
+
+    def _reset_default(self, prop):
+        settings = lf.get_render_settings()
+        if settings is None or prop not in BOOL_PROPS + SLIDER_PROPS + SELECT_PROPS + COLOR_PROPS + ["lod_max_splats", "environment_mode", "ppisp_mode"]:
+            return None
+        actual = "lod_debug_colors" if prop == "lod_debug_mode" else prop
+        info = settings.prop_info(actual)
+        return None if info.get("readonly") else info.get("builtin_default")
+
+    def _apply_reset(self, prop, value):
+        settings = lf.get_render_settings()
+        if settings is None:
+            return False
+        actual = "lod_debug_colors" if prop == "lod_debug_mode" else prop
+        self._scrub_fields.prepare_reset(prop)
+        if prop == "equirectangular":
+            self._set_equirectangular(value)
+        elif prop == "raster_backend":
+            self._set_raster_backend(value)
+        elif prop == "environment_mode":
+            self._set_environment_mode(value)
+        elif prop == "ppisp_mode":
+            self._set_ppisp_mode(value)
+        elif prop == "lod_max_splats":
+            self._set_render_property(prop, int(value))
+        elif prop == "mesh_wireframe" and not _mesh_wireframe_supported():
+            return False
+        else:
+            self._set_render_property(actual, value)
+        # Discard stale text so blur cannot restore the value preceding this reset.
+        if prop in COLOR_PROPS:
+            self._sync_color_text_bufs(prop)
+            self._escape_revert.rebase([f"{prop}_hex"] + [f"{prop}_{suffix}" for suffix, _ in COLOR_CHANNELS])
+        if self._handle:
+            self._handle.dirty_all()
+        self._scrub_fields.sync_all()
+        return values_match(getattr(lf.get_render_settings(), actual), value)
 
     def _get_scrub_value(self, prop):
-        if prop == "simplify_target":
-            return float(self._compute_simplify_target_count())
-        if prop == "simplify_lod_base":
-            return self._compute_simplify_lod_base()
-        if prop == "simplify_opacity_prune_threshold":
-            return self._compute_simplify_opacity_prune_threshold()
         if prop == "lod_max_splats":
             return float(self._current_lod_budget())
-        if prop == "theme_vignette_intensity":
-            theme = _theme()
-            return float(theme.vignette.intensity) if theme else 0.3
-        if prop == "theme_vignette_radius":
-            vignette = _theme_vignette()
-            return float(vignette.radius) if vignette else 0.75
-        if prop == "theme_vignette_softness":
-            vignette = _theme_vignette()
-            return float(vignette.softness) if vignette else 0.45
         settings = lf.get_render_settings()
         if not settings:
             spec = SCRUB_FIELD_DEFS[prop]
@@ -934,37 +961,14 @@ class RenderingPanel(Panel):
         return float(getattr(settings, prop, 0.0))
 
     def _set_scrub_value(self, prop, value):
-        if prop == "simplify_target":
-            self._set_simplify_target_count(value)
-            return
-        if prop == "simplify_lod_base":
-            self._set_simplify_lod_base(value)
-            return
-        if prop == "simplify_opacity_prune_threshold":
-            self._set_simplify_opacity_prune_threshold(value)
-            return
         if prop == "lod_max_splats":
             self._set_lod_budget(value)
-            return
-        if prop == "theme_vignette_intensity":
-            lf.ui.set_theme_vignette_intensity(float(value))
-            if self._handle:
-                self._handle.dirty(prop)
-            return
-        if prop == "theme_vignette_radius":
-            _set_theme_vignette_style(radius=float(value))
-            if self._handle:
-                self._handle.dirty(prop)
-            return
-        if prop == "theme_vignette_softness":
-            _set_theme_vignette_style(softness=float(value))
-            if self._handle:
-                self._handle.dirty(prop)
             return
         settings = lf.get_render_settings()
         if not settings:
             return
-        setattr(settings, prop, float(value))
+        typed_value = int(round(float(value))) if prop == "stochastic_max_frames" else float(value)
+        settings._set_without_session_dirty(prop, typed_value)
         if self._handle:
             self._handle.dirty(prop)
             if prop == "focal_length_mm":
@@ -979,7 +983,8 @@ class RenderingPanel(Panel):
         except (TypeError, ValueError):
             return
         budget = max(LOD_BUDGET_MIN, min(self._lod_budget_slider_max(), parsed))
-        settings.lod_max_splats = budget
+        settings._set_without_session_dirty("lod_max_splats", budget)
+        self._render_slider_pending = True
         self._dirty_model("lod_max_splats")
 
     def _color_text_value(self, field, canonical):
@@ -994,7 +999,7 @@ class RenderingPanel(Panel):
         if not field.endswith("_hex"):
             return None
         prop_id = field[:-4]
-        return prop_id if prop_id == BACKGROUND_COLOR_PROP else None
+        return prop_id if prop_id in COLOR_PROPS else None
 
     def _canonical_color_text_value(self, field):
         settings = lf.get_render_settings()
@@ -1042,6 +1047,7 @@ class RenderingPanel(Panel):
             return
         self._color_text_bufs[field] = canonical
         if updated:
+            self._mark_view_setting_commit()
             channel = self._split_color_channel_field(field)
             prop_id = (
                 channel[0]
@@ -1059,7 +1065,7 @@ class RenderingPanel(Panel):
             return False
         color = w.hex_to_color(hex_val)
         if color is not None:
-            setattr(s, prop_id, w.normalize_color(color))
+            s._set_without_session_dirty(prop_id, w.normalize_color(color))
             return True
         return False
 
@@ -1072,7 +1078,7 @@ class RenderingPanel(Panel):
             return False
         color = list(w.normalize_color(getattr(s, prop_id, (0.0, 0.0, 0.0))))
         color[channel_index] = parsed
-        setattr(s, prop_id, tuple(color))
+        s._set_without_session_dirty(prop_id, tuple(color))
         return True
 
     def _capture_color_snapshot(self, prop_id):
@@ -1085,7 +1091,9 @@ class RenderingPanel(Panel):
         settings = lf.get_render_settings()
         if not settings:
             return
-        setattr(settings, prop_id, w.normalize_color(snapshot or (0.0, 0.0, 0.0)))
+        settings._set_without_session_dirty(
+            prop_id, w.normalize_color(snapshot or (0.0, 0.0, 0.0))
+        )
         self._dirty_color_bindings(prop_id)
 
     def _compute_fov(self):
@@ -1131,37 +1139,100 @@ class RenderingPanel(Panel):
         header, arrow, content = self._get_section_elements(name)
         if content:
             w.animate_section_toggle(content, expanding, arrow, header_element=header)
+        if name == "selection" and expanding:
+            self._selection_groups.sync()
 
-    def _on_color_click(self, handle, event, args):
-        if not args or not self._popup_el:
-            return
+    def _selection_section_expanded(self):
+        return "selection" not in self._collapsed
+
+    def reveal_selection_groups(self):
+        """Expand Selection & Overlays and scroll the group list into view."""
+        if not self._selection_section_expanded():
+            self._collapsed.discard("selection")
+            self._sync_section_states()
+            self._selection_groups.sync()
+        groups_list = self._doc.get_element_by_id(GROUPS_LIST_ID) if self._doc else None
+        if groups_list:
+            groups_list.scroll_into_view(False)
+        return True
+
+    def _picker_color(self):
+        if self._color_edit_group is not None:
+            return self._selection_groups.group_color(self._color_edit_group) or (0.0, 0.0, 0.0)
+        s = lf.get_render_settings()
+        if not self._color_edit_prop or not s:
+            return (0.0, 0.0, 0.0)
+        return getattr(s, self._color_edit_prop, (0.0, 0.0, 0.0))
+
+    def _open_picker(self, event):
         self._picker_click_handled = True
-        prop_id = str(args[0])
-        if self._color_edit_prop == prop_id:
-            self._hide_picker()
-            return
-        self._color_edit_prop = prop_id
         mx = int(float(event.get_parameter("mouse_x", "0")))
         my = int(float(event.get_parameter("mouse_y", "0")))
         left = max(0, mx - 210)
+        scale = float(lf.ui.get_ui_scale() or 1.0)
+        if scale <= 0:
+            scale = 1.0
+        panel_height = 0.0
+        if self._doc is not None:
+            body = self._doc.get_element_by_id("body")
+            if body is not None:
+                panel_height = float(body.client_height)
+        top = color_picker_popup_top(my, panel_height, _COLOR_PICKER_POPUP_HEIGHT * scale)
         self._popup_el.set_property("left", f"{left}px")
-        self._popup_el.set_property("top", f"{my + 2}px")
+        self._popup_el.set_property("top", f"{top}px")
         self._popup_el.set_class("visible", True)
-        handle.dirty("picker_r")
-        handle.dirty("picker_g")
-        handle.dirty("picker_b")
-        handle.dirty("editing_background_color")
+        if self._handle:
+            self._handle.dirty("picker_r")
+            self._handle.dirty("picker_g")
+            self._handle.dirty("picker_b")
+            self._handle.dirty("editing_background_color")
+
+    def _on_color_click(self, handle, event, args):
+        del handle
+        if not args or not self._popup_el:
+            return
+        prop_id = str(args[0])
+        if self._color_edit_prop == prop_id:
+            self._picker_click_handled = True
+            self._hide_picker()
+            return
+        self._color_edit_group = None
+        self._color_edit_prop = prop_id
+        self._open_picker(event)
+
+    def _show_group_color_picker(self, gid, event):
+        if not self._popup_el:
+            return
+        if self._color_edit_group == gid:
+            self._picker_click_handled = True
+            self._hide_picker()
+            return
+        self._color_edit_prop = None
+        self._color_edit_group = gid
+        self._open_picker(event)
 
     def _on_picker_change(self, handle, event, args):
-        s = lf.get_render_settings()
-        if not s or not event or not self._color_edit_prop:
+        if not event:
             return
         r = float(event.get_parameter("red", "0"))
         g = float(event.get_parameter("green", "0"))
         b = float(event.get_parameter("blue", "0"))
+        if self._color_edit_group is not None:
+            self._selection_groups.set_group_color(self._color_edit_group, (r, g, b))
+            return
+        s = lf.get_render_settings()
+        if not s or not self._color_edit_prop:
+            return
         prop = self._color_edit_prop
-        setattr(s, prop, w.normalize_color((r, g, b)))
+        s._set_without_session_dirty(prop, w.normalize_color((r, g, b)))
         self._dirty_color_bindings(prop, handle)
+
+    def _on_body_mouseup(self, _event):
+        if (self._color_edit_prop is not None or self._chrom_edit_pending or
+                self._render_slider_pending):
+            self._mark_view_setting_commit()
+            self._chrom_edit_pending = False
+            self._render_slider_pending = False
 
     def _on_color_text_change(self, event):
         if not event.get_bool_parameter("linebreak", False):
@@ -1188,6 +1259,7 @@ class RenderingPanel(Panel):
 
     def _hide_picker(self):
         self._color_edit_prop = None
+        self._color_edit_group = None
         if self._popup_el:
             self._popup_el.set_class("visible", False)
         if self._handle:
@@ -1196,7 +1268,8 @@ class RenderingPanel(Panel):
     def _set_ppisp_mode(self, v):
         s = lf.get_render_settings()
         if s:
-            setattr(s, "ppisp_mode", v)
+            s._set_without_session_dirty("ppisp_mode", v)
+            self._mark_view_setting_commit()
         if self._handle:
             self._handle.dirty("ppisp_auto")
 
@@ -1268,191 +1341,24 @@ class RenderingPanel(Panel):
         return self._scrub_fields.set_spec("lod_max_splats", spec)
 
     def _active_splat_node(self):
-        scene = getattr(lf, "get_scene", lambda: None)()
-        if scene is None:
-            return None, "", 0
+        return active_splat_node()
 
-        selected_name = str(getattr(lf, "get_selected_node_name", lambda: "")() or "")
-        if not selected_name:
-            return None, "", 0
 
-        node = scene.get_node(selected_name)
-        if node is None:
-            return None, "", 0
 
-        node_type_enum = getattr(getattr(lf, "scene", None), "NodeType", None)
-        if node_type_enum is not None and getattr(node, "type", None) != node_type_enum.SPLAT:
-            return None, "", 0
 
-        try:
-            splat = node.splat_data()
-        except Exception:
-            splat = None
-        if splat is None:
-            return None, "", 0
 
-        try:
-            count = int(splat.visible_count())
-        except Exception:
-            count = int(getattr(node, "gaussian_count", 0))
-        return node, selected_name, count
 
-    def _refresh_simplify_source(self, force: bool) -> bool:
-        _node, source_name, source_count = self._active_splat_node()
-        changed = force or source_name != self._simplify_source_name or source_count != self._simplify_original_count
-        if not changed:
-            return False
 
-        self._simplify_source_name = source_name
-        self._simplify_original_count = source_count
-        if source_count > 0:
-            if self._simplify_target_touched and self._simplify_target_count > 0:
-                self._simplify_target_count = self._clamp_simplify_target_count(self._simplify_target_count, source_count)
-            else:
-                self._simplify_target_count = self._default_simplify_target_count(source_count)
-            if self._simplify_lod_base_touched and self._simplify_lod_base > 0:
-                self._simplify_lod_base = self._clamp_simplify_lod_base(self._simplify_lod_base)
-            else:
-                self._simplify_lod_base = DEFAULT_SIMPLIFY_LOD_BASE
-        elif not self._simplify_target_touched:
-            self._simplify_target_count = 0
-        if source_count <= 0 and not self._simplify_lod_base_touched:
-            self._simplify_lod_base = DEFAULT_SIMPLIFY_LOD_BASE
-        self._sync_simplify_scrub_spec()
-        self._dirty_model(
-            "simplify_has_source",
-            "simplify_source_name",
-            "simplify_original_count",
-            "simplify_target",
-            "simplify_target_count",
-            "simplify_lod_base",
-            "simplify_opacity_prune_threshold",
-            "simplify_output_name",
-            "simplify_can_apply",
-        )
-        return True
 
-    def _sync_simplify_scrub_spec(self):
-        max_value = max(0, int(self._simplify_original_count))
-        target_spec = ScrubFieldSpec(
-            1.0 if max_value > 0 else 0.0,
-            float(max_value),
-            1.0,
-            "%d",
-            data_type=int,
-        )
-        lod_spec = ScrubFieldSpec(0.1, 10.0, 0.1, "%.1f")
-        self._scrub_fields.set_spec("simplify_target", target_spec)
-        self._scrub_fields.set_spec("simplify_lod_base", lod_spec)
 
-    def _default_simplify_target_count(self, original_count=None) -> int:
-        source_count = self._simplify_original_count if original_count is None else int(original_count)
-        if source_count <= 0:
-            return 0
-        return max(1, min(source_count, int(math.ceil(source_count * DEFAULT_SIMPLIFY_TARGET_RATIO))))
 
-    def _clamp_simplify_target_count(self, value, original_count=None):
-        try:
-            parsed = int(round(float(str(value).strip().replace(",", "").replace("_", ""))))
-        except (TypeError, ValueError):
-            return None
-        clamped = max(1, parsed)
-        max_count = self._simplify_original_count if original_count is None else int(original_count)
-        if max_count > 0:
-            clamped = min(clamped, max_count)
-        return clamped
 
-    def _compute_simplify_target_count(self) -> int:
-        if self._simplify_original_count <= 0:
-            return 0
-        if self._simplify_target_count <= 0:
-            return self._default_simplify_target_count()
-        clamped = self._clamp_simplify_target_count(self._simplify_target_count)
-        if clamped is None:
-            return self._default_simplify_target_count()
-        return clamped
 
-    def _compute_simplify_ratio(self) -> float:
-        if self._simplify_original_count <= 0:
-            return 0.0
-        return float(self._compute_simplify_target_count()) / float(self._simplify_original_count)
 
-    def _clamp_simplify_lod_base(self, value):
-        try:
-            parsed = float(str(value).strip().replace(",", "").replace("_", ""))
-        except (TypeError, ValueError):
-            return None
-        return max(0.1, min(parsed, 10.0))
 
-    def _compute_simplify_lod_base(self) -> float:
-        clamped = self._clamp_simplify_lod_base(self._simplify_lod_base)
-        return DEFAULT_SIMPLIFY_LOD_BASE if clamped is None else clamped
 
-    def _set_simplify_lod_base(self, value):
-        next_value = self._clamp_simplify_lod_base(value)
-        if next_value is None or math.isclose(next_value, self._simplify_lod_base, abs_tol=1.0e-9):
-            return
-        self._simplify_lod_base = next_value
-        self._simplify_lod_base_touched = True
-        self._dirty_model("simplify_lod_base")
 
-    def _clamp_simplify_opacity_prune_threshold(self, value):
-        try:
-            parsed = float(str(value).strip().replace(",", "").replace("_", ""))
-        except (TypeError, ValueError):
-            return None
-        return max(0.0, min(parsed, 1.0))
 
-    def _compute_simplify_opacity_prune_threshold(self) -> float:
-        clamped = self._clamp_simplify_opacity_prune_threshold(self._simplify_opacity_prune_threshold)
-        return DEFAULT_SIMPLIFY_OPACITY_PRUNE_THRESHOLD if clamped is None else clamped
-
-    def _set_simplify_opacity_prune_threshold(self, value):
-        next_value = self._clamp_simplify_opacity_prune_threshold(value)
-        if next_value is None or math.isclose(next_value, self._simplify_opacity_prune_threshold, abs_tol=1.0e-9):
-            return
-        self._simplify_opacity_prune_threshold = next_value
-        self._dirty_model("simplify_opacity_prune_threshold")
-
-    def _simplify_output_name(self) -> str:
-        if not self._simplify_source_name:
-            return ""
-        return f"{self._simplify_source_name}_{self._compute_simplify_target_count()}"
-
-    def _can_run_simplify(self) -> bool:
-        return bool(
-            self._simplify_source_name
-            and self._simplify_original_count > 0
-            and self._compute_simplify_target_count() > 0
-            and not self._simplify_task_active
-        )
-
-    def _set_simplify_target_count(self, value):
-        next_value = self._clamp_simplify_target_count(value)
-        if next_value is None:
-            return
-        if next_value == self._simplify_target_count and self._simplify_target_touched:
-            return
-        self._simplify_target_count = next_value
-        self._simplify_target_touched = True
-        self._dirty_model("simplify_target", "simplify_target_count", "simplify_output_name")
-
-    def _simplify_progress_pct(self) -> str:
-        try:
-            return f"{int(round(float(self._simplify_progress_value) * 100.0))}%"
-        except (TypeError, ValueError):
-            return "0%"
-
-    def _simplify_task_state(self) -> dict[str, object]:
-        state = _native_store_value("splat_simplify_state", None)
-        if isinstance(state, dict):
-            return state
-        return {
-            "active": bool(getattr(lf, "is_splat_simplify_active", lambda: False)()),
-            "progress": getattr(lf, "get_splat_simplify_progress", lambda: 0.0)(),
-            "stage": getattr(lf, "get_splat_simplify_stage", lambda: "")() or "",
-            "error": getattr(lf, "get_splat_simplify_error", lambda: "")() or "",
-        }
 
     def _sync_lod_budget(self) -> bool:
         budget = self._current_lod_budget()
@@ -1469,63 +1375,15 @@ class RenderingPanel(Panel):
         self._dirty_model("lod_max_splats")
         return True
 
-    def _sync_simplify_task_state(self, force: bool) -> bool:
-        state = self._simplify_task_state()
-        active = bool(state.get("active", False))
-        progress = max(0.0, min(1.0, float(state.get("progress", 0.0))))
-        progress_value = f"{progress:.4f}".rstrip("0").rstrip(".") or "0"
-        stage = str(state.get("stage", "") or "")
-        error_text = str(state.get("error", "") or "")
 
-        changed = force or (
-            active != self._simplify_task_active or
-            progress_value != self._simplify_progress_value or
-            stage != self._simplify_progress_stage or
-            error_text != self._simplify_error_text
-        )
-        if not changed:
-            return False
 
-        self._simplify_task_active = active
-        self._simplify_progress_value = progress_value
-        self._simplify_progress_stage = stage
-        self._simplify_error_text = error_text
-        self._dirty_model(
-            "simplify_can_apply",
-            "simplify_show_progress",
-            "simplify_progress_value",
-            "simplify_progress_pct",
-            "simplify_progress_stage",
-            "simplify_show_error",
-            "simplify_error_text",
-        )
-        return True
 
-    def _start_simplify(self):
-        if not self._can_run_simplify():
-            return
-        self._simplify_error_text = ""
-        self._dirty_model("simplify_show_error", "simplify_error_text")
-        lf.simplify_splats(
-            self._simplify_source_name,
-            ratio=self._compute_simplify_ratio(),
-            lod_base=self._compute_simplify_lod_base(),
-            opacity_prune_threshold=self._compute_simplify_opacity_prune_threshold(),
-        )
-        self._sync_simplify_task_state(force=True)
-
-    def _on_simplify_apply(self, _handle=None, _ev=None, _args=None):
-        self._start_simplify()
-
-    def _on_simplify_cancel(self, _handle=None, _ev=None, _args=None):
-        cancel = getattr(lf, "cancel_splat_simplify", None)
-        if cancel is not None:
-            cancel()
 
     def _on_chrom_change(self, handle, event, args):
         s = lf.get_render_settings()
         if not s or not event:
             return
+        self._chrom_edit_pending = True
         mapping = {
             "red_x": "ppisp_color_red_x",
             "red_y": "ppisp_color_red_y",
@@ -1539,6 +1397,12 @@ class RenderingPanel(Panel):
         for param_key, prop_name in mapping.items():
             val = event.get_parameter(param_key, "")
             if val:
-                setattr(s, prop_name, float(val))
+                s._set_without_session_dirty(prop_name, float(val))
         for prop_name in mapping.values():
             handle.dirty(prop_name)
+
+    def _confirm_apply_defaults(self, *_):
+        def refresh():
+            if self._handle:
+                self._handle.dirty_all()
+        confirm_apply_defaults(refresh)

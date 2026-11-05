@@ -21,8 +21,10 @@
 #include <exception>
 #include <expected>
 #include <format>
+#include <functional>
 #include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <source_location>
 #include <span>
 #include <string>
@@ -45,6 +47,15 @@ struct SDL_Window;
 
 namespace lfs::vis {
 
+    // Lets another API that must own the Vulkan objects (such as a headset
+    // runtime) create the instance and device. Unset hooks use plain Vulkan.
+    struct VulkanDeviceHooks {
+        std::function<VkResult(const VkInstanceCreateInfo&, VkInstance&)> create_instance;
+        // Init fails when the GPU chosen for rendering is not this device.
+        std::function<VkPhysicalDevice(VkInstance)> required_physical_device;
+        std::function<VkResult(VkPhysicalDevice, const VkDeviceCreateInfo&, VkDevice&)> create_device;
+    };
+
     class VulkanContext {
         friend struct VulkanContextTestAccess;
 
@@ -60,8 +71,17 @@ namespace lfs::vis {
         VulkanContext(const VulkanContext&) = delete;
         VulkanContext& operator=(const VulkanContext&) = delete;
 
-        bool init(SDL_Window* window, int framebuffer_width, int framebuffer_height);
-        void shutdown();
+        LFS_VIS_API bool init(SDL_Window* window, int framebuffer_width, int framebuffer_height,
+                              VulkanDeviceHooks hooks = {});
+        // Runs an external API call that may submit to the shared graphics queue.
+        template <class Operation>
+        decltype(auto) withGraphicsQueue(Operation&& operation) {
+            const std::shared_lock device_lock(device_queue_access_mutex_);
+            const std::lock_guard queue_lock(graphics_queue_mutex_);
+            return std::forward<Operation>(operation)();
+        }
+        void setSceneRuntimeOwnership(bool owns) { owns_scene_runtimes_ = owns; }
+        LFS_VIS_API void shutdown();
         void notifyFramebufferResized(int width, int height, ResizeIntent intent = ResizeIntent::Exact);
         [[nodiscard]] bool hasPendingSwapchainResize() const {
             if (rendererTerminalState() != RendererTerminalState::Running)
@@ -276,12 +296,24 @@ namespace lfs::vis {
         [[nodiscard]] LFS_VIS_API bool beginFrame(const VkClearValue& clear_value, Frame& frame);
         // Dynamic rendering must be closed while external-image layout barriers
         // are recorded. These helpers bracket that interop window.
-        [[nodiscard]] bool finishActiveRendering(VkCommandBuffer command_buffer);
-        [[nodiscard]] bool restartActiveRendering(VkCommandBuffer command_buffer,
-                                                  const Frame& frame);
+        [[nodiscard]] LFS_VIS_API bool finishActiveRendering(VkCommandBuffer command_buffer);
+        [[nodiscard]] LFS_VIS_API bool restartActiveRendering(VkCommandBuffer command_buffer,
+                                                              const Frame& frame);
         [[nodiscard]] LFS_VIS_API bool endFrame();
         [[nodiscard]] bool hasActiveFrame() const noexcept { return frame_active_; }
-        [[nodiscard]] LFS_VIS_API std::expected<WindowCapture, std::string> captureAndEndActiveFrameRgba();
+        void requestSceneCapture() noexcept {
+            scene_capture_requested_.store(true, std::memory_order_release);
+        }
+        void cancelSceneCaptureRequest() noexcept {
+            scene_capture_requested_.store(false, std::memory_order_release);
+        }
+        [[nodiscard]] bool sceneCaptureRequested() const noexcept {
+            return scene_capture_requested_.load(std::memory_order_acquire);
+        }
+        [[nodiscard]] LFS_VIS_API bool recordSceneCapture(VkCommandBuffer command_buffer,
+                                                          const Frame& frame);
+        [[nodiscard]] LFS_VIS_API std::expected<WindowCapture, std::string> captureAndEndActiveFrameRgba(
+            bool scene_before_overlays = false);
         [[nodiscard]] bool waitForNextFrameSlot();
         [[nodiscard]] bool waitForCurrentFrameSlot();
         [[nodiscard]] LFS_VIS_API bool waitForSubmittedFrames();
@@ -290,7 +322,7 @@ namespace lfs::vis {
         [[nodiscard]] std::uint64_t lastFrameSubmitSerial() const;
         // Serial of the most recent *successful* graphics frame vkQueueSubmit.
         // Used by interop layout-commit rollback when endFrame submit fails.
-        [[nodiscard]] std::uint64_t lastSuccessfulFrameSubmitSerial() const;
+        [[nodiscard]] LFS_VIS_API std::uint64_t lastSuccessfulFrameSubmitSerial() const;
         // Immediate vkQueueSubmit count for the current GUI frame (proof counter for #1575).
         // Accounting starts at resetImmediateSubmitsThisFrame (prepareFrame) and is logged
         // at endFrame; beginFrame must not clear it because prepare runs first.
@@ -312,13 +344,13 @@ namespace lfs::vis {
         // waitForSubmittedFrames (no extra locking).
         [[nodiscard]] bool waitForRetiredFrameSubmitSerial(std::uint64_t serial);
         [[nodiscard]] bool waitForImmediateSubmits();
-        [[nodiscard]] bool deviceWaitIdle();
+        [[nodiscard]] LFS_VIS_API bool deviceWaitIdle();
         // Returns false if the wait was rejected (frame inactive / invalid edge);
         // endFrame will refuse submit when any wait fails. A requested value that
         // is already covered by a queued or submitted wait on the same semaphore
         // is treated as already satisfied (success, no extra submit wait). Callers
         // that commit layout optimistically must not do so on false.
-        [[nodiscard]] bool addFrameTimelineWait(
+        [[nodiscard]] LFS_VIS_API bool addFrameTimelineWait(
             VkSemaphore semaphore,
             std::uint64_t value,
             VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
@@ -354,6 +386,7 @@ namespace lfs::vis {
                                          const lfs::core::ExportableBlock& block);
         [[nodiscard]] bool sparseBindingEnabled() const { return sparse_binding_enabled_; }
         [[nodiscard]] bool bufferDeviceAddressEnabled() const { return buffer_device_address_enabled_; }
+        [[nodiscard]] bool geometryShaderEnabled() const { return geometry_shader_enabled_; }
         [[nodiscard]] bool createExternalTimelineSemaphore(
             std::uint64_t initial_value,
             ExternalSemaphore& out,
@@ -476,12 +509,15 @@ namespace lfs::vis {
         VkInstance instance_ = VK_NULL_HANDLE;
         VkDebugUtilsMessengerEXT debug_messenger_ = VK_NULL_HANDLE;
         VkSurfaceKHR surface_ = VK_NULL_HANDLE;
+        bool owns_scene_runtimes_ = true;
+        bool transparent_surface_ = false;
         VkPhysicalDevice physical_device_ = VK_NULL_HANDLE;
         std::array<std::uint8_t, VK_UUID_SIZE> device_uuid_{};
         VkDevice device_ = VK_NULL_HANDLE;
         VmaAllocator allocator_ = VK_NULL_HANDLE;
         VkPipelineCache pipeline_cache_ = VK_NULL_HANDLE;
         std::mutex pipeline_cache_mutex_;
+        std::size_t saved_pipeline_cache_hash_ = 0;
         VkQueue graphics_queue_ = VK_NULL_HANDLE;
         VkQueue present_queue_ = VK_NULL_HANDLE;
         uint32_t graphics_queue_family_ = 0;
@@ -566,6 +602,14 @@ namespace lfs::vis {
         std::chrono::steady_clock::time_point framebuffer_resize_last_recreate_{};
         bool frame_active_ = false;
         bool frame_rendering_active_ = false;
+        std::atomic_bool scene_capture_requested_{false};
+        struct SceneCaptureStaging {
+            VkBuffer buffer = VK_NULL_HANDLE;
+            VmaAllocation allocation = VK_NULL_HANDLE;
+            VkExtent2D extent{};
+            std::uint32_t image_index = 0;
+        } scene_capture_staging_;
+        void destroySceneCaptureStaging();
         bool frame_suboptimal_ = false;
         // Phase 7B: owner quarantine latch (10 s policy) shared by the six UI waits.
         std::atomic<bool> gpu_wait_quarantined_{false};
@@ -586,7 +630,10 @@ namespace lfs::vis {
         bool external_memory_dedicated_allocation_enabled_ = false;
         bool sparse_binding_enabled_ = false;
         bool buffer_device_address_enabled_ = false;
+        bool geometry_shader_enabled_ = false;
         std::mutex graphics_queue_mutex_;
+        std::shared_mutex device_queue_access_mutex_;
+        VulkanDeviceHooks device_hooks_;
         bool swapchain_maintenance1_enabled_ = false;
         bool swapchain_present_scaling_enabled_ = false;
         bool has_push_descriptor_ = false;

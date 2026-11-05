@@ -13,12 +13,18 @@
  * - SSIM map masking (like legacy fused_ssim_map)
  */
 
+#include "core/camera.hpp"
+#include "core/logger.hpp"
 #include "core/parameters.hpp"
+#include "core/scene.hpp"
 #include "core/tensor.hpp"
 #include "lfs/kernels/ssim.cuh"
 #include "mask_loss_reference.hpp"
 #include "training/losses/mask_loss.hpp"
+#include "training/trainer.hpp"
+#include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <gtest/gtest.h>
 
 using namespace lfs::core;
@@ -635,4 +641,260 @@ TEST_F(MaskLossTest, PerPixelGradMapVsScalarGradient) {
     const float numel = static_cast<float>(rendered.numel());
     EXPECT_GT(ratio, numel * 0.5f);
     EXPECT_LT(ratio, numel * 2.0f);
+}
+
+namespace lfs::training {
+    struct TrainerMaskSupervisionTestAccess {
+        static auto loss(Trainer& trainer, const Tensor& image, const Tensor& target,
+                         const Tensor& mask, const param::OptimizationParameters& params,
+                         const Tensor& raw = {}, const Tensor& structure = {},
+                         const Tensor& alpha = {}, const Tensor& roi = {}) {
+            return trainer.compute_photometric_loss_with_mask(
+                image, target, mask, roi, alpha, params, raw, structure);
+        }
+
+        static auto report(Trainer& trainer, const Tensor& image, const Tensor& target,
+                           const Tensor& mask, const Tensor& region,
+                           const param::OptimizationParameters& params, const Tensor& raw,
+                           const Tensor& mask_regularization_loss = {}) {
+            return trainer.report_region_image_loss(
+                image, raw, target, mask, region, {}, params, 0, mask_regularization_loss);
+        }
+    };
+} // namespace lfs::training
+
+class TrainerMaskSupervisionTest : public ::testing::TestWithParam<int> {
+protected:
+    Scene scene;
+    std::unique_ptr<lfs::training::Trainer> trainer;
+    param::OptimizationParameters params;
+    Tensor image, target, raw;
+    std::vector<std::string> warnings;
+    LogHandlerToken handler{};
+
+    void SetUp() override {
+        const auto group = scene.addCameraGroup("Training", scene.addGroup("Cameras"), 1);
+        scene.addCamera("camera.png", group, std::make_shared<Camera>(Tensor::eye(3, Device::CPU), Tensor::zeros({3}, Device::CPU), 32.0f, 32.0f, 16.0f, 16.0f, Tensor{}, Tensor{}, CameraModelType::PINHOLE, "camera.png", std::filesystem::path{}, std::filesystem::path{}, 32, 32, 0));
+        trainer = std::make_unique<lfs::training::Trainer>(scene);
+        params.mask_mode = param::MaskMode::Ignore;
+        params.lambda_dssim = GetParam() == 0 ? 0.0f : 0.2f;
+        image = Tensor::full({3, 32, 32}, 0.4f, Device::CUDA);
+        target = Tensor::full({3, 32, 32}, 0.7f, Device::CUDA);
+        if (GetParam() == 2)
+            raw = image.clone();
+        handler = Logger::get().add_log_handler([this](LogLevel level, const auto&, std::string_view message) {
+            if (level == LogLevel::Warn && message.find("no photometric supervision") != std::string_view::npos)
+                warnings.emplace_back(message);
+        });
+    }
+    void TearDown() override {
+        Logger::get().remove_log_handler(handler);
+    }
+    auto loss(const Tensor& mask, const Tensor& structure = {}) {
+        return lfs::training::TrainerMaskSupervisionTestAccess::loss(
+            *trainer, image, target, mask, params, raw, structure);
+    }
+};
+
+TEST_P(TrainerMaskSupervisionTest, EmptyIgnoreMaskWarnsOnceAndKeepsZeroGradient) {
+    const auto mask = Tensor::zeros({32, 32}, Device::CUDA);
+    for (int i = 0; i < 3; ++i) {
+        const auto result = loss(mask);
+        ASSERT_TRUE(result);
+        EXPECT_EQ(result->loss.item<float>(), 0.0f);
+        EXPECT_EQ(result->grad_corrected.abs().max().item<float>(), 0.0f);
+    }
+    ASSERT_EQ(warnings.size(), 1u);
+    EXPECT_NE(warnings.front().find("threshold"), std::string::npos);
+    EXPECT_NE(warnings.front().find("inversion"), std::string::npos);
+}
+
+TEST_P(TrainerMaskSupervisionTest, EmptyIgnoreMaskWithStructureWeightWarns) {
+    params.thin_structure_weight = 2.0f;
+    ASSERT_TRUE(loss(Tensor::zeros({32, 32}, Device::CUDA), Tensor::ones({32, 32}, Device::CUDA)));
+    EXPECT_EQ(warnings.size(), 1u);
+}
+
+TEST_P(TrainerMaskSupervisionTest, UsableMasksKeepReferenceLossAndGradientWithoutWarning) {
+    for (const float coverage : {1.0f, 0.5f}) {
+        auto mask = Tensor::ones({32, 32}, Device::CUDA);
+        if (coverage < 1.0f)
+            mask.slice(0, 0, 16).fill_(0.0f);
+        Tensor reference_loss, reference_gradient;
+        // The unchanged kernel path is the reference for the trainer diagnostic.
+        lfs::training::kernels::MaskedFusedL1SSIMWorkspace fused;
+        lfs::training::kernels::MaskedDecoupledFusedL1SSIMWorkspace decoupled;
+        if (raw.is_valid()) {
+            auto [value, context] = lfs::training::kernels::masked_decoupled_fused_l1_ssim_forward(
+                image, raw, target, mask, params.lambda_dssim, decoupled);
+            reference_loss = value;
+            reference_gradient = lfs::training::kernels::masked_decoupled_fused_l1_ssim_backward(context, decoupled).grad_corrected;
+        } else {
+            auto [value, context] = lfs::training::kernels::masked_fused_l1_ssim_forward(
+                image, target, mask, params.lambda_dssim, fused);
+            reference_loss = value;
+            reference_gradient = lfs::training::kernels::masked_fused_l1_ssim_backward(context, fused);
+        }
+        const auto result = loss(mask);
+        ASSERT_TRUE(result);
+        EXPECT_EQ(result->loss.item<float>(), reference_loss.item<float>());
+        EXPECT_EQ(result->grad_corrected.cpu().to_vector(), reference_gradient.cpu().to_vector());
+    }
+    EXPECT_TRUE(warnings.empty());
+}
+
+TEST_P(TrainerMaskSupervisionTest, OtherModesAndMissingMasksDoNotWarn) {
+    const auto mask = Tensor::zeros({32, 32}, Device::CUDA);
+    ASSERT_TRUE(loss({}));
+    for (const auto mode : {param::MaskMode::None, param::MaskMode::Segment,
+                            param::MaskMode::SegmentAndIgnore, param::MaskMode::AlphaConsistent}) {
+        params.mask_mode = mode;
+        ASSERT_TRUE(loss(mask));
+    }
+    EXPECT_TRUE(warnings.empty());
+}
+
+TEST_P(TrainerMaskSupervisionTest, MixedEmptyAndUsableViewsRemainAccepted) {
+    ASSERT_TRUE(loss(Tensor::zeros({32, 32}, Device::CUDA)));
+    const auto result = loss(Tensor::ones({32, 32}, Device::CUDA));
+    ASSERT_TRUE(result);
+    EXPECT_GT(result->loss.item<float>(), 0.0f);
+    EXPECT_EQ(warnings.size(), 1u);
+}
+
+TEST_P(TrainerMaskSupervisionTest, MeasureWarmLossUpdates) {
+    if (!std::getenv("LFS_MASK_TIMING"))
+        GTEST_SKIP() << "Set LFS_MASK_TIMING for a locked before/after timing run";
+    const auto mask = Tensor::ones({32, 32}, Device::CUDA);
+    for (int i = 0; i < 100; ++i)
+        ASSERT_TRUE(loss(mask));
+    for (int repeat = 0; repeat < 5; ++repeat) {
+        const auto start = std::chrono::steady_clock::now();
+        for (int i = 0; i < 1000; ++i)
+            ASSERT_TRUE(loss(mask));
+        static_cast<void>(image.sum().item<float>());
+        const auto us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
+        std::cout << "mask_loss_update_us=" << us / 1000 << '\n';
+    }
+}
+
+INSTANTIATE_TEST_SUITE_P(LossBranches, TrainerMaskSupervisionTest, ::testing::Values(0, 1, 2));
+
+TEST_P(TrainerMaskSupervisionTest, FullRegionRetainsMaskPenaltiesWithoutChangingGradients) {
+    target = image.clone();
+    params.mask_opacity_penalty_weight = 10.0f;
+    params.mask_opacity_penalty_power = 2.0f;
+    const auto alpha = Tensor::full({32, 32}, 0.5f, Device::CUDA);
+    const auto region = Tensor::ones({32, 32}, Device::CUDA);
+    for (const auto mode : {param::MaskMode::Segment, param::MaskMode::SegmentAndIgnore,
+                            param::MaskMode::AlphaConsistent}) {
+        SCOPED_TRACE(static_cast<int>(mode));
+        params.mask_mode = mode;
+        auto mask = Tensor::ones({32, 32}, Device::CUDA);
+        if (mode != param::MaskMode::AlphaConsistent)
+            mask.slice(0, 16, 32).fill_(mode == param::MaskMode::Segment ? 0.0f : 0.75f);
+        const auto result = lfs::training::TrainerMaskSupervisionTestAccess::loss(
+            *trainer, image, target, mask, params, raw, {}, alpha, region);
+        ASSERT_TRUE(result);
+        ASSERT_TRUE(result->mask_regularization_loss.is_valid());
+        const float expected_penalty = mode == param::MaskMode::AlphaConsistent ? 5.0f : 2.5f;
+        EXPECT_NEAR(result->mask_regularization_loss.item<float>(), expected_penalty, 1e-6f);
+        const auto rgb_gradient = result->grad_corrected.clone();
+        const auto alpha_gradient = result->grad_alpha.clone();
+        EXPECT_GT(alpha_gradient.abs().max().item<float>(), 0.0f);
+        const auto report = lfs::training::TrainerMaskSupervisionTestAccess::report(
+            *trainer, image, target, mask, region, params, raw, result->mask_regularization_loss);
+        EXPECT_NEAR(report.item<float>(), result->loss.item<float>(), 1e-5f);
+        EXPECT_NEAR(report.item<float>(), expected_penalty, 1e-5f);
+        EXPECT_EQ(result->grad_corrected.cpu().to_vector(), rgb_gradient.cpu().to_vector());
+        EXPECT_EQ(result->grad_alpha.cpu().to_vector(), alpha_gradient.cpu().to_vector());
+    }
+}
+
+TEST_P(TrainerMaskSupervisionTest, PartialRegionRetainsTrainingWeightedMaskPenalty) {
+    params.mask_mode = param::MaskMode::Segment;
+    params.mask_opacity_penalty_weight = 10.0f;
+    params.mask_opacity_penalty_power = 2.0f;
+    const auto alpha = Tensor::full({32, 32}, 0.5f, Device::CUDA);
+    auto mask = Tensor::ones({32, 32}, Device::CUDA);
+    mask.slice(0, 16, 32).fill_(0.0f);
+    auto region = Tensor::ones({32, 32}, Device::CUDA);
+    region.slice(0, 16, 32).fill_(0.0f);
+    auto training_weight = Tensor::ones({32, 32}, Device::CUDA);
+    training_weight.slice(0, 16, 32).fill_(0.25f);
+    const auto result = lfs::training::TrainerMaskSupervisionTestAccess::loss(
+        *trainer, image, target, mask, params, raw, {}, alpha, training_weight);
+    ASSERT_TRUE(result);
+    EXPECT_NEAR(result->mask_regularization_loss.item<float>(), 0.625f, 1e-6f);
+    const auto image_only = lfs::training::TrainerMaskSupervisionTestAccess::report(
+        *trainer, image, target, mask, region, params, raw);
+    const float image_value = image_only.item<float>();
+    const auto report = lfs::training::TrainerMaskSupervisionTestAccess::report(
+        *trainer, image, target, mask, region, params, raw, result->mask_regularization_loss);
+    EXPECT_NEAR(report.item<float>(), image_value + 0.625f, 1e-5f);
+}
+
+TEST_P(TrainerMaskSupervisionTest, RegionReportWithoutMaskPenaltyKeepsImageLoss) {
+    const auto mask = Tensor::ones({32, 32}, Device::CUDA);
+    const auto region = Tensor::ones({32, 32}, Device::CUDA);
+    const auto result = loss(mask);
+    ASSERT_TRUE(result);
+    EXPECT_FALSE(result->mask_regularization_loss.is_valid());
+    const auto report = lfs::training::TrainerMaskSupervisionTestAccess::report(
+        *trainer, image, target, mask, region, params, raw, result->mask_regularization_loss);
+    EXPECT_NEAR(report.item<float>(), result->loss.item<float>(), 1e-5f);
+}
+
+TEST_P(TrainerMaskSupervisionTest, AlphaConsistencyWithoutTrainingRoiStillKeepsPenalty) {
+    params.mask_mode = param::MaskMode::AlphaConsistent;
+    target = image.clone();
+    const auto mask = Tensor::ones({32, 32}, Device::CUDA);
+    const auto alpha = Tensor::full({32, 32}, 0.5f, Device::CUDA);
+    const auto region = Tensor::ones({32, 32}, Device::CUDA);
+    // --cropbox-loss-weight 1 disables ROI weighting for training, but not ROI reporting.
+    const auto result = lfs::training::TrainerMaskSupervisionTestAccess::loss(
+        *trainer, image, target, mask, params, raw, {}, alpha);
+    ASSERT_TRUE(result);
+    ASSERT_TRUE(result->mask_regularization_loss.is_valid());
+    const auto report = lfs::training::TrainerMaskSupervisionTestAccess::report(
+        *trainer, image, target, mask, region, params, raw, result->mask_regularization_loss);
+    EXPECT_NEAR(report.item<float>(), 5.0f, 1e-5f);
+    EXPECT_NEAR(report.item<float>(), result->loss.item<float>(), 1e-5f);
+}
+
+// The crop box loss report evaluates the masked L1/D-SSIM forward-only. It must equal the
+// training forwards over the same pixels, plain and decoupled, with and without a fixed
+// denominator, and report a normalization below one pixel when no pixel counts, which is how
+// the trainer skips views that miss the box.
+TEST_F(MaskLossTest, ForwardOnlyMaskedValueMatchesTheTrainingForward) {
+    constexpr size_t C = 3, H = 48, W = 64;
+    const auto rendered = Tensor::rand({C, H, W}, Device::CUDA);
+    const auto raw = Tensor::rand({C, H, W}, Device::CUDA);
+    const auto target = Tensor::rand({C, H, W}, Device::CUDA);
+    const auto target_u8 = (target * 255.0f).to(DataType::UInt8);
+    const auto region = create_binary_mask(H, W, 0.3f);
+
+    for (const auto* gt : {&target, &target_u8}) {
+        for (const float denominator : {0.0f, 1234.5f}) {
+            SCOPED_TRACE(::testing::Message() << "u8=" << (gt == &target_u8) << " denominator=" << denominator);
+            lfs::training::kernels::MaskedFusedL1SSIMWorkspace training;
+            auto [training_loss, context] = lfs::training::kernels::masked_fused_l1_ssim_forward(
+                rendered, *gt, region, 0.2f, training, denominator);
+            lfs::training::kernels::MaskedL1SSIMValueWorkspace value;
+            lfs::training::kernels::masked_fused_l1_ssim_value(rendered, {}, *gt, region, 0.2f, value, denominator);
+            EXPECT_EQ(value.loss.cpu().item<float>(), training_loss.cpu().item<float>());
+            EXPECT_EQ(value.mask_sum.cpu().item<float>(), context.mask_sum_value);
+
+            lfs::training::kernels::MaskedDecoupledFusedL1SSIMWorkspace decoupled;
+            auto [decoupled_loss, decoupled_context] = lfs::training::kernels::masked_decoupled_fused_l1_ssim_forward(
+                rendered, raw, *gt, region, 0.2f, decoupled, denominator);
+            lfs::training::kernels::masked_fused_l1_ssim_value(rendered, raw, *gt, region, 0.2f, value, denominator);
+            EXPECT_EQ(value.loss.cpu().item<float>(), decoupled_loss.cpu().item<float>());
+        }
+    }
+
+    lfs::training::kernels::MaskedL1SSIMValueWorkspace empty;
+    lfs::training::kernels::masked_fused_l1_ssim_value(rendered, {}, target, Tensor::zeros({H, W}, Device::CUDA),
+                                                       0.2f, empty);
+    EXPECT_LT(empty.mask_sum.cpu().item<float>(), 1.0f);
 }

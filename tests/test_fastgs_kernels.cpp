@@ -12,6 +12,7 @@
 #include "io/formats/ply.hpp"
 #include "lfs/training/joint_adam_codec.hpp"
 #include "lfs/training/morton_reorder.hpp"
+#include "rasterization/fastgs/rasterization/include/backward.h"
 #include "rasterization/fastgs/rasterization/include/forward.h"
 #include "rasterization/fastgs/utils/utils.h"
 #include "training/kernels/normal_consistency_loss.hpp"
@@ -20,12 +21,14 @@
 #include "training/rasterization/fast_rasterizer.hpp"
 #include "training/strategies/mrnf.hpp"
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <cuda_runtime.h>
 #include <filesystem>
 #include <gtest/gtest.h>
+#include <iostream>
 #include <limits>
 #include <numeric>
 #include <random>
@@ -309,11 +312,314 @@ protected:
     Tensor means_, sh0_, shN_, scaling_, rotation_, opacity_, bg_;
 };
 
+namespace {
+    float joint_adam_comparison_step(const float a_min, const float a_max,
+                                     const float b_min, const float b_max, const float qmax) {
+        const float codec_step = std::max(std::abs(a_max - a_min), std::abs(b_max - b_min)) / qmax;
+        const float magnitude = std::max({std::abs(a_min), std::abs(a_max), std::abs(b_min), std::abs(b_max)});
+        // Narrow or constant codec ranges cannot resolve less than one stored float step.
+        const float float_step = std::nextafter(magnitude, std::numeric_limits<float>::infinity()) - magnitude;
+        return std::max(codec_step, float_step);
+    }
+
+    // One fixed visible splat keeps a comparison independent of other tests' random state.
+    std::unique_ptr<SplatData> make_comparison_splat() {
+        constexpr size_t n = 1;
+        auto rotation = Tensor::from_vector({1.0f, 0.2f, -0.3f, 0.1f}, {n, 4}, Device::CUDA);
+        return std::make_unique<SplatData>(
+            1, Tensor::from_vector({0.17f, -0.21f, 1.5f}, {n, 3}, Device::CUDA),
+            Tensor::from_vector({0.1f, 0.3f, 0.5f}, {n, 1, 3}, Device::CUDA),
+            Tensor::full({n, 3, 3}, 0.01f, Device::CUDA),
+            Tensor::from_vector({-2.0f, -2.3f, -2.6f}, {n, 3}, Device::CUDA),
+            rotation / rotation.pow(2.0f).sum(-1, true).sqrt(), Tensor::full({n}, 0.2f, Device::CUDA), 1.0f);
+    }
+
+    // Blend backward adds each warp's share of a splat gradient with a float atomic, so with
+    // many shaded pixels the summation order and rounding change between identical runs.
+    // One non-zero pixel leaves one contribution and makes repeated backward passes
+    // bit-identical. It sits on the splat flank, where position and shape gradients are large.
+    Tensor single_pixel_image_gradient(const RenderOutput& render) {
+        const auto alpha = render.alpha.to(Device::CPU).to_vector();
+        if (alpha.empty() || render.image.numel() != 3 * alpha.size())
+            throw std::runtime_error("Unexpected render layout");
+        const size_t peak = static_cast<size_t>(std::max_element(alpha.begin(), alpha.end()) - alpha.begin());
+        if (!(alpha[peak] > 0.0f))
+            throw std::runtime_error("The test splat covers no pixel");
+        const float half = 0.5f * alpha[peak];
+        size_t pixel = peak;
+        for (size_t i = 0; i < alpha.size(); ++i) {
+            if (std::abs(alpha[i] - half) < std::abs(alpha[pixel] - half))
+                pixel = i;
+        }
+        std::vector<float> gradient(render.image.numel(), 0.0f);
+        for (size_t channel = 0; channel < 3; ++channel)
+            gradient[channel * alpha.size() + pixel] = 1.0f;
+        return Tensor::from_vector(gradient, render.image.shape(), Device::CUDA);
+    }
+
+    // Allow five comparison steps for reduction-order roundoff. Stored float spacing
+    // bounds the effective precision when a codec range is narrow or constant.
+    void expect_joint_adam_state_equivalent(const AdamParamState& reference,
+                                            const AdamParamState& optimized) {
+        ASSERT_EQ(reference.joint_bits, optimized.joint_bits);
+        ASSERT_EQ(reference.exp_avg.shape(), optimized.exp_avg.shape());
+        ASSERT_EQ(reference.exp_avg.dtype(), optimized.exp_avg.dtype());
+        if (!reference.exp_avg.is_valid() || !optimized.exp_avg.is_valid()) {
+            EXPECT_EQ(reference.exp_avg.is_valid(), optimized.exp_avg.is_valid());
+            return;
+        }
+        if (reference.joint_bits == 0) {
+            auto a = reference.exp_avg.to(Device::CPU);
+            auto b = optimized.exp_avg.to(Device::CPU);
+            EXPECT_EQ(std::memcmp(a.data_ptr(), b.data_ptr(), a.numel() * dtype_size(a.dtype())), 0);
+            return;
+        }
+
+        const int bits = reference.joint_bits;
+        const float qmax = bits == 16 ? joint_adam::Codec16::kQMax : joint_adam::Codec8::kQMax;
+        auto ref_bounds = reference.joint_bounds.to(Device::CPU);
+        auto opt_bounds = optimized.joint_bounds.to(Device::CPU);
+        ASSERT_EQ(ref_bounds.numel(), opt_bounds.numel());
+        const float* rb = ref_bounds.ptr<float>();
+        const float* ob = opt_bounds.ptr<float>();
+        for (size_t i = 0; i < ref_bounds.numel(); ++i) {
+            const size_t axis = i % 4;
+            const size_t lo = (i / 4) * 4 + (axis < 2 ? 0 : 2);
+            const float step = joint_adam_comparison_step(rb[lo], rb[lo + 1], ob[lo], ob[lo + 1], qmax);
+            EXPECT_NEAR(rb[i], ob[i], std::max(5.0f * step, 1.0e-6f));
+        }
+
+        auto ref_packed = reference.exp_avg.to(Device::CPU);
+        auto opt_packed = optimized.exp_avg.to(Device::CPU);
+        const auto* ref_bytes = ref_packed.ptr<uint8_t>();
+        const auto* opt_bytes = opt_packed.ptr<uint8_t>();
+        const size_t bytes_per_cell = bits == 16 ? joint_adam::Codec16::kBytesPerCell
+                                                 : joint_adam::Codec8::kBytesPerCell;
+        const size_t cells = ref_packed.numel() / bytes_per_cell;
+        for (size_t cell = 0; cell < cells; ++cell) {
+            float ru = 0.0f, rs = 0.0f, ou = 0.0f, os = 0.0f;
+            float rm = 0.0f, rv = 0.0f, om = 0.0f, ov = 0.0f;
+            if (bits == 16) {
+                joint_adam::Codec16::decode_us(ref_bytes, cell, rb[0], rb[1], rb[2], rb[3], ru, rs);
+                joint_adam::Codec16::decode_us(opt_bytes, cell, ob[0], ob[1], ob[2], ob[3], ou, os);
+                joint_adam::Codec16::us_to_g1g2(ru, rs, rm, rv);
+                joint_adam::Codec16::us_to_g1g2(ou, os, om, ov);
+            } else {
+                joint_adam::Codec8::decode_us(ref_bytes, cell, rb[0], rb[1], rb[2], rb[3], ru, rs);
+                joint_adam::Codec8::decode_us(opt_bytes, cell, ob[0], ob[1], ob[2], ob[3], ou, os);
+                joint_adam::Codec8::us_to_g1g2(ru, rs, rm, rv);
+                joint_adam::Codec8::us_to_g1g2(ou, os, om, ov);
+            }
+            const float du = joint_adam_comparison_step(rb[0], rb[1], ob[0], ob[1], qmax) * 5.0f;
+            const float ds = joint_adam_comparison_step(rb[2], rb[3], ob[2], ob[3], qmax) * 5.0f;
+            const float sqrt_v = std::max(std::sqrt(std::max(rv, 0.0f)),
+                                          std::sqrt(std::max(ov, 0.0f)));
+            const float delta_sqrt_v = (sqrt_v + joint_adam::kEps) * ds;
+            const float abs_u = std::max(std::abs(ru), std::abs(ou));
+            const float m_tol = 2.0f * (du * (sqrt_v + joint_adam::kEps) +
+                                        abs_u * delta_sqrt_v + du * delta_sqrt_v);
+            const float v_tol = 2.0f * (2.0f * sqrt_v * delta_sqrt_v +
+                                        delta_sqrt_v * delta_sqrt_v);
+            EXPECT_NEAR(rm, om, std::max(m_tol, 1.0e-6f));
+            EXPECT_NEAR(rv, ov, std::max(v_tol, 1.0e-12f));
+        }
+    }
+
+    struct JointAdamStateDifference {
+        float max_bound_lsb = 0.0f;
+        float max_coordinate_lsb = 0.0f;
+        size_t different_packed_bytes = 0;
+        size_t packed_bytes = 0;
+    };
+
+    JointAdamStateDifference measure_joint_adam_state_difference(const AdamOptimizer& a,
+                                                                 const AdamOptimizer& b) {
+        JointAdamStateDifference result;
+        for (const auto type : {ParamType::Means, ParamType::Sh0, ParamType::ShN,
+                                ParamType::Scaling, ParamType::Rotation, ParamType::Opacity}) {
+            const auto* as = a.get_state(type);
+            const auto* bs = b.get_state(type);
+            if (!as || !bs || !as->exp_avg.is_valid() || !bs->exp_avg.is_valid())
+                continue;
+            if (as->joint_bits != bs->joint_bits || as->joint_bits == 0 ||
+                !as->joint_bounds.is_valid() || !bs->joint_bounds.is_valid()) {
+                throw std::runtime_error("Expected matching joint Adam codec states");
+            }
+
+            const int bits = as->joint_bits;
+            const float qmax = bits == 16 ? joint_adam::Codec16::kQMax : joint_adam::Codec8::kQMax;
+            const size_t bytes_per_cell = joint_adam::bytes_per_cell(bits);
+            auto ab = as->joint_bounds.to(Device::CPU);
+            auto bb = bs->joint_bounds.to(Device::CPU);
+            auto ap = as->exp_avg.to(Device::CPU);
+            auto bp = bs->exp_avg.to(Device::CPU);
+            if (ab.numel() != bb.numel() || ab.numel() % 4 != 0 ||
+                ap.numel() != bp.numel() || ap.numel() % bytes_per_cell != 0) {
+                throw std::runtime_error("Joint Adam state shapes differ");
+            }
+            const auto* av = ab.ptr<float>();
+            const auto* bv = bb.ptr<float>();
+            for (size_t i = 0; i < ab.numel(); ++i) {
+                const size_t axis = i % 4;
+                const size_t base = (i / 4) * 4;
+                const size_t lo = base + (axis < 2 ? 0 : 2);
+                const float step = joint_adam_comparison_step(av[lo], av[lo + 1], bv[lo], bv[lo + 1], qmax);
+                if (step > 0.0f)
+                    result.max_bound_lsb = std::max(result.max_bound_lsb, std::abs(av[i] - bv[i]) / step);
+            }
+
+            const auto* aptr = ap.ptr<uint8_t>();
+            const auto* bptr = bp.ptr<uint8_t>();
+            result.packed_bytes += ap.numel();
+            for (size_t i = 0; i < ap.numel(); ++i)
+                result.different_packed_bytes += aptr[i] != bptr[i];
+
+            const size_t cells = ap.numel() / bytes_per_cell;
+            for (size_t cell = 0; cell < cells; ++cell) {
+                const size_t bounds = 0; // The fixture has one primitive and one bounds block.
+                float au = 0.0f, ascale = 0.0f, bu = 0.0f, bscale = 0.0f;
+                if (bits == 16) {
+                    joint_adam::Codec16::decode_us(aptr, cell, av[bounds], av[bounds + 1], av[bounds + 2],
+                                                   av[bounds + 3], au, ascale);
+                    joint_adam::Codec16::decode_us(bptr, cell, bv[bounds], bv[bounds + 1], bv[bounds + 2],
+                                                   bv[bounds + 3], bu, bscale);
+                } else {
+                    joint_adam::Codec8::decode_us(aptr, cell, av[bounds], av[bounds + 1], av[bounds + 2],
+                                                  av[bounds + 3], au, ascale);
+                    joint_adam::Codec8::decode_us(bptr, cell, bv[bounds], bv[bounds + 1], bv[bounds + 2],
+                                                  bv[bounds + 3], bu, bscale);
+                }
+                const float ustep = joint_adam_comparison_step(
+                    av[bounds], av[bounds + 1], bv[bounds], bv[bounds + 1], qmax);
+                const float sstep = joint_adam_comparison_step(
+                    av[bounds + 2], av[bounds + 3], bv[bounds + 2], bv[bounds + 3], qmax);
+                if (ustep > 0.0f)
+                    result.max_coordinate_lsb = std::max(result.max_coordinate_lsb,
+                                                         std::abs(au - bu) / ustep);
+                if (sstep > 0.0f)
+                    result.max_coordinate_lsb = std::max(result.max_coordinate_lsb,
+                                                         std::abs(ascale - bscale) / sstep);
+            }
+        }
+        return result;
+    }
+} // namespace
+
+TEST(JointAdamComparisonTest, WideRangesRetainCodecStep) {
+    for (const float qmax : {255.0f, 65535.0f}) {
+        EXPECT_EQ(joint_adam_comparison_step(-2.0f, 3.0f, -1.0f, 4.0f, qmax), 5.0f / qmax);
+    }
+}
+
+TEST(JointAdamComparisonTest, NearlyConstantRangesUseFloatSpacing) {
+    const float first = 1.0f;
+    const float second = std::nextafter(first, 2.0f);
+    const float third = std::nextafter(second, 2.0f);
+    for (const float qmax : {255.0f, 65535.0f}) {
+        const float step = joint_adam_comparison_step(first, second, second, third, qmax);
+        EXPECT_EQ(step, second - first);
+        EXPECT_LE((third - first) / step, 2.0f);
+    }
+}
+
+TEST(JointAdamComparisonTest, ConstantRangesDoNotHideDrift) {
+    for (const float qmax : {255.0f, 65535.0f}) {
+        const float step = joint_adam_comparison_step(1.0f, 1.0f, 2.0f, 2.0f, qmax);
+        ASSERT_GT(step, 0.0f);
+        EXPECT_GT(1.0f / step, 5.0f);
+    }
+}
+
 // Forward kernels
 TEST_F(FastGSKernelTest, Forward_Preprocess) {
     auto r = forward();
     ASSERT_TRUE(r.has_value()) << lfs::format_for_developer(r.error());
     EXPECT_GT(r->second.forward_ctx.n_instances, 0);
+}
+
+TEST_F(FastGSKernelTest, OptimizerStateRunToRunDeterminismControl) {
+    struct Run {
+        std::unique_ptr<SplatData> model;
+        std::unique_ptr<AdamOptimizer> optimizer;
+    };
+    const size_t test_n = 1;
+    // Keep this control independent of other tests' random state. A spatially varying
+    // image gradient avoids cancellation of the position gradient under a uniform image sum.
+    auto test_means = Tensor::from_vector({0.17f, -0.21f, 1.5f}, {test_n, 3}, Device::CUDA);
+    auto test_sh0 = Tensor::from_vector({0.1f, 0.3f, 0.5f}, {test_n, 1, 3}, Device::CUDA);
+    auto test_scaling = Tensor::from_vector({-2.0f, -2.3f, -2.6f}, {test_n, 3}, Device::CUDA);
+    auto test_rotation = Tensor::from_vector({1.0f, 0.2f, -0.3f, 0.1f}, {test_n, 4}, Device::CUDA);
+    test_rotation = test_rotation / test_rotation.pow(2.0f).sum(-1, true).sqrt();
+    auto test_opacity = Tensor::full({test_n}, 0.2f, Device::CUDA);
+    auto sh_rest = Tensor::full({test_n, 3, 3}, 0.01f, Device::CUDA);
+    std::vector<float> gradient(3 * H * W);
+    for (int channel = 0; channel < 3; ++channel) {
+        for (int y = 0; y < H; ++y) {
+            for (int x = 0; x < W; ++x) {
+                const float u = static_cast<float>(x) / W;
+                const float v = static_cast<float>(y) / H;
+                gradient[(channel * H + y) * W + x] =
+                    0.25f + 0.1f * channel + u * u + 0.37f * u * v + 0.5f * v * v;
+            }
+        }
+    }
+    const auto grad = Tensor::from_vector(gradient, {3, H, W}, Device::CUDA);
+    auto run = [&](bool generic) {
+        Run result;
+        result.model = std::make_unique<SplatData>(1, test_means.clone(), test_sh0.clone(), sh_rest.clone(),
+                                                   test_scaling.clone(), test_rotation.clone(), test_opacity.clone(),
+                                                   1.0f);
+        AdamConfig cfg{.lr = 0.001f, .beta1 = 0.9, .beta2 = 0.999, .eps = 1e-15};
+        result.optimizer = std::make_unique<AdamOptimizer>(*result.model, cfg);
+        result.optimizer->allocate_gradients();
+        result.optimizer->zero_grad(0);
+        auto forward_result = fast_rasterize_forward(*camera_, *result.model, bg_, 0, 0, 0, 0, false);
+        if (!forward_result)
+            throw std::runtime_error("FastGS forward failed in optimizer-state determinism control");
+        fast_lfs::rasterization::set_force_generic_preprocess_for_testing(generic);
+        fast_rasterize_backward(forward_result->second, grad, *result.model, *result.optimizer,
+                                {}, {}, DensificationType::None, 1, {});
+        const auto sync_status = cudaDeviceSynchronize();
+        fast_lfs::rasterization::set_force_generic_preprocess_for_testing(false);
+        if (sync_status != cudaSuccess)
+            throw std::runtime_error(cudaGetErrorString(sync_status));
+        return result;
+    };
+
+    auto generic_a = run(true);
+    auto generic_b = run(true);
+    auto specialized_a = run(false);
+    auto specialized_b = run(false);
+    const auto generic_diff = measure_joint_adam_state_difference(*generic_a.optimizer, *generic_b.optimizer);
+    const auto specialized_diff = measure_joint_adam_state_difference(*specialized_a.optimizer,
+                                                                      *specialized_b.optimizer);
+    const auto cross_diff = measure_joint_adam_state_difference(*generic_a.optimizer, *specialized_a.optimizer);
+    std::cout << "Optimizer state variation (bound steps, decoded coordinate steps, packed bytes differing/total): "
+              << "generic=" << generic_diff.max_bound_lsb << "," << generic_diff.max_coordinate_lsb << ","
+              << generic_diff.different_packed_bytes << "/" << generic_diff.packed_bytes
+              << " specialized=" << specialized_diff.max_bound_lsb << ","
+              << specialized_diff.max_coordinate_lsb << "," << specialized_diff.different_packed_bytes << "/"
+              << specialized_diff.packed_bytes << " cross=" << cross_diff.max_bound_lsb << ","
+              << cross_diff.max_coordinate_lsb << "," << cross_diff.different_packed_bytes << "/"
+              << cross_diff.packed_bytes << "\n";
+    EXPECT_LE(generic_diff.max_bound_lsb, 5.0f);
+    EXPECT_LE(generic_diff.max_coordinate_lsb, 5.0f);
+    EXPECT_LE(specialized_diff.max_bound_lsb, 5.0f);
+    EXPECT_LE(specialized_diff.max_coordinate_lsb, 5.0f);
+    for (const auto type : {ParamType::Means, ParamType::Sh0, ParamType::ShN,
+                            ParamType::Scaling, ParamType::Rotation, ParamType::Opacity}) {
+        const auto* ga = generic_a.optimizer->get_state(type);
+        const auto* gb = generic_b.optimizer->get_state(type);
+        const auto* sa = specialized_a.optimizer->get_state(type);
+        const auto* sb = specialized_b.optimizer->get_state(type);
+        ASSERT_NE(ga, nullptr);
+        ASSERT_NE(gb, nullptr);
+        ASSERT_NE(sa, nullptr);
+        ASSERT_NE(sb, nullptr);
+        SCOPED_TRACE(static_cast<int>(type));
+        expect_joint_adam_state_equivalent(*ga, *gb);
+        expect_joint_adam_state_equivalent(*sa, *sb);
+    }
 }
 
 TEST_F(FastGSKernelTest, Forward_TileDepthOrdering) {
@@ -372,6 +678,243 @@ TEST_F(FastGSKernelTest, Backward_Blend) {
     EXPECT_GT(adam_moment(*opt, ParamType::Scaling).pow(2.0f).sum().item<float>(), 0.0f);
 }
 
+TEST_F(FastGSKernelTest, DisabledSeptemberFeaturesMatchGenericBackwardNumerically) {
+    // A single splat and a single-pixel image gradient keep float atomics out of the comparison.
+    auto reference_model = make_comparison_splat();
+    auto specialized_model = make_comparison_splat();
+    AdamConfig cfg{.lr = 0.001f, .beta1 = 0.9, .beta2 = 0.999, .eps = 1e-15};
+    AdamOptimizer reference_opt(*reference_model, cfg);
+    AdamOptimizer specialized_opt(*specialized_model, cfg);
+    reference_opt.allocate_gradients();
+    specialized_opt.allocate_gradients();
+    reference_opt.zero_grad(0);
+    specialized_opt.zero_grad(0);
+
+    auto reference_forward = fast_rasterize_forward(*camera_, *reference_model, bg_, 0, 0, 0, 0, false);
+    ASSERT_TRUE(reference_forward.has_value());
+
+    Tensor ref_scale_loss = Tensor::zeros({1}, Device::CUDA);
+    Tensor ref_opacity_loss = Tensor::zeros({1}, Device::CUDA);
+    Tensor fast_scale_loss = Tensor::zeros({1}, Device::CUDA);
+    Tensor fast_opacity_loss = Tensor::zeros({1}, Device::CUDA);
+    FastGSFusedExtraGradients ref_extra, fast_extra;
+    ref_extra.scale_reg_weight = fast_extra.scale_reg_weight = 0.01f;
+    ref_extra.scale_reg_loss_out = ref_scale_loss.ptr<float>();
+    fast_extra.scale_reg_loss_out = fast_scale_loss.ptr<float>();
+    ref_extra.opacity_reg_weight = fast_extra.opacity_reg_weight = 0.01f;
+    ref_extra.opacity_reg_loss_out = ref_opacity_loss.ptr<float>();
+    fast_extra.opacity_reg_loss_out = fast_opacity_loss.ptr<float>();
+    const auto grad_ref = single_pixel_image_gradient(reference_forward->first);
+
+    fast_lfs::rasterization::set_force_generic_preprocess_for_testing(true);
+    fast_rasterize_backward(reference_forward->second, grad_ref, *reference_model, reference_opt,
+                            {}, {}, DensificationType::None, 1, ref_extra);
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    auto specialized_forward = fast_rasterize_forward(*camera_, *specialized_model, bg_, 0, 0, 0, 0, false);
+    ASSERT_TRUE(specialized_forward.has_value());
+    const auto grad_fast = single_pixel_image_gradient(specialized_forward->first);
+    fast_lfs::rasterization::set_force_generic_preprocess_for_testing(false);
+    fast_rasterize_backward(specialized_forward->second, grad_fast, *specialized_model, specialized_opt,
+                            {}, {}, DensificationType::None, 1, fast_extra);
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+    auto exact_tensor_equal = [](const Tensor& a, const Tensor& b) {
+        if (a.is_valid() != b.is_valid())
+            return false;
+        if (!a.is_valid())
+            return true;
+        if (a.shape() != b.shape() || a.dtype() != b.dtype())
+            return false;
+        auto ac = a.to(Device::CPU);
+        auto bc = b.to(Device::CPU);
+        return std::memcmp(ac.data_ptr(), bc.data_ptr(), a.numel() * dtype_size(a.dtype())) == 0;
+    };
+    EXPECT_TRUE(exact_tensor_equal(reference_forward->first.image, specialized_forward->first.image));
+    EXPECT_TRUE(exact_tensor_equal(reference_forward->first.alpha, specialized_forward->first.alpha));
+    for (const auto type : {ParamType::Means, ParamType::Sh0, ParamType::ShN,
+                            ParamType::Scaling, ParamType::Rotation, ParamType::Opacity}) {
+        SCOPED_TRACE(static_cast<int>(type));
+        const Tensor* reference_params = nullptr;
+        const Tensor* specialized_params = nullptr;
+        switch (type) {
+        case ParamType::Means:
+            reference_params = &reference_model->means();
+            specialized_params = &specialized_model->means();
+            break;
+        case ParamType::Sh0:
+            reference_params = &reference_model->sh0();
+            specialized_params = &specialized_model->sh0();
+            break;
+        case ParamType::ShN:
+            reference_params = &reference_model->shN();
+            specialized_params = &specialized_model->shN();
+            break;
+        case ParamType::Scaling:
+            reference_params = &reference_model->scaling_raw();
+            specialized_params = &specialized_model->scaling_raw();
+            break;
+        case ParamType::Rotation:
+            reference_params = &reference_model->rotation_raw();
+            specialized_params = &specialized_model->rotation_raw();
+            break;
+        case ParamType::Opacity:
+            reference_params = &reference_model->opacity_raw();
+            specialized_params = &specialized_model->opacity_raw();
+            break;
+        }
+        EXPECT_TRUE(exact_tensor_equal(*reference_params, *specialized_params)) << "parameter values differ";
+        const auto* rs = reference_opt.get_state(type);
+        const auto* ss = specialized_opt.get_state(type);
+        ASSERT_NE(rs, nullptr);
+        ASSERT_NE(ss, nullptr);
+        EXPECT_EQ(rs->step_count, ss->step_count);
+        EXPECT_TRUE(exact_tensor_equal(rs->grad, ss->grad)) << "gradients differ";
+        expect_joint_adam_state_equivalent(*rs, *ss);
+    }
+    EXPECT_TRUE(exact_tensor_equal(ref_scale_loss, fast_scale_loss));
+    EXPECT_TRUE(exact_tensor_equal(ref_opacity_loss, fast_opacity_loss));
+}
+
+TEST_F(FastGSKernelTest, DisabledSeptemberFeaturesBackwardIsFasterThanGenericReference) {
+    auto opt = make_optimizer();
+    constexpr int kSamples = 9;
+    std::array<double, kSamples> generic_ms{}, specialized_ms{};
+    cudaEvent_t start{}, stop{};
+    ASSERT_EQ(cudaEventCreate(&start), cudaSuccess);
+    ASSERT_EQ(cudaEventCreate(&stop), cudaSuccess);
+    for (int i = 0; i < kSamples; ++i) {
+        auto measure = [&](const bool generic) {
+            opt->zero_grad(i + 1);
+            auto r = forward();
+            EXPECT_TRUE(r.has_value());
+            if (!r.has_value())
+                return 0.0;
+            auto grad = Tensor::ones_like(r->first.image);
+            fast_lfs::rasterization::set_force_generic_preprocess_for_testing(generic);
+            EXPECT_EQ(cudaEventRecord(start), cudaSuccess);
+            fast_rasterize_backward(r->second, grad, *splat_, *opt, {}, {}, DensificationType::None, i + 1);
+            EXPECT_EQ(cudaEventRecord(stop), cudaSuccess);
+            EXPECT_EQ(cudaEventSynchronize(stop), cudaSuccess);
+            float elapsed = 0.0f;
+            EXPECT_EQ(cudaEventElapsedTime(&elapsed, start, stop), cudaSuccess);
+            return static_cast<double>(elapsed);
+        };
+        generic_ms[i] = measure(true);
+        specialized_ms[i] = measure(false);
+    }
+    fast_lfs::rasterization::set_force_generic_preprocess_for_testing(false);
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+    std::sort(generic_ms.begin(), generic_ms.end());
+    std::sort(specialized_ms.begin(), specialized_ms.end());
+    const double improvement =
+        (1.0 - specialized_ms[kSamples / 2] / generic_ms[kSamples / 2]) * 100.0;
+    std::cout << "Disabled-feature backward median: generic=" << generic_ms[kSamples / 2] * 1000.0
+              << " us, specialized=" << specialized_ms[kSamples / 2] * 1000.0
+              << " us, improvement=" << improvement << "%\n";
+    EXPECT_LT(specialized_ms[kSamples / 2], generic_ms[kSamples / 2] * 0.98)
+        << "generic median=" << generic_ms[kSamples / 2]
+        << " ms, specialized median=" << specialized_ms[kSamples / 2] << " ms";
+}
+
+TEST_F(FastGSKernelTest, MrnfEnabledSeptemberFeaturesMatchGenericBackwardNumerically) {
+    constexpr size_t test_n = 1;
+    auto reference_model = make_comparison_splat();
+    auto specialized_model = make_comparison_splat();
+    AdamConfig cfg{.lr = 0.001f, .beta1 = 0.9, .beta2 = 0.999, .eps = 1e-15};
+    AdamOptimizer reference_opt(*reference_model, cfg);
+    AdamOptimizer specialized_opt(*specialized_model, cfg);
+    reference_opt.allocate_gradients();
+    specialized_opt.allocate_gradients();
+    reference_opt.zero_grad(0);
+    specialized_opt.zero_grad(0);
+    auto far_mask = Tensor::ones({test_n}, Device::CUDA, DataType::Bool);
+    reference_opt.set_per_splat_mean_step(true, 0.5f);
+    specialized_opt.set_per_splat_mean_step(true, 0.5f);
+    reference_opt.set_mean_step_far_mask(far_mask.clone());
+    specialized_opt.set_mean_step_far_mask(far_mask.clone());
+    auto reference_forward = fast_rasterize_forward(*camera_, *reference_model, bg_, 0, 0, 0, 0, false);
+    ASSERT_TRUE(reference_forward.has_value());
+
+    Tensor ref_scale_loss = Tensor::zeros({1}, Device::CUDA);
+    Tensor ref_opacity_loss = Tensor::zeros({1}, Device::CUDA);
+    Tensor ref_erank_loss = Tensor::zeros({1}, Device::CUDA);
+    Tensor ref_dc_loss = Tensor::zeros({1}, Device::CUDA);
+    Tensor ref_sh_rest_loss = Tensor::zeros({1}, Device::CUDA);
+    Tensor fast_scale_loss = Tensor::zeros({1}, Device::CUDA);
+    Tensor fast_opacity_loss = Tensor::zeros({1}, Device::CUDA);
+    Tensor fast_erank_loss = Tensor::zeros({1}, Device::CUDA);
+    Tensor fast_dc_loss = Tensor::zeros({1}, Device::CUDA);
+    Tensor fast_sh_rest_loss = Tensor::zeros({1}, Device::CUDA);
+    Tensor ref_rendered_count = Tensor::zeros({test_n}, Device::CUDA);
+    Tensor fast_rendered_count = Tensor::zeros({test_n}, Device::CUDA);
+    FastGSFusedExtraGradients ref_extra, fast_extra;
+    ref_extra.scale_reg_weight = fast_extra.scale_reg_weight = 0.01f;
+    ref_extra.scale_reg_log = fast_extra.scale_reg_log = true;
+    ref_extra.scale_reg_loss_out = ref_scale_loss.ptr<float>();
+    fast_extra.scale_reg_loss_out = fast_scale_loss.ptr<float>();
+    ref_extra.opacity_reg_weight = fast_extra.opacity_reg_weight = 0.01f;
+    ref_extra.opacity_reg_loss_out = ref_opacity_loss.ptr<float>();
+    fast_extra.opacity_reg_loss_out = fast_opacity_loss.ptr<float>();
+    ref_extra.erank_reg_weight = fast_extra.erank_reg_weight = 0.001f;
+    ref_extra.erank_reg_loss_out = ref_erank_loss.ptr<float>();
+    fast_extra.erank_reg_loss_out = fast_erank_loss.ptr<float>();
+    ref_extra.dc_reg_weight = fast_extra.dc_reg_weight = 0.001f;
+    ref_extra.dc_reg_loss_out = ref_dc_loss.ptr<float>();
+    fast_extra.dc_reg_loss_out = fast_dc_loss.ptr<float>();
+    ref_extra.sh_rest_reg_weight = fast_extra.sh_rest_reg_weight = 0.001f;
+    ref_extra.sh_rest_reg_loss_out = ref_sh_rest_loss.ptr<float>();
+    fast_extra.sh_rest_reg_loss_out = fast_sh_rest_loss.ptr<float>();
+    ref_extra.flatten_reg_weight = fast_extra.flatten_reg_weight = 0.001f;
+    ref_extra.rendered_count = ref_rendered_count.ptr<float>();
+    fast_extra.rendered_count = fast_rendered_count.ptr<float>();
+
+    fast_lfs::rasterization::set_force_generic_preprocess_for_testing(true);
+    fast_rasterize_backward(reference_forward->second, single_pixel_image_gradient(reference_forward->first),
+                            *reference_model, reference_opt, {}, {}, DensificationType::None, 1, ref_extra);
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    auto specialized_forward = fast_rasterize_forward(*camera_, *specialized_model, bg_, 0, 0, 0, 0, false);
+    ASSERT_TRUE(specialized_forward.has_value());
+    fast_lfs::rasterization::set_force_generic_preprocess_for_testing(false);
+    fast_rasterize_backward(specialized_forward->second, single_pixel_image_gradient(specialized_forward->first),
+                            *specialized_model, specialized_opt, {}, {}, DensificationType::None, 1, fast_extra);
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+    auto exact_tensor_equal = [](const Tensor& a, const Tensor& b) {
+        if (a.is_valid() != b.is_valid())
+            return false;
+        if (!a.is_valid())
+            return true;
+        if (a.shape() != b.shape() || a.dtype() != b.dtype())
+            return false;
+        auto ac = a.to(Device::CPU);
+        auto bc = b.to(Device::CPU);
+        return std::memcmp(ac.data_ptr(), bc.data_ptr(), a.numel() * dtype_size(a.dtype())) == 0;
+    };
+    EXPECT_TRUE(exact_tensor_equal(reference_forward->first.image, specialized_forward->first.image));
+    EXPECT_TRUE(exact_tensor_equal(reference_forward->first.alpha, specialized_forward->first.alpha));
+    for (const auto type : {ParamType::Means, ParamType::Sh0, ParamType::ShN,
+                            ParamType::Scaling, ParamType::Rotation, ParamType::Opacity}) {
+        const auto* rs = reference_opt.get_state(type);
+        const auto* ss = specialized_opt.get_state(type);
+        ASSERT_NE(rs, nullptr);
+        ASSERT_NE(ss, nullptr);
+        EXPECT_EQ(rs->step_count, ss->step_count);
+        EXPECT_TRUE(exact_tensor_equal(rs->grad, ss->grad));
+        expect_joint_adam_state_equivalent(*rs, *ss);
+    }
+    EXPECT_TRUE(exact_tensor_equal(reference_model->means(), specialized_model->means()));
+    EXPECT_TRUE(exact_tensor_equal(reference_model->scaling_raw(), specialized_model->scaling_raw()));
+    EXPECT_TRUE(exact_tensor_equal(reference_model->sh0(), specialized_model->sh0()));
+    EXPECT_TRUE(exact_tensor_equal(reference_model->shN(), specialized_model->shN()));
+    EXPECT_TRUE(exact_tensor_equal(ref_scale_loss, fast_scale_loss));
+    EXPECT_TRUE(exact_tensor_equal(ref_opacity_loss, fast_opacity_loss));
+    EXPECT_TRUE(exact_tensor_equal(ref_erank_loss, fast_erank_loss));
+    EXPECT_TRUE(exact_tensor_equal(ref_dc_loss, fast_dc_loss));
+    EXPECT_TRUE(exact_tensor_equal(ref_sh_rest_loss, fast_sh_rest_loss));
+    EXPECT_TRUE(exact_tensor_equal(ref_rendered_count, fast_rendered_count));
+}
+
 TEST_F(FastGSKernelTest, EdgeWeightedContributionUsesFloatMapInMainBackward) {
     auto r = forward();
     ASSERT_TRUE(r.has_value()) << lfs::format_for_developer(r.error());
@@ -405,6 +948,96 @@ TEST_F(FastGSKernelTest, EdgeWeightedContributionUsesFloatMapInMainBackward) {
     EXPECT_GT(actual_total_contribution, 0.0f);
     EXPECT_NEAR(actual_total_contribution, expected_total_contribution,
                 std::max(1.0e-3f, expected_total_contribution * 1.0e-4f));
+}
+
+TEST(FastGSImpactTest, RemovalImpactMatchesTwoSplatComposite) {
+    if (!torch::cuda::is_available()) {
+        GTEST_SKIP() << "CUDA not available";
+    }
+
+    constexpr int width = 64, height = 48;
+    constexpr float sh_c0 = 0.28209479177387814f;
+    auto R = Tensor::eye(3, Device::CUDA);
+    std::vector<float> t_data{0.0f, 0.0f, 4.0f};
+    auto T = Tensor::from_blob(t_data.data(), {3}, Device::CPU, DataType::Float32).to(Device::CUDA);
+    auto camera = Camera(R, T, 60.0f, 60.0f, width / 2.0f, height / 2.0f,
+                         Tensor(), Tensor(), CameraModelType::PINHOLE,
+                         "impact", "", std::filesystem::path{}, width, height, 0);
+    auto bg = Tensor::full({3}, 0.5f, Device::CUDA);
+
+    const auto make_model = [&](const std::array<float, 3>& front_color, const bool include_back) {
+        const size_t n = include_back ? 2u : 1u;
+        std::vector<float> means{0.0f, 0.0f, 0.0f};
+        std::vector<float> scales(3 * n, -1.6f);
+        std::vector<float> rotations(4 * n, 0.0f);
+        std::vector<float> opacities{
+            std::log(0.95f / 0.05f)};
+        std::vector<float> sh0{
+            (front_color[0] - 0.5f) / sh_c0,
+            (front_color[1] - 0.5f) / sh_c0,
+            (front_color[2] - 0.5f) / sh_c0};
+        rotations[0] = 1.0f;
+        if (include_back) {
+            means.insert(means.end(), {0.0f, 0.0f, 0.5f});
+            opacities.push_back(std::log(0.8f / 0.2f));
+            sh0.insert(sh0.end(), {0.0f, 0.0f, 0.0f});
+            rotations[4] = 1.0f;
+        }
+        return std::make_unique<SplatData>(
+            0,
+            Tensor::from_blob(means.data(), {n, size_t{3}}, Device::CPU, DataType::Float32).to(Device::CUDA),
+            Tensor::from_blob(sh0.data(), {n, size_t{1}, size_t{3}}, Device::CPU, DataType::Float32).to(Device::CUDA),
+            Tensor::zeros({n, size_t{0}, size_t{3}}, Device::CUDA),
+            Tensor::from_blob(scales.data(), {n, size_t{3}}, Device::CPU, DataType::Float32).to(Device::CUDA),
+            Tensor::from_blob(rotations.data(), {n, size_t{4}}, Device::CPU, DataType::Float32).to(Device::CUDA),
+            Tensor::from_blob(opacities.data(), {n}, Device::CPU, DataType::Float32).to(Device::CUDA),
+            1.0f);
+    };
+
+    const std::array<float, 3> different{0.9f, 0.1f, 0.5f};
+    auto solo = make_model(different, false);
+    auto solo_forward = fast_rasterize_forward(camera, *solo, bg, 0, 0, 0, 0, false);
+    ASSERT_TRUE(solo_forward.has_value()) << lfs::format_for_developer(solo_forward.error());
+    const auto front_alpha = solo_forward->first.alpha.clone();
+    solo_forward->second.release_forward_context();
+
+    const auto measure = [&](const std::array<float, 3>& front_color) {
+        auto model = make_model(front_color, true);
+        auto forward = fast_rasterize_forward(camera, *model, bg, 0, 0, 0, 0, false);
+        EXPECT_TRUE(forward.has_value());
+        if (!forward.has_value())
+            return std::pair{std::vector<float>{}, std::vector<float>{}};
+        AdamConfig cfg{.lr = 0.001f, .beta1 = 0.9, .beta2 = 0.999, .eps = 1e-15};
+        AdamOptimizer opt(*model, cfg);
+        opt.allocate_gradients();
+        opt.zero_grad(0);
+        auto impact_sum = Tensor::zeros({size_t{2}}, Device::CUDA, DataType::Float32);
+        auto impact_peak = Tensor::zeros({size_t{2}}, Device::CUDA, DataType::Float32);
+        FastGSFusedExtraGradients fused;
+        fused.impact_sum_out = impact_sum.ptr<float>();
+        fused.impact_peak_out = impact_peak.ptr<float>();
+        fast_rasterize_backward(forward->second, Tensor::zeros_like(forward->first.image), *model, opt,
+                                {}, {}, DensificationType::None, 1, fused);
+        EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+        return std::pair{impact_sum.cpu().to_vector(), impact_peak.cpu().to_vector()};
+    };
+
+    const auto [different_sum, different_peak] = measure(different);
+    ASSERT_EQ(different_sum.size(), 2u);
+    ASSERT_EQ(different_peak.size(), 2u);
+    constexpr float color_l1 = 0.8f;
+    const float expected_sum = front_alpha.sum().item<float>() * color_l1;
+    const float expected_peak = front_alpha.max().item<float>() * color_l1;
+    EXPECT_NEAR(different_sum[0], expected_sum, std::max(1.0e-4f, expected_sum * 2.0e-4f));
+    EXPECT_NEAR(different_peak[0], expected_peak, 1.0e-4f);
+    EXPECT_NEAR(different_sum[1], 0.0f, 1.0e-5f);
+    EXPECT_NEAR(different_peak[1], 0.0f, 1.0e-6f);
+
+    const auto [same_sum, same_peak] = measure({0.5f, 0.5f, 0.5f});
+    ASSERT_EQ(same_sum.size(), 2u);
+    ASSERT_EQ(same_peak.size(), 2u);
+    EXPECT_NEAR(same_sum[0], 0.0f, 1.0e-5f);
+    EXPECT_NEAR(same_peak[0], 0.0f, 1.0e-6f);
 }
 
 TEST(FastGSDepthGradientTest, BackwardDepthMatchesLibtorchAutogradForCenteredSplat) {
@@ -874,6 +1507,75 @@ TEST(FastGSNormalChannelTest, BackwardNormalRotationGradientMatchesFiniteDiffere
         grad_normal);
 
     const auto rotation_grad = recovered_fused_grad(opt, ParamType::Rotation).to(Device::CPU);
+    const float* actual = rotation_grad.ptr<float>();
+
+    // The splat sits exactly on the pixel center, so the blend weight has zero
+    // derivative w.r.t. rotation there and central differences through the full
+    // forward isolate exactly the detached-weight value path the kernel emits.
+    const float h = 2.0e-2f;
+    for (int c = 0; c < 4; ++c) {
+        std::vector<float> plus = base_quat;
+        std::vector<float> minus = base_quat;
+        plus[c] += h;
+        minus[c] -= h;
+        const float expected = (render_loss(plus) - render_loss(minus)) / (2.0f * h);
+        EXPECT_NEAR(actual[c], expected, std::max(2.0e-3f, std::abs(expected) * 2.0e-2f))
+            << "rotation gradient mismatch for quaternion component " << c;
+    }
+}
+
+TEST(FastGSNormalChannelTest, DeferredNormalRotationGradientMatchesFiniteDifferences) {
+    if (!torch::cuda::is_available()) {
+        GTEST_SKIP() << "CUDA not available";
+    }
+
+    NormalChannelScene scene;
+    // Generic quaternion away from symmetry; keeps the smallest-axis column
+    // pointed toward the camera so the orientation sign stays fixed.
+    const std::vector<float> base_quat{0.95f, 0.15f, -0.1f, 0.05f};
+    const std::vector<float> upstream{0.7f, -0.4f, 1.1f};
+    auto camera = scene.make_camera();
+    auto bg = Tensor::zeros({3}, Device::CUDA);
+
+    const auto render_loss = [&](const std::vector<float>& quat) {
+        auto splat = scene.make_splat(quat);
+        auto forward = fast_rasterize_forward(camera, splat, bg, 0, 0, 0, 0, false, Tensor{}, true);
+        if (!forward.has_value()) {
+            throw lfs::Exception(std::move(forward.error()));
+        }
+        const auto normal_cpu = forward->first.normal.to(Device::CPU);
+        const float* n = normal_cpu.ptr<float>();
+        const float loss = upstream[0] * n[0] + upstream[1] * n[1] + upstream[2] * n[2];
+        forward->second.release_forward_context();
+        return loss;
+    };
+
+    auto splat = scene.make_splat(base_quat);
+    auto forward = fast_rasterize_forward(camera, splat, bg, 0, 0, 0, 0, false, Tensor{}, true);
+    ASSERT_TRUE(forward.has_value()) << lfs::format_for_developer(forward.error());
+
+    AdamConfig cfg{.lr = 0.001f, .beta1 = 0.9, .beta2 = 0.999, .eps = 1e-15};
+    AdamOptimizer opt(splat, cfg);
+    opt.allocate_gradients();
+    opt.zero_grad(0);
+
+    std::vector<float> upstream_data = upstream;
+    auto grad_image = Tensor::zeros_like(forward->first.image);
+    auto grad_normal = Tensor::from_blob(upstream_data.data(), {3, 1, 1}, Device::CPU, DataType::Float32).to(Device::CUDA);
+    fast_rasterize_backward(
+        forward->second,
+        grad_image,
+        splat,
+        opt,
+        {},
+        {},
+        DensificationType::None,
+        1,
+        {},
+        {},
+        grad_normal, true);
+
+    const auto rotation_grad = opt.get_grad(ParamType::Rotation).to(Device::CPU);
     const float* actual = rotation_grad.ptr<float>();
 
     // The splat sits exactly on the pixel center, so the blend weight has zero
@@ -2358,9 +3060,9 @@ TEST(NormalLossRegression, Morton50kFourReordersJointAllParameters) {
             for (size_t i = 0; i < n; ++i)
                 std::swap(orig[3 * i], orig[3 * i + 1]);
         }
-        auto result = morton::apply_morton_reorder(splat, &opt);
+        auto result = morton::apply_morton_reorder(
+            splat, &opt, nullptr, [&](const morton::RowVisitor& visit) { strategy.for_each_gaussian_row(visit); });
         ASSERT_TRUE(result.applied);
-        strategy.permute_gaussian_rows(result.permutation);
         auto p = result.permutation.cpu();
         auto previous = order;
         for (size_t i = 0; i < n; ++i)
@@ -2474,8 +3176,6 @@ TEST(FastGSFusedAdamSettingsTest, CarriesPerSplatMeanStepAndFarMask) {
     settings.means.n_primitives = 4;
     settings.per_splat_mean_step = true;
     settings.mean_step_median_extent = 0.25f;
-    settings.mean_step_r_min = 1.5f;
-    settings.mean_step_r_max = 42.0f;
     settings.mean_step_far_mask = mask;
     settings.mean_step_far_mask_n = 4;
 
@@ -2486,8 +3186,6 @@ TEST(FastGSFusedAdamSettingsTest, CarriesPerSplatMeanStepAndFarMask) {
     EXPECT_EQ(fused.mean_step_far_mask, mask);
     EXPECT_EQ(fused.mean_step_far_mask_n, 4);
     EXPECT_FLOAT_EQ(fused.mean_step_median_extent, 0.25f);
-    EXPECT_FLOAT_EQ(fused.mean_step_r_min, 1.5f);
-    EXPECT_FLOAT_EQ(fused.mean_step_r_max, 42.0f);
 }
 
 TEST(FastGSFusedAdamSettingsTest, BoundsFarMaskCountToLiveRows) {
@@ -2650,14 +3348,13 @@ TEST(ScreenShareAdamHingeTest, HingeDoesNotInflateSecondMoment) {
                 entry.bias_correction2_sqrt_rcp = bc2;
                 fast_lfs::optimizer::adam_step_joint_contiguous_batched(
                     &entry, 1, nullptr, 0, 1.0f, nullptr, 0, 1.0f,
-                    beta1, beta2, eps, nullptr, nullptr, 0, 0.0f, 1.0f, 300.0f,
+                    beta1, beta2, eps, nullptr, nullptr, 0, 0.0f,
                     nullptr, 0, screen_share.ptr<float>(), 1, limit, penalty);
             } else {
                 fast_lfs::optimizer::adam_step_joint_contiguous_raw(
                     param.ptr<float>(), packed.ptr<std::uint8_t>(), bounds.ptr<float>(), grad.ptr<float>(),
                     nullptr, 0, 1.0f, nullptr, 0, 1.0f, 1, 1, 16, lr,
                     beta1, beta2, eps, bc1, bc2, nullptr,
-                    nullptr, 0, 0.0f, 1.0f, 300.0f, nullptr, 0,
                     screen_share.ptr<float>(), 1, limit, penalty);
             }
         }
@@ -2782,6 +3479,105 @@ TEST(JointAdamUpdates, ZeroHistoryStaysFixedInOrdinaryAndFusedAllGroups) {
                 }
             }
             EXPECT_GT(history_travel, 0.0) << "Zero gradient must still decay real momentum";
+        }
+    }
+}
+
+TEST(FastGSTouchedGating, OccludedRowsKeepStatisticsRegularizersAndOptimizerHistory) {
+    struct Restore {
+        const bool touched = fast_lfs::rasterization::touched_gating_for_testing();
+        ~Restore() { fast_lfs::rasterization::set_touched_gating_for_testing(touched); }
+    } restore;
+    constexpr size_t count = 259;
+    const auto run = [&](bool gated, bool mip) {
+        fast_lfs::rasterization::set_touched_gating_for_testing(gated);
+        auto model = make_adam_test_splat(count, 3);
+        AdamOptimizer optimizer(model, AdamConfig{});
+        optimizer.allocate_gradients();
+        for (auto type : AdamOptimizer::all_param_types())
+            optimizer.get_grad(type).fill_(0.1f);
+        optimizer.step(1000);
+        auto frozen = Tensor::zeros_bool({count}, Device::CPU);
+        auto cropped = Tensor::zeros_bool({count}, Device::CPU);
+        frozen.ptr<bool>()[63] = true;
+        cropped.ptr<bool>()[64] = true;
+        optimizer.set_frozen_mask(frozen.cuda());
+        optimizer.set_frozen_lr_scale(0.25f);
+        optimizer.set_crop_damping_mask(cropped.cuda());
+        optimizer.set_cropbox_lr_scale(0.3f);
+        model.scaling_raw().fill_(2.0f);
+        model.opacity_raw().fill_(12.0f);
+        auto means = model.means().cpu();
+        for (size_t i = 0; i < count; ++i) {
+            means.ptr<float>()[3 * i] = i == count - 1 ? 10000.0f : 0.0f;
+            means.ptr<float>()[3 * i + 1] = 0.0f;
+            means.ptr<float>()[3 * i + 2] = 0.001f * i;
+        }
+        model.means() = means.cuda();
+        model._densification_info = Tensor::zeros({2, count}, Device::CUDA);
+        auto rendered = Tensor::zeros({count}, Device::CUDA);
+        auto losses = Tensor::zeros({5}, Device::CUDA);
+        FastGSFusedExtraGradients extra;
+        extra.scale_reg_weight = 0.01f;
+        extra.opacity_reg_weight = 0.01f;
+        extra.erank_reg_weight = 0.01f;
+        extra.dc_reg_weight = 0.01f;
+        extra.sh_rest_reg_weight = 0.01f;
+        extra.flatten_reg_weight = 0.01f;
+        extra.rendered_count = rendered.ptr<float>();
+        extra.scale_reg_loss_out = losses.ptr<float>();
+        extra.opacity_reg_loss_out = losses.ptr<float>() + 1;
+        extra.erank_reg_loss_out = losses.ptr<float>() + 2;
+        extra.dc_reg_loss_out = losses.ptr<float>() + 3;
+        extra.sh_rest_reg_loss_out = losses.ptr<float>() + 4;
+        Camera camera(Tensor::eye(3, Device::CUDA),
+                      Tensor::from_vector(std::vector<float>{0, 0, 4}, {3}, Device::CUDA),
+                      8.0f, 8.0f, 0.5f, 0.5f, {}, {}, CameraModelType::PINHOLE,
+                      "touched", "", {}, 1, 1, 0);
+        auto background = Tensor::full({3}, 0.17f, Device::CUDA);
+        auto forward = fast_rasterize_forward(camera, model, background,
+                                              0, 0, 0, 0, mip, {}, true, true);
+        if (!forward)
+            throw lfs::Exception(std::move(forward.error()));
+        const auto& raw = forward->second.forward_ctx;
+        EXPECT_EQ(raw.primitive_touched != nullptr, gated);
+        const auto touched_rows = raw.primitive_touched;
+        const auto visible = raw.n_visible;
+        optimizer.zero_grad(1001);
+        fast_rasterize_backward(forward->second, Tensor::full_like(forward->first.image, 0.01f),
+                                model, optimizer, Tensor::full_like(forward->first.alpha, 0.02f), {},
+                                DensificationType::None, 1001, extra,
+                                Tensor::full_like(forward->first.depth, 0.03f), Tensor::full_like(forward->first.normal, 0.04f));
+        if (gated) {
+            // The backward walk marks the rows it reaches; occluded rows stay clear.
+            std::vector<unsigned> touched(visible);
+            EXPECT_EQ(cudaMemcpy(touched.data(), touched_rows, touched.size() * sizeof(unsigned), cudaMemcpyDeviceToHost), cudaSuccess);
+            const auto touched_count = std::count(touched.begin(), touched.end(), 1u);
+            EXPECT_GT(touched_count, 0);
+            EXPECT_LT(touched_count, visible / 2);
+        }
+        std::vector<Tensor> result;
+        for (const auto* parameter : {&model.means(), &model.scaling_raw(), &model.rotation_raw(),
+                                      &model.opacity_raw(), &model.sh0(), &model.shN()})
+            result.push_back(parameter->cpu());
+        for (auto type : AdamOptimizer::all_param_types()) {
+            const auto* state = optimizer.get_state(type);
+            result.push_back(state->exp_avg.cpu());
+            result.push_back(state->joint_bounds.cpu());
+        }
+        result.push_back(model._densification_info.cpu());
+        result.push_back(rendered.cpu());
+        result.push_back(losses.cpu());
+        return result;
+    };
+    for (bool mip : {false, true}) {
+        const auto reference = run(false, mip);
+        const auto candidate = run(true, mip);
+        ASSERT_EQ(reference.size(), candidate.size());
+        for (size_t i = 0; i < reference.size(); ++i) {
+            SCOPED_TRACE(::testing::Message() << "mip=" << mip << " buffer=" << i);
+            ASSERT_EQ(reference[i].bytes(), candidate[i].bytes());
+            EXPECT_EQ(std::memcmp(reference[i].data_ptr(), candidate[i].data_ptr(), reference[i].bytes()), 0);
         }
     }
 }

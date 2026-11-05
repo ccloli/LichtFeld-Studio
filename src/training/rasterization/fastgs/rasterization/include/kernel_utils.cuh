@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include "core/cuda/sigmoid.cuh"
 #include "core/sh_value_codec.cuh"
 #include "fused_adam_types.h"
 #include "helper_math.h"
@@ -293,16 +294,31 @@ namespace fast_lfs::rasterization::kernels {
             const float x = direction.x;
             const float y = direction.y;
             const float z = direction.z;
-            float3 c[15];
-            load_shN_coeffs(sh_coefficients_rest, primitive_idx, active_sh_bases, sh_layout_slots, c,
-                            sh_value_bounds, sh_value_n_cells, sh_value_bits);
-            result = result + (-0.48860251190291987f * y) * c[0] + (0.48860251190291987f * z) * c[1] + (-0.48860251190291987f * x) * c[2];
+            auto coefficient = [&]<int Index>() {
+                return load_shN_coeff<Index>(sh_coefficients_rest, primitive_idx, sh_layout_slots,
+                                             sh_value_bounds, sh_value_n_cells, sh_value_bits);
+            };
+            // Consume each decoded coefficient before loading the next one.
+            // Keep the addition order and the existing storage-specific decoders.
+            result = result + (-0.48860251190291987f * y) * coefficient.template operator()<0>();
+            result = result + (0.48860251190291987f * z) * coefficient.template operator()<1>();
+            result = result + (-0.48860251190291987f * x) * coefficient.template operator()<2>();
             if (active_sh_bases > 4) {
                 const float xx = x * x, yy = y * y, zz = z * z;
                 const float xy = x * y, xz = x * z, yz = y * z;
-                result = result + (1.0925484305920792f * xy) * c[3] + (-1.0925484305920792f * yz) * c[4] + (0.94617469575755997f * zz - 0.31539156525251999f) * c[5] + (-1.0925484305920792f * xz) * c[6] + (0.54627421529603959f * xx - 0.54627421529603959f * yy) * c[7];
+                result = result + (1.0925484305920792f * xy) * coefficient.template operator()<3>();
+                result = result + (-1.0925484305920792f * yz) * coefficient.template operator()<4>();
+                result = result + (0.94617469575755997f * zz - 0.31539156525251999f) * coefficient.template operator()<5>();
+                result = result + (-1.0925484305920792f * xz) * coefficient.template operator()<6>();
+                result = result + (0.54627421529603959f * xx - 0.54627421529603959f * yy) * coefficient.template operator()<7>();
                 if (active_sh_bases > 9) {
-                    result = result + (0.59004358992664352f * y * (-3.0f * xx + yy)) * c[8] + (2.8906114426405538f * xy * z) * c[9] + (0.45704579946446572f * y * (1.0f - 5.0f * zz)) * c[10] + (0.3731763325901154f * z * (5.0f * zz - 3.0f)) * c[11] + (0.45704579946446572f * x * (1.0f - 5.0f * zz)) * c[12] + (1.4453057213202769f * z * (xx - yy)) * c[13] + (0.59004358992664352f * x * (-xx + 3.0f * yy)) * c[14];
+                    result = result + (0.59004358992664352f * y * (-3.0f * xx + yy)) * coefficient.template operator()<8>();
+                    result = result + (2.8906114426405538f * xy * z) * coefficient.template operator()<9>();
+                    result = result + (0.45704579946446572f * y * (1.0f - 5.0f * zz)) * coefficient.template operator()<10>();
+                    result = result + (0.3731763325901154f * z * (5.0f * zz - 3.0f)) * coefficient.template operator()<11>();
+                    result = result + (0.45704579946446572f * x * (1.0f - 5.0f * zz)) * coefficient.template operator()<12>();
+                    result = result + (1.4453057213202769f * z * (xx - yy)) * coefficient.template operator()<13>();
+                    result = result + (0.59004358992664352f * x * (-xx + 3.0f * yy)) * coefficient.template operator()<14>();
                 }
             }
         }
@@ -453,6 +469,13 @@ namespace fast_lfs::rasterization::kernels {
         const float beta1,
         const float beta2,
         const float eps) {
+        if (param.gradient_out != nullptr) {
+            if (primitive_idx < static_cast<uint>(param.n_primitives)) {
+                for (uint i = 0; i < row_elements; ++i)
+                    param.gradient_out[primitive_idx * row_elements + i] += grads[i];
+            }
+            return;
+        }
         if (param.joint_bits == 16) {
             adam_step_row_joint<16>(grads, param, primitive_idx, row_elements, beta1, beta2, eps);
             return;
@@ -468,12 +491,21 @@ namespace fast_lfs::rasterization::kernels {
         return 1.0f / (1.0f + expf(-x));
     }
 
+    template <bool RUNTIME_LOG_SCALE = true>
     __device__ inline float scale_regularization_grad(
         const FusedAdamSettings& fused_adam,
         const FusedAdamParam& param,
         const uint element_idx) {
         if (fused_adam.scale_reg_weight <= 0.0f || param.n_elements <= 0)
             return 0.0f;
+        if constexpr (RUNTIME_LOG_SCALE) {
+            if (fused_adam.scale_reg_log) {
+                if (param.param[element_idx] <= -40.0f)
+                    return 0.0f;
+                return fused_adam.scale_reg_weight * 0.01f /
+                       (static_cast<float>(param.n_elements) * fused_adam.scale_reg_normalizer);
+            }
+        }
         return fused_adam.scale_reg_weight * expf(param.param[element_idx]) /
                static_cast<float>(param.n_elements);
     }
@@ -505,19 +537,9 @@ namespace fast_lfs::rasterization::kernels {
         const uint element_idx) {
         float grad = 0.0f;
         if (fused_adam.opacity_reg_weight > 0.0f && param.n_elements > 0) {
-            const float opa = sigmoid(param.param[element_idx]);
-            grad += fused_adam.opacity_reg_weight * opa * (1.0f - opa) /
+            const float derivative = lfs::core::sigmoid_derivative_from_logit(param.param[element_idx]);
+            grad += fused_adam.opacity_reg_weight * derivative /
                     static_cast<float>(param.n_elements);
-        }
-        if (fused_adam.sparsity_opa_sigmoid != nullptr &&
-            fused_adam.sparsity_z != nullptr &&
-            fused_adam.sparsity_u != nullptr &&
-            element_idx < static_cast<uint>(fused_adam.sparsity_n)) {
-            const float opa = fused_adam.sparsity_opa_sigmoid[element_idx];
-            grad += fused_adam.sparsity_rho *
-                    (opa - fused_adam.sparsity_z[element_idx] + fused_adam.sparsity_u[element_idx]) *
-                    opa * (1.0f - opa) *
-                    fused_adam.sparsity_grad_loss;
         }
         return grad;
     }
@@ -795,6 +817,26 @@ namespace fast_lfs::rasterization::kernels {
         }
     };
 
+    // L2 pull of one shN-rest coefficient toward zero: adds its gradient to grad (unless the
+    // colour gate blocks the channel) and returns its loss term.
+    template <int ACTIVE_SH_BASES>
+    __device__ __forceinline__ float add_sh_rest_regularization(
+        const FusedAdamSettings& fused_adam,
+        const int n_primitives,
+        const uint cell_lin,
+        const uint colour_reg_mask,
+        const float value,
+        float& grad) {
+        constexpr uint kCoefficientCount = (ACTIVE_SH_BASES - 1u) * 3u;
+        if (fused_adam.sh_rest_reg_weight <= 0.0f || cell_lin >= kCoefficientCount || n_primitives <= 0)
+            return 0.0f;
+        const float reg_scale = fused_adam.sh_rest_reg_weight /
+                                (static_cast<float>(n_primitives) * static_cast<float>(kCoefficientCount));
+        if (colour_reg_mask & (1u << (cell_lin % 3u)))
+            grad += 2.0f * reg_scale * value;
+        return reg_scale * value * value;
+    }
+
     // Joint 8-bit shN Adam (swizzled float cells × 2 B). ALL threads must call when joint.
     // Walks ALL layout slots (not only active SH) so inactive bands re-encode under new
     // bounds and stay true-zero when their codes represent (u,log_s)=(0,0).
@@ -811,12 +853,13 @@ namespace fast_lfs::rasterization::kernels {
     // GradSource(primitive_idx, k, slot, active_slot) -> float4 cell grads. The fused
     // path reconstructs from color; the standalone path loads a swizzled buffer.
     // blockIdx.x is the 256-splat joint-bounds row (256 threads per block).
-    template <int ACTIVE_SH_BASES, typename GradSource>
+    template <int ACTIVE_SH_BASES, bool SEPT_REGULARIZERS = true, typename GradSource>
     __device__ inline void apply_shN_grads_packed_joint(
         const FusedAdamSettings& fused_adam,
         const uint primitive_idx,
         const uint sh_layout_slots,
-        GradSource grad_source) {
+        GradSource grad_source,
+        const uint colour_reg_mask = 7u) {
         using C = lfs::training::joint_adam::DeviceCodec<8>;
         using VC = lfs::core::sh_value::DeviceCodec16;
         constexpr float kInf = 1e30f;
@@ -870,6 +913,7 @@ namespace fast_lfs::rasterization::kernels {
         float local_u_min = kInf, local_u_max = -kInf;
         float local_s_min = kInf, local_s_max = -kInf;
         float local_v_min = kInf, local_v_max = -kInf;
+        float local_sh_rest_loss = 0.0f;
 
         constexpr uint N_SLOTS = (ACTIVE_SH_BASES > 9) ? 12u : (ACTIVE_SH_BASES > 4) ? 6u
                                                                                      : 3u;
@@ -889,10 +933,13 @@ namespace fast_lfs::rasterization::kernels {
                     float pci = (c == 0) ? pc.x : (c == 1) ? pc.y
                                               : (c == 2)   ? pc.z
                                                            : pc.w;
-                    const float gci = (c == 0) ? gk.x : (c == 1) ? gk.y
-                                                    : (c == 2)   ? gk.z
-                                                                 : gk.w;
+                    float gci = (c == 0) ? gk.x : (c == 1) ? gk.y
+                                              : (c == 2)   ? gk.z
+                                                           : gk.w;
                     const int64_t cell = static_cast<int64_t>(slot) * 4 + c;
+                    if constexpr (SEPT_REGULARIZERS && ACTIVE_SH_BASES > 1)
+                        local_sh_rest_loss += add_sh_rest_regularization<ACTIVE_SH_BASES>(
+                            fused_adam, p.n_primitives, k * 4u + static_cast<uint>(c), colour_reg_mask, pci, gci);
                     const float2 prim = shN_adam_moment_us<C>(
                         gci, cell, p.joint_packed, old_mm, apply_step, active_slot,
                         beta1, beta2, row_step_size, eps, p.bias_correction2_sqrt_rcp, pci);
@@ -988,10 +1035,14 @@ namespace fast_lfs::rasterization::kernels {
                     float pci = (c == 0) ? pc.x : (c == 1) ? pc.y
                                               : (c == 2)   ? pc.z
                                                            : pc.w;
-                    const float gci = (c == 0) ? gk.x : (c == 1) ? gk.y
-                                                    : (c == 2)   ? gk.z
-                                                                 : gk.w;
+                    float gci = (c == 0) ? gk.x : (c == 1) ? gk.y
+                                              : (c == 2)   ? gk.z
+                                                           : gk.w;
                     const int64_t cell = static_cast<int64_t>(slot) * 4 + c;
+                    // The first pass accumulated the loss; this pass re-encodes the regularized moments.
+                    if constexpr (SEPT_REGULARIZERS && ACTIVE_SH_BASES > 1)
+                        add_sh_rest_regularization<ACTIVE_SH_BASES>(
+                            fused_adam, p.n_primitives, k * 4u + static_cast<uint>(c), colour_reg_mask, pci, gci);
                     const float2 prim = shN_adam_moment_us<C>(
                         gci, cell, p.joint_packed, old_mm, apply_step, active_slot,
                         beta1, beta2, row_step_size, eps, p.bias_correction2_sqrt_rcp, pci);
@@ -1010,12 +1061,21 @@ namespace fast_lfs::rasterization::kernels {
                 }
             }
         }
+
+        // Every thread reaches this reduction, including overhang and masked
+        // rows. This leaves at most one global scalar update per block.
+        if constexpr (SEPT_REGULARIZERS)
+            if (fused_adam.sh_rest_reg_loss_out != nullptr) {
+                const float block_sum = lfs::core::warp_ops::block_reduce_sum(local_sh_rest_loss);
+                if (threadIdx.x == 0 && block_sum != 0.0f)
+                    atomicAdd(fused_adam.sh_rest_reg_loss_out, block_sum);
+            }
     }
 
     // Joint (u, log_s) Adam step over swizzled shN moments of one primitive.
     // Slot count is derived from ACTIVE_SH_BASES. All threads must call
     // when joint_bits==8 (block bounds).
-    template <int ACTIVE_SH_BASES>
+    template <int ACTIVE_SH_BASES, bool SEPT_REGULARIZERS = true>
     __device__ inline void apply_shN_grads_packed(
         const FusedAdamSettings& fused_adam,
         const uint primitive_idx,
@@ -1023,13 +1083,28 @@ namespace fast_lfs::rasterization::kernels {
         const float3 mean3d,
         const float3 cam_position,
         const float3 grad_color,
-        const bool compute_sh_grads) {
+        const bool compute_sh_grads,
+        const uint colour_reg_mask = 7u) {
         const FusedAdamParam& p = fused_adam.shN;
+        if (p.gradient_out != nullptr) {
+            if (primitive_idx < static_cast<uint>(p.n_primitives)) {
+                constexpr uint n_slots = (ACTIVE_SH_BASES > 9) ? 12u : (ACTIVE_SH_BASES > 4) ? 6u
+                                                                                             : 3u;
+                const ShNGradFromColor<ACTIVE_SH_BASES> source(mean3d, cam_position, grad_color, compute_sh_grads);
+                auto* out = reinterpret_cast<float4*>(p.gradient_out);
+                for (uint k = 0; k < sh_layout_slots; ++k) {
+                    const uint slot = shAt(primitive_idx, k, sh_layout_slots);
+                    out[slot] += source(primitive_idx, k, slot, k < n_slots);
+                }
+            }
+            return;
+        }
         if (p.joint_bits == 8) {
-            apply_shN_grads_packed_joint<ACTIVE_SH_BASES>(
+            apply_shN_grads_packed_joint<ACTIVE_SH_BASES, SEPT_REGULARIZERS>(
                 fused_adam, primitive_idx, sh_layout_slots,
                 ShNGradFromColor<ACTIVE_SH_BASES>(
-                    mean3d, cam_position, grad_color, compute_sh_grads));
+                    mean3d, cam_position, grad_color, compute_sh_grads),
+                colour_reg_mask);
         }
         // Non-joint state is unsupported (joint is the only codec).
     }

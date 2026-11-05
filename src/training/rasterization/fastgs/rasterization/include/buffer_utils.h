@@ -22,7 +22,9 @@
 
 namespace fast_lfs::rasterization {
 
-    using InstanceKey = std::uint32_t;
+    using InstanceKey = std::uint64_t;
+    // Tile index above the raw IEEE bits of the (positive) view depth.
+    inline constexpr int kInstanceDepthBits = 32;
 
     enum FastGSForwardStatusFlags : unsigned int {
         kFastGSForwardStatusTileIndexOutOfRange = 1u << 0,
@@ -224,15 +226,9 @@ namespace fast_lfs::rasterization {
         return 32 - leading_zeros;
     }
 
-    inline int packed_instance_depth_bits(uint n_tiles) {
-        const int tile_bits = n_tiles <= 1 ? 0 : extract_end_bit(n_tiles - 1);
-        const int depth_bits = 32 - tile_bits;
-        return depth_bits > 23 ? 23 : (depth_bits < 0 ? 0 : depth_bits);
-    }
-
     inline int packed_instance_key_end_bit(uint n_tiles) {
         const int tile_bits = n_tiles <= 1 ? 0 : extract_end_bit(n_tiles - 1);
-        return tile_bits + packed_instance_depth_bits(n_tiles);
+        return tile_bits + kInstanceDepthBits;
     }
 
     struct mat3x3 {
@@ -322,6 +318,11 @@ namespace fast_lfs::rasterization {
             const size_t aligned = align_allocation_size(size);
             LFS_ASSERT_MSG(aligned <= cursor_, "FastGS retained prefix exceeds the phase high-water");
             if (size > 0 && source != base_) {
+                const auto source_address = reinterpret_cast<std::uintptr_t>(source);
+                const auto destination_address = reinterpret_cast<std::uintptr_t>(base_);
+                LFS_ASSERT_MSG(source_address >= destination_address &&
+                                   source_address - destination_address >= size,
+                               "FastGS retained prefix overlaps its source");
                 LFS_CUDA_CHECK_MSG(
                     cudaMemcpyAsync(base_, source, size, cudaMemcpyDeviceToDevice, stream_),
                     "cudaMemcpyAsync(FastGS retained sorted indices)");
@@ -393,15 +394,15 @@ namespace fast_lfs::rasterization {
     };
 
     // The visibility mask and its block scan are forward-only.  The original
-    // order map and compact IDs remain persistent because backward consumes
-    // both.  Keeping the map avoids a rank/popcount walk in the full-N
-    // backward preprocess.
+    // order map remains persistent because backward consumes it.  Keeping the
+    // map avoids a rank/popcount walk in the full-N backward preprocess.  The
+    // compact IDs are sized to the visible count once the scan knows it.
     struct VisibilityBuffers {
         uint* visibility_mask;
         uint* block_counts;
         uint* block_offsets;
         uint* primitive_work_indices;
-        uint* visible_indices;
+        uint* visible_indices = nullptr;
         char* cub_workspace;
         size_t cub_workspace_size;
 
@@ -415,7 +416,6 @@ namespace fast_lfs::rasterization {
             obtain(blob, buffers.block_counts, n_blocks, 128);
             obtain(blob, buffers.block_offsets, n_blocks, 128);
             obtain(blob, buffers.primitive_work_indices, n_primitives, 128);
-            obtain(blob, buffers.visible_indices, n_primitives, 128);
             LFS_CUDA_CHECK_MSG(
                 cub::DeviceScan::InclusiveSum(
                     nullptr, buffers.cub_workspace_size,
@@ -437,6 +437,16 @@ namespace fast_lfs::rasterization {
     };
     static_assert(sizeof(PackedMeanBBox) == 16, "PackedMeanBBox must be 128-bit");
 
+    // Projected attributes consumed together by blend and scoring kernels.
+    // Each field is one aligned 128-bit load; optional depth and normals stay separate.
+    struct alignas(16) ProjectedRecord {
+        PackedMeanBBox geometry;
+        float4 conic_opacity;
+        float4 color;
+    };
+    static_assert(sizeof(ProjectedRecord) == 48);
+    static_assert(alignof(ProjectedRecord) == 16);
+
     struct PerPrimitiveBuffers {
         size_t cub_workspace_size;
         char* cub_workspace;
@@ -445,17 +455,13 @@ namespace fast_lfs::rasterization {
         std::uint64_t* n_touched_tiles;
         std::uint64_t* offset;
         ushort4* screen_bounds;
-        PackedMeanBBox* mean2d;
-        float4* conic_opacity;
-        float4* color; // float3 padded to float4 for 128-bit shared/global loads
+        ProjectedRecord* projected;
         FastGSForwardStatus* forward_status;
 
         static PerPrimitiveBuffers from_persistent_blob(char*& blob, int n_visible) {
             PerPrimitiveBuffers buffers{};
             obtain(blob, buffers.depths, n_visible, 128);
-            obtain(blob, buffers.mean2d, n_visible, 128);
-            obtain(blob, buffers.conic_opacity, n_visible, 128);
-            obtain(blob, buffers.color, n_visible, 128);
+            obtain(blob, buffers.projected, n_visible, 128);
             obtain(blob, buffers.forward_status, 1, 128);
             return buffers;
         }

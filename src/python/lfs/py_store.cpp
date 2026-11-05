@@ -274,6 +274,7 @@ namespace lfs::python {
             state["outcome"] = value.outcome;
             state["format"] = value.format;
             state["error"] = value.error;
+            state["warning"] = value.warning;
             state["path"] = value.path;
             return state;
         }
@@ -292,6 +293,7 @@ namespace lfs::python {
             state.outcome = dict_value(dict, "outcome", std::string{"idle"});
             state.format = dict_value(dict, "format", std::string{});
             state.error = dict_value(dict, "error", std::string{});
+            state.warning = dict_value(dict, "warning", std::string{});
             state.path = dict_value(dict, "path", std::string{});
             return state;
         }
@@ -353,10 +355,10 @@ namespace lfs::python {
                                                      : std::optional<float>{nb::cast<float>(value)});
             else if (field == "scene_generation")
                 store.scene_generation.set(nb::cast<std::uint64_t>(value));
+            else if (field == "stored_session_generation")
+                store.stored_session_generation.set(nb::cast<std::uint64_t>(value));
             else if (field == "selection_generation")
                 store.selection_generation.set(nb::cast<std::uint64_t>(value));
-            else if (field == "fps")
-                store.fps.set(nb::cast<float>(value));
             else if (field == "mode_text")
                 store.mode_text.set(nb::cast<std::string>(value));
             else if (field == "active_tool")
@@ -383,12 +385,16 @@ namespace lfs::python {
                 store.mesh2splat_state.set(task_progress_state_from_object(value));
             else if (field == "splat_simplify_state")
                 store.splat_simplify_state.set(task_progress_state_from_object(value));
+            else if (field == "camera_selection_state")
+                store.camera_selection_state.set(task_progress_state_from_object(value));
             else if (field == "scripts_generation")
                 store.scripts_generation.set(nb::cast<std::uint64_t>(value));
             else if (field == "language_generation")
                 store.language_generation.set(nb::cast<std::uint64_t>(value));
             else if (field == "render_settings_generation")
                 store.render_settings_generation.set(nb::cast<std::uint64_t>(value));
+            else if (field == "viewport_toolbar_generation")
+                store.viewport_toolbar_generation.set(nb::cast<std::uint64_t>(value));
             else
                 throw_unknown_field(field);
         }
@@ -419,10 +425,10 @@ namespace lfs::python {
                 return nb::cast(store.eval_lpips.get());
             if (field == "scene_generation")
                 return nb::cast(store.scene_generation.get());
+            if (field == "stored_session_generation")
+                return nb::cast(store.stored_session_generation.get());
             if (field == "selection_generation")
                 return nb::cast(store.selection_generation.get());
-            if (field == "fps")
-                return nb::cast(store.fps.get());
             if (field == "mode_text")
                 return nb::cast(store.mode_text.get());
             if (field == "active_tool")
@@ -449,12 +455,16 @@ namespace lfs::python {
                 return task_progress_state_to_dict(store.mesh2splat_state.get());
             if (field == "splat_simplify_state")
                 return task_progress_state_to_dict(store.splat_simplify_state.get());
+            if (field == "camera_selection_state")
+                return task_progress_state_to_dict(store.camera_selection_state.get());
             if (field == "scripts_generation")
                 return nb::cast(store.scripts_generation.get());
             if (field == "language_generation")
                 return nb::cast(store.language_generation.get());
             if (field == "render_settings_generation")
                 return nb::cast(store.render_settings_generation.get());
+            if (field == "viewport_toolbar_generation")
+                return nb::cast(store.viewport_toolbar_generation.get());
             throw_unknown_field(field);
         }
 
@@ -484,10 +494,10 @@ namespace lfs::python {
                 return subscribe_observable(store.eval_lpips, std::move(callback));
             if (field == "scene_generation")
                 return subscribe_observable(store.scene_generation, std::move(callback));
+            if (field == "stored_session_generation")
+                return subscribe_observable(store.stored_session_generation, std::move(callback));
             if (field == "selection_generation")
                 return subscribe_observable(store.selection_generation, std::move(callback));
-            if (field == "fps")
-                return subscribe_observable(store.fps, std::move(callback));
             if (field == "mode_text")
                 return subscribe_observable(store.mode_text, std::move(callback));
             if (field == "active_tool")
@@ -521,12 +531,17 @@ namespace lfs::python {
             if (field == "splat_simplify_state")
                 return subscribe_observable_as(
                     store.splat_simplify_state, std::move(callback), task_progress_state_to_dict);
+            if (field == "camera_selection_state")
+                return subscribe_observable_as(
+                    store.camera_selection_state, std::move(callback), task_progress_state_to_dict);
             if (field == "scripts_generation")
                 return subscribe_observable(store.scripts_generation, std::move(callback));
             if (field == "language_generation")
                 return subscribe_observable(store.language_generation, std::move(callback));
             if (field == "render_settings_generation")
                 return subscribe_observable(store.render_settings_generation, std::move(callback));
+            if (field == "viewport_toolbar_generation")
+                return subscribe_observable(store.viewport_toolbar_generation, std::move(callback));
             throw_unknown_field(field);
         }
 

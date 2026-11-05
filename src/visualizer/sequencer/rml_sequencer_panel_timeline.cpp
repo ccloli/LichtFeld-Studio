@@ -24,15 +24,25 @@ namespace lfs::vis {
 
     using namespace panel_config;
 
+    void RmlSequencerPanel::setTimelineMarkup(Rml::Element* element, std::string markup) {
+        const auto cached = timeline_markup_.find(element);
+        if (cached != timeline_markup_.end() && cached->second == markup)
+            return;
+
+        // Playback moves the playhead without changing these decorative subtrees.
+        element->SetInnerRML(markup);
+        timeline_markup_.insert_or_assign(element, std::move(markup));
+    }
+
     void RmlSequencerPanel::rebuildEasingStripe(const float timeline_x, const float timeline_width) {
         if (!elements_cached_)
             return;
 
         const auto& keyframes = controller_.timeline().keyframes();
         if (timeline_width <= 0.0f || keyframes.empty()) {
-            el_easing_segments_->SetInnerRML("");
-            el_easing_curves_->SetInnerRML("");
-            el_easing_indicators_->SetInnerRML("");
+            setTimelineMarkup(el_easing_segments_, "");
+            setTimelineMarkup(el_easing_curves_, "");
+            setTimelineMarkup(el_easing_indicators_, "");
             return;
         }
 
@@ -121,9 +131,9 @@ namespace lfs::vis {
                 easing_class, tone, kx, iy);
         }
 
-        el_easing_segments_->SetInnerRML(segments_html);
-        el_easing_curves_->SetInnerRML(curves_html);
-        el_easing_indicators_->SetInnerRML(indicators_html);
+        setTimelineMarkup(el_easing_segments_, std::move(segments_html));
+        setTimelineMarkup(el_easing_curves_, std::move(curves_html));
+        setTimelineMarkup(el_easing_indicators_, std::move(indicators_html));
     }
 
     void RmlSequencerPanel::ensureFilmThumbPool(const size_t count) {
@@ -212,7 +222,7 @@ namespace lfs::vis {
                 "<div class=\"film-strip-divider\" style=\"left:{:.1f}px;\"></div>",
                 gui::FilmStripRenderer::THUMB_PADDING + actual_thumb_w * static_cast<float>(i));
         }
-        el_film_strip_dividers_->SetInnerRML(divider_html);
+        setTimelineMarkup(el_film_strip_dividers_, std::move(divider_html));
 
         std::string sprocket_top_html;
         std::string sprocket_bottom_html;
@@ -228,8 +238,8 @@ namespace lfs::vis {
             sprocket_bottom_html += fmt::format(
                 "<div class=\"film-strip-sprocket bottom\" style=\"left:{:.1f}px;\"></div>", sx);
         }
-        el_film_strip_sprockets_top_->SetInnerRML(sprocket_top_html);
-        el_film_strip_sprockets_bottom_->SetInnerRML(sprocket_bottom_html);
+        setTimelineMarkup(el_film_strip_sprockets_top_, std::move(sprocket_top_html));
+        setTimelineMarkup(el_film_strip_sprockets_bottom_, std::move(sprocket_bottom_html));
     }
 
     void RmlSequencerPanel::rebuildFilmStrip(float timeline_x, const float timeline_width,
@@ -246,11 +256,11 @@ namespace lfs::vis {
             }
             unregisterFilmStripSources();
             clearFilmThumbPool();
-            el_film_strip_gaps_->SetInnerRML("");
-            el_film_strip_markers_->SetInnerRML("");
-            el_film_strip_dividers_->SetInnerRML("");
-            el_film_strip_sprockets_top_->SetInnerRML("");
-            el_film_strip_sprockets_bottom_->SetInnerRML("");
+            setTimelineMarkup(el_film_strip_gaps_, "");
+            setTimelineMarkup(el_film_strip_markers_, "");
+            setTimelineMarkup(el_film_strip_dividers_, "");
+            setTimelineMarkup(el_film_strip_sprockets_top_, "");
+            setTimelineMarkup(el_film_strip_sprockets_bottom_, "");
             updateTimelineTooltip(film_strip, input);
             return;
         }
@@ -273,7 +283,9 @@ namespace lfs::vis {
         options.timeline_x = timeline_x;
         options.timeline_width = timeline_width;
         options.strip_y = strip_y;
-        options.mouse_x = input.mouse_x;
+        const bool pointer_visible = input.mouse_x >= timeline_x && input.mouse_x <= timeline_x + timeline_width &&
+                                     input.mouse_y >= cached_panel_y_ && input.mouse_y <= cached_panel_y_ + cached_total_height_;
+        options.mouse_x = pointer_visible ? input.mouse_x : cached_panel_x_ - 1.0f;
         options.mouse_y = input.mouse_y;
         options.zoom_level = zoom_level_;
         options.pan_offset = pan_offset_;
@@ -282,6 +294,8 @@ namespace lfs::vis {
         options.hovered_keyframe_id = hoveredKeyframeId();
         options.selected_keyframe_time = selected_keyframe_time;
         options.hovered_keyframe_time = hovered_keyframe_time;
+        options.camera_width = ui_state_.camera_width;
+        options.camera_height = ui_state_.camera_height;
         film_strip.render(controller_, rm, sm, options);
 
         handleFilmStripInteraction(timeline_x, timeline_width, input, film_strip);
@@ -325,7 +339,7 @@ namespace lfs::vis {
             if (anim_end_x < visible_right_x)
                 append_gap_region(anim_end_x, visible_right_x);
         }
-        el_film_strip_gaps_->SetInnerRML(gaps_html);
+        setTimelineMarkup(el_film_strip_gaps_, std::move(gaps_html));
 
         ensureFilmThumbPool(film_strip.thumbs().size());
         std::set<std::string> active_sources;
@@ -356,6 +370,16 @@ namespace lfs::vis {
             thumb_el->SetProperty("display", "block");
             thumb_el->SetProperty("left", fmt::format("{:.1f}px", thumb.screen_x - groove_origin_x));
             thumb_el->SetProperty("width", fmt::format("{:.1f}px", thumb.screen_width));
+            // Keep the existing time intervals and hit targets. Contain the
+            // camera image inside each tile instead of stretching it to the tile.
+            const float ratio = ui_state_.equirectangular ? 2.0f : static_cast<float>(std::clamp(ui_state_.camera_width, 1, 8192)) / std::clamp(ui_state_.camera_height, 1, 8192);
+            const float image_height = std::min(gui::FilmStripRenderer::STRIP_HEIGHT - 2 * gui::FilmStripRenderer::THUMB_PADDING, thumb.screen_width / ratio);
+            const float image_width = image_height * ratio;
+            image_el->SetProperty("position", "absolute");
+            image_el->SetProperty("width", fmt::format("{}px", image_width));
+            image_el->SetProperty("height", fmt::format("{}px", image_height));
+            image_el->SetProperty("left", fmt::format("{}px", (thumb.screen_width - image_width) * 0.5f));
+            image_el->SetProperty("top", fmt::format("{}px", (gui::FilmStripRenderer::STRIP_HEIGHT - 2 * gui::FilmStripRenderer::THUMB_PADDING - image_height) * 0.5f));
             thumb_el->SetClassNames("film-thumb");
             thumb_el->SetClass("hovered", thumb.hovered);
             thumb_el->SetClass("contains-selected", thumb.contains_selected);
@@ -390,7 +414,7 @@ namespace lfs::vis {
                 marker.hovered ? " hovered" : "",
                 marker.screen_x - groove_origin_x);
         }
-        el_film_strip_markers_->SetInnerRML(markers_html);
+        setTimelineMarkup(el_film_strip_markers_, std::move(markers_html));
 
         updateTimelineTooltip(film_strip, input);
     }

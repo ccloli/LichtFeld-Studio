@@ -40,8 +40,14 @@ namespace fast_lfs::rasterization {
         size_t per_primitive_buffers_size = 0;
         size_t per_tile_buffers_size = 0;
         size_t sorted_primitive_indices_size = 0;
+        unsigned char* contributor_masks = nullptr;
+        uint* contributor_positions = nullptr;
+        uint* primitive_touched = nullptr;
+        size_t contributor_storage_size = 0;
         size_t per_instance_sort_scratch_size = 0;
         size_t per_instance_sort_total_size = 0;
+        size_t visible_sort_scratch_size = 0;
+        unsigned tile_sort_key_bytes = 0;
         int n_instances = 0;
         int n_visible = 0;
         int sh_layout_bases = 1;
@@ -101,9 +107,18 @@ namespace fast_lfs::rasterization {
         const float* sh_value_bounds_ptr = nullptr, // float2 per 256; null = fp32/IEEE-f16 shN
         unsigned int sh_value_n_cells = 0,
         unsigned int sh_value_bits = 0, // 0=fp32, 16=q16(+bounds) or IEEE f16
-        float* max_screen_share_ptr = nullptr);
+        float* max_screen_share_ptr = nullptr,
+        float dilation_scale = 1.0f);
 
     void release_forward_context(const ForwardContext& forward_ctx);
+
+    // Read-only device buffers for correctness captures. Their lifetime is the
+    // context lifetime; callers synchronize its stream before reading them.
+    struct ForwardCaptureView {
+        const uint2* tile_ranges;
+        const uint* last_contributors;
+    };
+    ForwardCaptureView forward_capture_view(const ForwardContext& context, int width, int height);
 
     struct BackwardOutputs {
         bool success;
@@ -111,7 +126,8 @@ namespace fast_lfs::rasterization {
     };
 
     BackwardOutputs backward_raw(
-        float* densification_info_ptr,            // Device pointer [2*N] or nullptr
+        float* densification_weight_ptr,          // Device pointer [N] or nullptr
+        float* densification_error_ptr,           // Device pointer [N] or nullptr
         const float* densification_error_map_ptr, // Device pointer [H*W] or nullptr
         const float* grad_image_ptr,              // Device pointer [3*H*W]
         const BackgroundAlphaGradient& background_grad,
@@ -149,10 +165,11 @@ namespace fast_lfs::rasterization {
         const float* shN_value_bounds_ptr = nullptr,
         unsigned shN_value_n_cells = 0u,
         unsigned shN_value_bits = 0u,
-        const bool* mean_step_far_mask = nullptr,
-        int mean_step_far_mask_n = 0,
         const float* edge_weight_map = nullptr,
-        float* edge_score_out = nullptr);
+        float* edge_score_out = nullptr,
+        float* impact_sum_out = nullptr,
+        float* impact_peak_out = nullptr,
+        const ColorVarianceLoss& color_variance = {});
 
     // Pre-compile all CUDA kernels to avoid JIT delays during rendering
     void warmup_kernels();

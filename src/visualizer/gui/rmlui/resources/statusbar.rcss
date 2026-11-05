@@ -383,12 +383,36 @@ body {
     margin-right: 0;
 }
 
-#fps-value {
-    margin-left: 16dp;
+/* Inline layout avoids recursively measuring nested flex boxes on each FPS update. */
+#fps-group {
+    display: block;
+    margin-left: 12dp;
+}
+
+.fps-metric {
+    display: inline;
+}
+
+.fps-separator {
+    margin: 0 6dp;
+}
+
+.fps-caption {
+    font-size: 12dp;
+}
+
+.fps-number {
+    display: inline-block;
+    margin-left: 3dp;
+    min-width: 1.8em;
+    text-align: right;
+    font-weight: normal;
 }
 
 #fps-label {
-    margin-left: 0;
+    font-size: 12dp;
+    font-weight: bold;
+    margin-right: 8dp;
 }
 
 #git-commit {
@@ -455,7 +479,6 @@ body.fit-3 #time-metric {
 }
 
 body.fit-4 #eval-metric,
-body.fit-4 #fps-label,
 body.fit-4 #wasd-section,
 body.fit-4 #zoom-section {
     display: none;
@@ -499,15 +522,99 @@ body.fit-9 #status-message-section {
     overflow: hidden;
 }
 
+body.fit-9 #status-left {
+    display: none;
+}
+
 body.fit-9 #status-right {
-    flex-shrink: 1;
+    flex: 1 1 0px;
+    margin-left: 4dp;
     min-width: 0;
     overflow: hidden;
 }
 
 body.fit-9 #gpu-mem {
-    flex-shrink: 1;
+    flex: 1 1 0px;
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
+}
+/* Metric values keep a minimum width so changing digits do not move their neighbours. */
+#loss-value { min-width: 44dp; }
+#gaussians-value { min-width: 80dp; }
+#step-value { min-width: 100dp; }
+#time-value, #eta-value { min-width: 60dp; }
+
+#mcp-compact { display: none; }
+body.fit-8 #mcp-summary { display: none; }
+body.fit-8 #mcp-compact { display: block; }
+body.fit-8 #mcp-chip { margin-right: 4dp; padding: 0 3dp; }
+body.fit-8 #fps-group { margin-left: 6dp; }
+
+/* Tessle eats leaf snacks along the training track. */
+#progress-container.tessle {
+    background-color: #1d1f22;
+    border-radius: 2dp;
+    decorator: none;
+    border-bottom: 1dp #45494d;
+    box-sizing: border-box;
+}
+
+#progress-container.tessle #progress-fill {
+    visibility: hidden;
+}
+
+.tessle-leaf {
+    position: absolute;
+    top: 5dp;
+    width: 3dp;
+    height: 2dp;
+    pointer-events: none;
+}
+
+#tessle-figure {
+    position: absolute;
+    top: 0;
+    width: 14dp;
+    height: 14dp;
+    pointer-events: none;
+    z-index: 2;
+}
+
+#progress-text.progress-text--tessle {
+    width: auto;
+    padding: 0 3dp;
+    line-height: 14dp;
+    color: #e4e6e9;
+    background-color: #1d1f22;
+    text-align: left;
+}
+
+/* Checkpoints are collectible fruit beneath the character and percentage. */
+#progress-container.tessle #progress-markers {
+    z-index: 0;
+}
+
+#progress-container.tessle .progress-marker {
+    top: 0;
+    bottom: auto;
+    width: 14dp;
+    height: 14dp;
+    margin-left: -7dp;
+    border-radius: 0;
+    background-color: transparent;
+}
+
+#progress-container.tessle .progress-marker.is-past {
+    opacity: 0;
+}
+
+#progress-container.tessle .progress-marker.is-hovered,
+#progress-container.tessle .progress-marker.is-preview {
+    top: -1dp;
+    width: 16dp;
+    height: 16dp;
+    margin-left: -8dp;
+    opacity: 1;
+    background-color: transparent;
 }

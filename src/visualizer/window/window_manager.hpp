@@ -6,10 +6,12 @@
 
 #include "core/export.hpp"
 #include "input/frame_input_buffer.hpp"
+#include "input/gamepad_service.hpp"
 #include "input/input_router.hpp"
 #include "visualizer/visualizer.hpp"
 #include <chrono>
 #include <filesystem>
+#include <functional>
 #include <glm/glm.hpp>
 #include <memory>
 #include <optional>
@@ -23,6 +25,11 @@ namespace lfs::vis {
 
     class InputController;
     class VulkanContext;
+    struct VulkanDeviceHooks;
+    namespace gui {
+        class NativeDragContext;
+        class NativeDragScheduler;
+    } // namespace gui
 
     class LFS_VIS_API WindowManager {
     public:
@@ -55,7 +62,10 @@ namespace lfs::vis {
         WindowManager(const WindowManager&) = delete;
         WindowManager& operator=(const WindowManager&) = delete;
 
-        bool init();
+        // When Vulkan cannot start through device_hooks, init retries with plain
+        // Vulkan and deviceHooksError() keeps the reason.
+        bool init(const VulkanDeviceHooks* device_hooks = nullptr);
+        [[nodiscard]] const std::string& deviceHooksError() const { return device_hooks_error_; }
 
         void setInitialWindowState(PersistentWindowState state);
         [[nodiscard]] PersistentWindowState persistentWindowState() const;
@@ -65,7 +75,7 @@ namespace lfs::vis {
         void updateWindowSize(const char* reason = "manual",
                               ResizeIntent intent = ResizeIntent::Exact);
         void pollEvents();
-        void waitEvents(double timeout_seconds);
+        void waitEvents(std::optional<double> timeout_seconds = std::nullopt);
         bool shouldClose() const;
         void requestClose() { should_close_ = true; }
         void cancelClose();
@@ -73,6 +83,10 @@ namespace lfs::vis {
         void refreshResizeCursor();
         [[nodiscard]] unsigned manualResizeEdgeMask() const;
 
+        gui::NativeDragContext& nativeFileDragContext();
+        gui::NativeDragScheduler& nativeDragScheduler();
+        void dispatchNativeDrags(std::function<bool()> frame);
+        bool advanceNativeTransferFrame();
         SDL_Window* getWindow() const { return window_; }
         VulkanContext* getVulkanContext() const { return vulkan_context_.get(); }
         glm::ivec2 getWindowSize() const { return window_size_; }
@@ -85,6 +99,7 @@ namespace lfs::vis {
         void setTitlebarDragRegion(int height_px, std::vector<HitTestRect> excluded_rects);
         void clearTitlebarDragRegion();
         [[nodiscard]] bool isTitlebarDragPoint(int x, int y) const;
+        [[nodiscard]] bool usesWayland() const { return is_wayland_; }
         [[nodiscard]] bool usesEventDrivenTitlebarDrag() const { return native_titlebar_move_available_; }
         void setFullscreen(bool fullscreen);
         GraphicsBackend graphicsBackend() const { return graphics_backend_; }
@@ -92,14 +107,21 @@ namespace lfs::vis {
 
         void setCallbackHandler(void* handler) { callback_handler_ = handler; }
         void setInputController(InputController* ic);
+        [[nodiscard]] InputController* inputController() const { return input_controller_; }
         [[nodiscard]] const FrameInputBuffer& frameInput() const { return frame_input_; }
         [[nodiscard]] const input::InputRouter& inputRouter() const { return input_router_; }
+        [[nodiscard]] input::GamepadService& gamepads() { return gamepads_; }
+        void updateGamepadService(bool navigation_enabled);
+        void setGamepadDiagnosticsActive(bool active);
 
     private:
         friend class WindowInputDispatchTest;
+        friend class SidebarInputDispatchTest;
         void processEvent(const ::SDL_Event& event);
         void dispatchQueuedEvent(const ::SDL_Event& event);
         void dispatchPolledEvent(const ::SDL_Event& event);
+        void flushGamepadEvents();
+        std::vector<SDL_Event> gamepad_events_;
         bool drainQueuedEvents();
         static bool watchEvent(void* userdata, ::SDL_Event* event);
         bool pumping_events_ = false;
@@ -117,7 +139,14 @@ namespace lfs::vis {
         };
 
         SDL_Window* window_ = nullptr;
+        input::GamepadService gamepads_;
+        input::GamepadSample gamepad_wake_sample_;
+        bool gamepad_diagnostics_active_ = false;
         std::unique_ptr<VulkanContext> vulkan_context_;
+        std::string device_hooks_error_;
+        std::unique_ptr<gui::NativeDragContext> native_file_drag_;
+        std::unique_ptr<gui::NativeDragScheduler> native_drag_scheduler_;
+        std::function<bool()> native_transfer_frame_;
         GraphicsBackend graphics_backend_ = GraphicsBackend::Vulkan;
         std::string title_;
         glm::ivec2 window_size_;
@@ -133,6 +162,7 @@ namespace lfs::vis {
         int titlebar_drag_height_px_ = 0;
         std::vector<HitTestRect> titlebar_drag_excluded_rects_;
         bool native_titlebar_move_available_ = false;
+        bool is_wayland_ = false;
         bool pending_titlebar_double_click_ = false;
         bool titlebar_drag_active_ = false;
         bool titlebar_drag_started_maximized_ = false;
@@ -164,6 +194,7 @@ namespace lfs::vis {
         void updateManualResize();
         void finishManualResize();
         void suppressFrameInputForManualResize();
+        void pinFrameInputForValueDrag();
         [[nodiscard]] bool isManualResizeActive() const { return manual_resize_edge_ != ResizeEdge::NoEdge; }
         void beginTitlebarDrag(int local_x, int local_y);
         void updateTitlebarDrag();

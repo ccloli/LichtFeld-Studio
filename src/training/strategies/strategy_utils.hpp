@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include <optional>
+
 #include "core/parameters.hpp"
 #include "core/splat_data.hpp"
 #include "lfs/training/screen_share.cuh"
@@ -15,6 +17,30 @@
 #include <vector>
 
 namespace lfs::training {
+
+    // Row counts of every row-indexed training tensor before a refine. Growth
+    // only appends rows, and each append is whole, so a refine that runs out of
+    // VRAM part way can be undone by cutting each tensor back to its count.
+    class RefineRowSnapshot {
+    public:
+        using StrategyRows = std::function<void(const std::function<void(lfs::core::Tensor&)>&)>;
+
+        RefineRowSnapshot(lfs::core::SplatData& splat, AdamOptimizer& optimizer, const StrategyRows& strategy_rows);
+
+        // False when a model or optimizer tensor lost rows, which growth never does.
+        [[nodiscard]] bool restore() const;
+
+    private:
+        struct Rows {
+            lfs::core::Tensor* tensor;
+            std::size_t rows;
+            bool valid;
+            bool may_shrink;
+        };
+        std::vector<Rows> tensors_;
+        std::vector<std::pair<AdamParamState*, std::size_t>> state_sizes_;
+        lfs::core::SplatData* splat_;
+    };
 
     // Initialize Gaussians (move to GPU, pre-allocate capacity, etc.)
     void initialize_gaussians(lfs::core::SplatData& splat_data, int max_cap = 0);
@@ -28,6 +54,80 @@ namespace lfs::training {
     std::unique_ptr<ExponentialLR> create_scheduler(
         const lfs::core::param::OptimizationParameters& params,
         AdamOptimizer& optimizer);
+
+    // Gaussians the device can still add without running the rasterizer out
+    // of memory. Each new Gaussian costs its persistent state (parameters,
+    // optimizer moments, gradients, strategy buffers) and its share of the
+    // rasterizer arena, which grows with N; a strategy step that briefly holds
+    // a second copy of one per-Gaussian buffer (compaction) passes that buffer's
+    // bytes as transient_bytes_per_gaussian; refines measured by
+    // RefineVramWindow raise it to what they took. A pool reserve plus the
+    // larger of the arena's growth headroom and the refine transient is never
+    // planned for. SIZE_MAX when the device cannot be queried.
+    [[nodiscard]] size_t vram_growth_limit(const lfs::core::SplatData& splat_data,
+                                           const AdamOptimizer* optimizer,
+                                           size_t transient_bytes_per_gaussian = 0);
+
+    // Brackets one refine (prune, relocate, grow, split) so later growth plans
+    // for what refines really take. The tensor pool's peak reservation during
+    // the refine, beyond what it held when the refine began, is the refine's
+    // transient VRAM; vram_growth_limit keeps that much, per Gaussian of the
+    // grown model, free. A refine that fit only after pressure relief raises
+    // the growth reserve, as a recovered forward OOM does. Not nestable; one
+    // window per refine.
+    class RefineVramWindow {
+    public:
+        explicit RefineVramWindow(const lfs::core::SplatData& splat_data);
+        ~RefineVramWindow();
+        RefineVramWindow(const RefineVramWindow&) = delete;
+        RefineVramWindow& operator=(const RefineVramWindow&) = delete;
+
+    private:
+        const lfs::core::SplatData& splat_data_;
+        std::uint64_t pressure_episodes_ = 0;
+    };
+
+    // Samples, every few iterations, what one training step takes from the
+    // tensor pool outside refines, and hands the rasterizer arena that much
+    // (plus a margin) as the free VRAM to keep when it grows.
+    class FrameVramProbe {
+    public:
+        explicit FrameVramProbe(int iter);
+        ~FrameVramProbe();
+        FrameVramProbe(const FrameVramProbe&) = delete;
+        FrameVramProbe& operator=(const FrameVramProbe&) = delete;
+
+    private:
+        size_t start_used_ = 0;
+        size_t refines_ = 0;
+        bool active_ = false;
+    };
+
+    // Transient refine VRAM per Gaussian that growth currently plans for.
+    [[nodiscard]] size_t refine_transient_bytes_per_gaussian();
+
+    // The tensor pool's peak reservation over the run. Refine windows restart
+    // the pool's own high-water mark; this folds the earlier peaks back in.
+    [[nodiscard]] size_t tensor_pool_reserved_high_bytes();
+    // Same for the pool's peak use, which frame probes restart.
+    [[nodiscard]] size_t tensor_pool_used_high_bytes();
+
+    // Called after training recovered from running out of VRAM: the plan
+    // missed something, so later growth keeps `bytes` more free. Cleared when
+    // a training run initializes its Gaussians.
+    void raise_vram_growth_reserve(size_t bytes);
+
+    // Logs (once per 1% of model growth) that VRAM granted fewer new
+    // Gaussians than the strategy requested.
+    void note_vram_growth_limit(const lfs::core::SplatData& splat_data, const AdamOptimizer* optimizer,
+                                size_t granted, size_t requested);
+
+    // Clamps a growth request to vram_growth_limit and logs when VRAM, not the
+    // strategy, decided how far the model grows.
+    [[nodiscard]] size_t clamp_growth_to_vram(size_t requested,
+                                              const lfs::core::SplatData& splat_data,
+                                              const AdamOptimizer* optimizer,
+                                              size_t transient_bytes_per_gaussian = 0);
 
     // Build the row mask for splats loaded via --add-splat ... --freeze.
     // Invalid/empty means no frozen rows for the requested size.
@@ -64,6 +164,34 @@ namespace lfs::training {
     lfs::core::Tensor apply_crop_damping_to_scores(
         const AdamOptimizer& optimizer,
         const lfs::core::Tensor& scores);
+
+    // Weighted picks split by the crop box growth share: roi_count picks come from ROI rows and
+    // rest_count from the others. A side with too few positive weights hands its leftover to
+    // the other side unless its share is exactly 0 or 1.
+    struct RoiGrowthSplit {
+        lfs::core::Tensor roi_weights;
+        lfs::core::Tensor rest_weights;
+        int64_t roi_count = 0;
+        int64_t rest_count = 0;
+        int64_t roi_nnz = 0;
+        int64_t rest_nnz = 0;
+    };
+    // nullopt when no crop box ROI is active.
+    [[nodiscard]] std::optional<RoiGrowthSplit> split_growth_by_roi(
+        const AdamOptimizer& optimizer,
+        const lfs::core::Tensor& weights,
+        int64_t k);
+
+    // Whether zero_frozen_scores, apply_crop_damping_to_scores or
+    // roi_share_sampling_weights can change a score.
+    [[nodiscard]] bool reshapes_sampling_scores(const lfs::core::SplatData& splat_data,
+                                                const AdamOptimizer& optimizer);
+
+    // Sampling weights rescaled so ROI rows hold the growth share of the total weight, for
+    // samplers that draw with replacement. Unchanged when no crop box ROI is active.
+    [[nodiscard]] lfs::core::Tensor roi_share_sampling_weights(
+        const AdamOptimizer& optimizer,
+        const lfs::core::Tensor& weights);
 
     size_t frozen_row_count(const lfs::core::SplatData& splat_data, size_t n);
 
@@ -142,8 +270,6 @@ namespace lfs::training {
      * Avoids per-refine empty() allocs for means/rot/scale/sh0/shN/opacity.
      */
     struct DensifyChildWorkspace {
-        ~DensifyChildWorkspace();
-
         lfs::core::Tensor means;     // [cap, 3]
         lfs::core::Tensor rotations; // [cap, 4]
         lfs::core::Tensor scales;    // [cap, 3]
@@ -173,9 +299,10 @@ namespace lfs::training {
 
     /**
      * grow densification_info / 1D score buffers without full realloc
-     * when reserved capacity allows. densification_info is [n_rows,N] (2 rows
-     * for every strategy): when n or n_rows changes we must
-     * reallocate (row offsets depend on N); when shape already matches, reuse.
+     * when reserved capacity allows. densification_info is [n_rows,N] with
+     * n_rows >= 2 (weight row, then error row), or [N] for n_rows == 1 (the
+     * error row alone): when n or n_rows changes we must reallocate (row
+     * offsets depend on N); when shape already matches, reuse.
      * For 1D scores: append_zeros into reserved capacity when possible.
      */
     void ensure_densification_info_shape_inplace(

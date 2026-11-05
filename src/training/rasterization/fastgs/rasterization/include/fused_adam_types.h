@@ -13,6 +13,8 @@ namespace fast_lfs::rasterization {
     // SH value quant: when sh_value_bits==16, `param` is uint16 codes
     // (pad-dropped cell-linear swizzle) and sh_value_bounds is float2 per 256-prim block.
     struct FusedAdamParam {
+        // Optional raw gradient destination. When present, capture instead of updating Adam.
+        float* gradient_out = nullptr;
         float* param = nullptr; // float params OR bitcast uint16* when sh_value_bits==16
         // Joint codec: packed (u,log_s) bytes + float4 bounds[n_bounds]
         std::uint8_t* joint_packed = nullptr;
@@ -46,22 +48,23 @@ namespace fast_lfs::rasterization {
         float beta2 = 0.999f;
         float eps = 1e-15f;
         float scale_reg_weight = 0.0f;
+        bool scale_reg_log = false;
+        float scale_reg_normalizer = 1.0f;
+        float erank_reg_weight = 0.0f;
+        float dc_reg_weight = 0.0f;
+        float sh_rest_reg_weight = 0.0f;
         float flatten_reg_weight = 0.0f;
         float opacity_reg_weight = 0.0f;
+        float* rendered_count = nullptr;
         // Optional persistent device scalars (caller zeros). Filled by preprocess_backward
         // via block-reduce + atomicAdd so the trainer can skip loss-only reg kernels.
         float* scale_reg_loss_out = nullptr;
         float* opacity_reg_loss_out = nullptr;
-        const float* sparsity_opa_sigmoid = nullptr;
-        const float* sparsity_z = nullptr;
-        const float* sparsity_u = nullptr;
-        int sparsity_n = 0;
-        float sparsity_rho = 0.0f;
-        float sparsity_grad_loss = 0.0f;
+        float* erank_reg_loss_out = nullptr;
+        float* sh_rest_reg_loss_out = nullptr;
+        float* dc_reg_loss_out = nullptr;
         bool per_splat_mean_step = false;
         float mean_step_median_extent = 0.0f;
-        float mean_step_r_min = 1.0f;
-        float mean_step_r_max = 300.0f;
         const bool* mean_step_far_mask = nullptr;
         int mean_step_far_mask_n = 0;
 

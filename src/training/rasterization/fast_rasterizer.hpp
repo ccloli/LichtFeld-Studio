@@ -135,24 +135,44 @@ namespace lfs::training {
 
     struct FastGSFusedExtraGradients {
         float scale_reg_weight = 0.0f;
+        bool scale_reg_log = false;
+        float scale_reg_normalizer = 1.0f;
+        float erank_reg_weight = 0.0f;
+        float dc_reg_weight = 0.0f;
+        float sh_rest_reg_weight = 0.0f;
         float flatten_reg_weight = 0.0f;
         float opacity_reg_weight = 0.0f;
+        float* rendered_count = nullptr;
         // Optional persistent device scalars (caller zeros each step). Accumulated in
         // preprocess_backward so loss-only reg kernels can be skipped on the FastGS path.
         float* scale_reg_loss_out = nullptr;
         float* opacity_reg_loss_out = nullptr;
-        const float* sparsity_opa_sigmoid = nullptr;
-        const float* sparsity_z = nullptr;
-        const float* sparsity_u = nullptr;
-        int sparsity_n = 0;
-        float sparsity_rho = 0.0f;
-        float sparsity_grad_loss = 0.0f;
+        float* erank_reg_loss_out = nullptr;
+        float* sh_rest_reg_loss_out = nullptr;
+        float* dc_reg_loss_out = nullptr;
         // Optional edge guidance folded into the main blend backward. The map
         // is a median-normalized row-major float32 [H,W], and the destination
         // is a zeroed float32 [N] per-view scratch vector.
         const float* edge_weight_map = nullptr;
         float* edge_score_out = nullptr;
+        float* impact_sum_out = nullptr;
+        float* impact_peak_out = nullptr;
     };
+
+    // SteadySplats color variance against each pixel's expected splat color, which the
+    // backward derives from the context's forward image: that image must still hold the
+    // raw render, so callers must not clamp or correct it in place before the backward.
+    struct FastGSColorVarianceLoss {
+        core::Tensor loss; // Optional caller-zeroed CUDA float32 scalar.
+        float weight = 0.0f;
+        // Optional CUDA Float32 [H, W] pixel weights, such as the crop box ROI. The loss
+        // then takes their weighted mean over the pixels, like the photometric loss.
+        core::Tensor pixel_weight;
+    };
+
+    // Accumulates FP64 removal energy into aligned CUDA UInt8 [N, sizeof(double)] storage.
+    // The caller zeros these bytes once; each call adds a view without clearing them.
+    lfs::Status fast_accumulate_pop_scores(const FastRasterizeContext& ctx, lfs::core::Tensor& scores);
 
     [[nodiscard]] fast_lfs::rasterization::FusedAdamSettings make_fastgs_fused_adam_settings(
         const FastGSFusedAdamState& optimizer_fused,
@@ -172,7 +192,9 @@ namespace lfs::training {
         bool mip_filter = false,
         const lfs::core::Tensor& bg_image = {},
         bool render_normal = false,
-        bool render_depth = true);
+        bool render_depth = true,
+        float dilation_scale = 1.0f,
+        bool update_screen_share = true);
 
     // Backward pass with optional extra alpha gradient for masked training
     void fast_rasterize_backward(
@@ -186,7 +208,9 @@ namespace lfs::training {
         int iteration = 0,
         const FastGSFusedExtraGradients& fused_extra_gradients = {},
         const lfs::core::Tensor& grad_depth = {},
-        const lfs::core::Tensor& grad_normal = {});
+        const lfs::core::Tensor& grad_normal = {},
+        bool defer_optimizer_step = false,
+        const FastGSColorVarianceLoss& color_variance = {});
 
     // Release per-thread renderer caches before the owning CUDA stream is torn down.
     bool release_fast_rasterizer_thread_local_caches() noexcept;
@@ -201,9 +225,11 @@ namespace lfs::training {
         lfs::core::Tensor& bg_color,
         bool mip_filter = false,
         const lfs::core::Tensor& bg_image = {},
-        bool render_normal = false) {
+        bool render_normal = false,
+        float dilation_scale = 1.0f) {
         auto result = fast_rasterize_forward(
-            viewpoint_camera, gaussian_model, bg_color, 0, 0, 0, 0, mip_filter, bg_image, render_normal);
+            viewpoint_camera, gaussian_model, bg_color, 0, 0, 0, 0, mip_filter,
+            bg_image, render_normal, /*render_depth=*/true, dilation_scale, /*update_screen_share=*/false);
         if (!result) {
             throw lfs::Exception(std::move(result.error()));
         }
@@ -230,14 +256,16 @@ namespace lfs::training {
         lfs::core::Tensor& bg_color,
         bool mip_filter = false,
         const lfs::core::Tensor& bg_image = {},
-        bool render_normal = false) {
+        bool render_normal = false,
+        float dilation_scale = 1.0f) {
         return fast_rasterize(
             const_cast<lfs::core::Camera&>(viewpoint_camera),
             gaussian_model,
             bg_color,
             mip_filter,
             bg_image,
-            render_normal);
+            render_normal,
+            dilation_scale);
     }
 
     inline RenderOutput fast_rasterize(

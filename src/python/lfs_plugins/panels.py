@@ -20,8 +20,8 @@ class _PanelSpec:
     height_mode: str
     size: tuple[int, int]
     options: tuple[str, ...] = ("DEFAULT_CLOSED",)
-    update_policy: str = "interval"
-    update_interval_ms: int = 100
+    update_policy: str = "dirty"
+    update_interval_ms: int | None = None
     style: str = ""
     has_poll: bool = False
     has_draw: bool = False
@@ -30,6 +30,11 @@ class _PanelSpec:
 # Keep the registration contract in one place. The implementation classes use
 # panel_metadata() too, so registration cannot silently drift from the class.
 PANEL_SPECS = {
+    "logging": _PanelSpec(
+        "lfs_plugins.logging_panel", "LoggingPanel", "lfs.logging", "Logging",
+        "FLOATING", 95, "rmlui/logging_panel.rml", "FILL", (960, 600),
+        update_policy="interval", update_interval_ms=200,
+    ),
     "new_project": _PanelSpec(
         "lfs_plugins.import_panels", "NewProjectPanel", "lfs.new_project",
         "New Project", "FLOATING", 11, "rmlui/new_project_panel.rml",
@@ -72,7 +77,7 @@ PANEL_SPECS = {
     ),
     "histogram": _PanelSpec(
         "lfs_plugins.histogram_panel", "HistogramPanel", "lfs.histogram", "Histogram",
-        "BOTTOM_DOCK", 97, "rmlui/histogram_panel.rml", "FILL", (860, 660),
+        "BOTTOM_DOCK", 97, "rmlui/histogram_panel.rml", "FILL", (1000, 300),
         update_policy="dirty", has_poll=True,
     ),
     "scripts": _PanelSpec(
@@ -82,7 +87,22 @@ PANEL_SPECS = {
     ),
     "preferences": _PanelSpec(
         "lfs_plugins.preferences_panel", "PreferencesPanel", "lfs.preferences",
-        "Preferences", "FLOATING", 100, "rmlui/preferences.rml", "FILL", (780, 440), update_policy="dirty",
+        "Preferences", "FLOATING", 100, "rmlui/preferences.rml", "FILL", (780, 440),
+        update_policy="interval", update_interval_ms=100,
+    ),
+    "collision": _PanelSpec(
+        "lfs_plugins.collision_panel", "CollisionPanel", "lfs.collision", "collision.title",
+        "FLOATING", 14, "rmlui/collision.rml", "CONTENT", (420, 0),
+    ),
+    "splat_simplify": _PanelSpec(
+        "lfs_plugins.splat_simplify_panel", "SplatSimplifyPanel", "lfs.splat_simplify",
+        "rendering_panel.section_simplify", "FLOATING", 13, "rmlui/splat_simplify.rml", "CONTENT", (420, 0),
+        update_policy="dirty",
+    ),
+    "camera_selection": _PanelSpec(
+        "lfs_plugins.camera_selection_panel", "CameraSelectionPanel", "lfs.camera_selection",
+        "scene.camera_selection", "FLOATING", 15, "rmlui/camera_selection.rml", "CONTENT", (420, 0),
+        update_policy="dirty",
     ),
     "mesh2splat": _PanelSpec(
         "lfs_plugins.mesh2splat_panel", "Mesh2SplatPanel", "native.mesh2splat",
@@ -92,7 +112,7 @@ PANEL_SPECS = {
     "plugin_marketplace": _PanelSpec(
         "lfs_plugins.plugin_marketplace_panel", "PluginMarketplacePanel",
         "lfs.plugin_marketplace", "Plugin Marketplace", "FLOATING", 91,
-        "rmlui/plugin_marketplace.rml", "FILL", (770, 560),
+        "rmlui/plugin_marketplace.rml", "FILL", (840, 600),
         update_policy="dirty",
     ),
     "asset_manager": _PanelSpec(
@@ -111,6 +131,8 @@ _PANEL_METADATA_FIELDS = (
 def panel_metadata(name, lf):
     """Resolve a shared panel spec into class attributes for a runtime."""
     spec = PANEL_SPECS[name]
+    if spec.update_policy == "interval" and spec.update_interval_ms is None:
+        raise ValueError(f"Panel {spec.id!r} uses interval updates but has no update_interval_ms")
     return {
         "id": spec.id,
         "label": spec.label,
@@ -171,7 +193,7 @@ def _register_lazy_panel(lf, name):
 
         _delegated_instance_methods = frozenset({
             "poll", "draw", "show", "on_bind_model", "on_mount", "on_unmount",
-            "on_update", "on_scene_changed", "capture_chrome", "apply_chrome",
+            "on_update", "on_scene_changed", "on_visibility_changed", "capture_chrome", "apply_chrome",
             "on_host_geometry_changed",
         })
 
@@ -239,11 +261,6 @@ def _build_builtin_panel_steps(lf):
         _register_lazy_panel(lf, "new_project")
         _register_lazy_panel(lf, "resume_checkpoint")
 
-    def selection_groups():
-        from . import selection_groups as selection_groups_mod
-
-        selection_groups_mod.register()
-
     def operators():
         from . import operators as operators_mod
 
@@ -258,6 +275,9 @@ def _build_builtin_panel_steps(lf):
         from . import tools as tools_mod
 
         tools_mod.register()
+        _register_lazy_panel(lf, "splat_simplify")
+        _register_lazy_panel(lf, "collision")
+        _register_lazy_panel(lf, "camera_selection")
 
     def menus():
         from . import file_menu, edit_menu, tools_menu, view_menu, help_menu
@@ -313,6 +333,9 @@ def _build_builtin_panel_steps(lf):
     def scripts_panel():
         _register_lazy_panel(lf, "scripts")
 
+    def logging_panel():
+        _register_lazy_panel(lf, "logging")
+
     def preferences_panel():
         _register_lazy_panel(lf, "preferences")
 
@@ -340,7 +363,6 @@ def _build_builtin_panel_steps(lf):
         ("rendering_panel", rendering_panel),
         ("training_panel", training_panel),
         ("import_panels", import_panels),
-        ("selection_groups", selection_groups),
         ("operators", operators),
         ("sequencer_ops", sequencer_ops),
         ("tools", tools),
@@ -354,6 +376,7 @@ def _build_builtin_panel_steps(lf):
         ("image_preview_panel", image_preview_panel),
         ("histogram_panel", histogram_panel),
         ("scripts_panel", scripts_panel),
+        ("logging_panel", logging_panel),
         ("preferences_panel", preferences_panel),
         ("mesh2splat_panel", mesh2splat_panel),
         ("plugin_marketplace_panel", plugin_marketplace_panel),

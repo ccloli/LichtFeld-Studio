@@ -12,6 +12,10 @@
 
 namespace fast_lfs::rasterization {
 
+    // Compare the runtime-generic and settings-specialized preprocess kernels in tests.
+    void set_force_generic_preprocess_for_testing(bool force) noexcept;
+    [[nodiscard]] bool force_generic_preprocess_for_testing() noexcept;
+
     void backward(
         const float* densification_error_map,
         const float* grad_image,
@@ -31,6 +35,9 @@ namespace fast_lfs::rasterization {
         char* per_primitive_buffers_blob,
         char* per_tile_buffers_blob,
         const uint* sorted_primitive_indices,
+        const unsigned char* contributor_masks,
+        const uint* contributor_positions,
+        uint* primitive_touched,
         const uint* primitive_work_indices,
         float* grad_opacity_helper,
         float3* grad_color_helper,
@@ -39,7 +46,8 @@ namespace fast_lfs::rasterization {
         float* grad_depth_helper,
         float3* grad_normal_helper, // [N] or nullptr, required when grad_normal != nullptr
         float4* grad_w2c,
-        float* densification_info,
+        float* densification_weight, // [N] or nullptr
+        float* densification_error,  // [N] or nullptr
         const int n_primitives,
         const int n_instances,
         const int n_visible,
@@ -59,10 +67,11 @@ namespace fast_lfs::rasterization {
         const float2* shN_value_bounds,
         const uint shN_value_n_cells,
         const uint shN_value_bits,
-        const bool* mean_step_far_mask,
-        const int mean_step_far_mask_n,
         const float* edge_weight_map,
         float* edge_score_out,
-        cudaStream_t stream);
+        float* impact_sum_out,
+        float* impact_peak_out,
+        cudaStream_t stream,
+        const ColorVarianceLoss& color_variance = {});
 
 } // namespace fast_lfs::rasterization

@@ -4,9 +4,13 @@
 
 #pragma once
 
+#include "core/export.hpp"
+#include "gui/rmlui/preview_texture_status.hpp"
+
 #include <RmlUi/Core/RenderInterface.h>
 
 #include "core/assert.hpp"
+#include "core/export.hpp"
 #include "rendering/vulkan_result.hpp"
 #include "rendering/vulkan_wait.hpp"
 #include "window/vulkan_image_barrier_tracker.hpp"
@@ -51,12 +55,15 @@
 #define RMLUI_VK_API_VERSION VK_API_VERSION_1_3
 
 class RenderInterface_VK : public Rml::RenderInterface {
+    friend class RenderInterfaceVKTestAccess;
+
 public:
+    using PreviewTextureStatus = lfs::vis::gui::PreviewTextureStatus;
     static constexpr uint32_t kSwapchainBackBufferCount = 3;
     static constexpr VkDeviceSize kVideoMemoryForAllocation = 4 * 1024 * 1024; // [bytes]
 
-    RenderInterface_VK();
-    ~RenderInterface_VK();
+    LFS_VIS_API RenderInterface_VK();
+    LFS_VIS_API ~RenderInterface_VK();
 
     struct ExternalContext {
         VkInstance instance = VK_NULL_HANDLE;
@@ -71,18 +78,18 @@ public:
         bool host_image_copy = false;
     };
 
-    bool InitializeExternal(const ExternalContext& context);
-    void ShutdownExternal();
-    void BeginExternalFrame(VkCommandBuffer command_buffer,
-                            VkExtent2D extent,
-                            VkImage swapchain_image,
-                            VkImageView swapchain_image_view,
-                            VkImageView depth_stencil_image_view,
-                            std::size_t frame_slot);
-    void EndExternalFrame();
-    void ResetContextRenderState();
-    void SetContextOffset(float offset_x, float offset_y);
-    void SetContextClipRect(float x1, float y1, float x2, float y2);
+    LFS_VIS_API bool InitializeExternal(const ExternalContext& context);
+    LFS_VIS_API void ShutdownExternal();
+    LFS_VIS_API void BeginExternalFrame(VkCommandBuffer command_buffer,
+                                        VkExtent2D extent,
+                                        VkImage swapchain_image,
+                                        VkImageView swapchain_image_view,
+                                        VkImageView depth_stencil_image_view,
+                                        std::size_t frame_slot);
+    LFS_VIS_API void EndExternalFrame();
+    LFS_VIS_API void ResetContextRenderState();
+    LFS_VIS_API void SetContextOffset(float offset_x, float offset_y);
+    LFS_VIS_API void SetContextClipRect(float x1, float y1, float x2, float y2);
     void RenderTextureQuad(Rml::TextureHandle texture, float x, float y, float w, float h);
 
     struct FrostedGlassRegion {
@@ -98,10 +105,10 @@ public:
 
     // Restrict layer render-pass area (and thus loadOp clears / scissor bounds) to the
     // capture clip rect while recording a cached-panel refresh. Pair with EndCacheCapture.
-    // Nested PushLayer during the capture inherits the same restricted area. Normal
+    // Nested PushContextLayer during the capture inherits the same restricted area. Normal
     // (non-capture) layer usage is unaffected when capture is inactive.
-    void BeginCacheCapture(int x, int y, int width, int height);
-    void EndCacheCapture();
+    LFS_VIS_API void BeginCacheCapture(int x, int y, int width, int height);
+    LFS_VIS_API void EndCacheCapture();
 
     // Build a Rml::Image src URL referencing an externally-owned VkImageView/VkSampler.
     // The view+sampler must remain alive while any element references this URL. The
@@ -120,15 +127,17 @@ public:
     /// Called by RmlUi when it wants to compile geometry it believes will be static for the forseeable future.
     Rml::CompiledGeometryHandle CompileGeometry(Rml::Span<const Rml::Vertex> vertices, Rml::Span<const int> indices) override;
     /// Called by RmlUi when it wants to render application-compiled geometry.
-    void RenderGeometry(Rml::CompiledGeometryHandle handle, Rml::Vector2f translation, Rml::TextureHandle texture) override;
+    LFS_VIS_API void RenderGeometry(Rml::CompiledGeometryHandle handle, Rml::Vector2f translation, Rml::TextureHandle texture) override;
     /// Called by RmlUi when it wants to release application-compiled geometry.
-    void ReleaseGeometry(Rml::CompiledGeometryHandle geometry) override;
+    LFS_VIS_API void ReleaseGeometry(Rml::CompiledGeometryHandle geometry) override;
 
     /// Called by RmlUi when a texture is required by the library.
     Rml::TextureHandle LoadTexture(Rml::Vector2i& texture_dimensions, const Rml::String& source) override;
     [[nodiscard]] uint64_t previewTextureGeneration() const {
         return m_preview_texture_generation.load(std::memory_order_acquire);
     }
+    // Graphics thread only; source identity is the complete revisioned preview URL.
+    [[nodiscard]] LFS_VIS_API PreviewTextureStatus previewTextureStatus(const std::string& source) const;
     [[nodiscard]] bool currentContextUsedPreviewTexture() const {
         return m_current_context_used_preview_texture;
     }
@@ -138,30 +147,34 @@ public:
     void ReleaseTexture(Rml::TextureHandle texture_handle) override;
 
     /// Called by RmlUi when it wants to enable or disable scissoring to clip content.
-    void EnableScissorRegion(bool enable) override;
+    LFS_VIS_API void EnableScissorRegion(bool enable) override;
     /// Called by RmlUi when it wants to change the scissor region.
-    void SetScissorRegion(Rml::Rectanglei region) override;
+    LFS_VIS_API void SetScissorRegion(Rml::Rectanglei region) override;
 
     /// Called by RmlUi when it wants to enable or disable the clip mask.
     void EnableClipMask(bool enable) override;
     /// Called by RmlUi when it wants to set or modify the contents of the clip mask.
-    void RenderToClipMask(Rml::ClipMaskOperation operation, Rml::CompiledGeometryHandle geometry, Rml::Vector2f translation) override;
+    LFS_VIS_API void RenderToClipMask(Rml::ClipMaskOperation operation, Rml::CompiledGeometryHandle geometry, Rml::Vector2f translation) override;
 
-    /// Called by RmlUi when it wants to render to an offscreen layer.
-    Rml::LayerHandle PushLayer() override;
+    /// Called by RmlUi when it wants to render to an offscreen layer. The layer is in render-target
+    /// coordinates (origin 0,0): the context offset and clip do not apply inside it.
+    LFS_VIS_API Rml::LayerHandle PushLayer() override;
+    /// Pushes a layer that keeps the current context frame (offset, clip, cache-capture area).
+    /// Used for cached panel captures. PopLayer restores the frame that was current before the push.
+    LFS_VIS_API Rml::LayerHandle PushContextLayer();
     /// Called by RmlUi when it wants to composite one layer onto another.
     void CompositeLayers(Rml::LayerHandle source, Rml::LayerHandle destination, Rml::BlendMode blend_mode,
                          Rml::Span<const Rml::CompiledFilterHandle> filters) override;
     /// Called by RmlUi when it wants to remove the current layer.
-    void PopLayer() override;
+    LFS_VIS_API void PopLayer() override;
     /// Called by RmlUi when it wants to capture the current layer as a texture.
-    Rml::TextureHandle SaveLayerAsTexture() override;
+    LFS_VIS_API Rml::TextureHandle SaveLayerAsTexture() override;
     /// Captures an explicit layer region for manager-owned context caches.
     /// When `reuse_texture` has the same extent as `region`, reuses that image instead of
     /// allocating a new one.
     /// On extent mismatch or invalid handle, allocates a new texture (caller must release
     /// the old one if it is no longer needed).
-    Rml::TextureHandle SaveLayerRegionAsTexture(VkRect2D region, Rml::TextureHandle reuse_texture);
+    LFS_VIS_API Rml::TextureHandle SaveLayerRegionAsTexture(VkRect2D region, Rml::TextureHandle reuse_texture);
 
     /// Called by RmlUi when it wants to set the current transform matrix to a new matrix.
     void SetTransform(const Rml::Matrix4f* transform) override;
@@ -192,6 +205,8 @@ private:
         int m_width = 0;
         int m_height = 0;
         bool m_is_async_preview = false;
+        std::string m_preview_source;
+        PreviewTextureStatus m_preview_status = PreviewTextureStatus::Unknown;
         // Resource identity for VulkanImageBarrierTracker (#1478).
         std::uint64_t m_barrier_generation = 0;
     };
@@ -227,6 +242,14 @@ private:
         std::filesystem::path path;
         int max_size = 0;
         bool embedded_project_preview = false;
+        bool mask_overlay = false;
+    };
+
+    class MemoryPool;
+    struct pool_allocation_t {
+        MemoryPool* owner = nullptr;
+        VmaVirtualAllocation handle = nullptr;
+        explicit operator bool() const noexcept { return handle != nullptr; }
     };
 
     struct geometry_handle_t {
@@ -238,14 +261,28 @@ private:
 
         // @ this is for freeing our logical blocks for VMA
         // see https://gpuopen-librariesandsdks.github.io/VulkanMemoryAllocator/html/virtual_allocator.html
-        VmaVirtualAllocation m_p_vertex_allocation;
-        VmaVirtualAllocation m_p_index_allocation;
-        VmaVirtualAllocation m_p_shader_allocation;
+        pool_allocation_t m_p_vertex_allocation;
+        pool_allocation_t m_p_index_allocation;
+        pool_allocation_t m_p_shader_allocation;
     };
 
     struct buffer_data_t {
         VkBuffer m_p_vk_buffer;
         VmaAllocation m_p_vma_allocation;
+    };
+
+    // Context/clip/scissor state that defines the coordinate frame of one render target.
+    struct frame_state_t {
+        Rml::Vector2f context_offset{};
+        Rml::Matrix4f context_transform = Rml::Matrix4f::Identity();
+        bool context_clip_enabled = false;
+        VkRect2D context_clip_scissor{};
+        bool cache_capture_active = false;
+        VkRect2D cache_capture_render_area{};
+        bool scissor_specified = false;
+        Rml::Rectanglei scissor_region{};
+        VkRect2D scissor{};
+        VkRect2D scissor_requested{};
     };
 
     struct render_layer_t {
@@ -255,6 +292,8 @@ private:
         VkImageLayout m_depth_stencil_layout = VK_IMAGE_LAYOUT_UNDEFINED;
         int width = 0;
         int height = 0;
+        // Frame of the render target that was active when this layer was pushed; PopLayer restores it.
+        frame_state_t saved_frame{};
     };
 
     enum class active_render_target_t { None,
@@ -416,17 +455,17 @@ private:
     // @ main manager for "allocating" vertex, index, uniform stuff
     class MemoryPool {
     public:
-        MemoryPool();
-        ~MemoryPool();
+        LFS_VIS_API MemoryPool();
+        LFS_VIS_API ~MemoryPool();
 
-        void Initialize(VkDeviceSize byte_size, VkDeviceSize device_min_uniform_alignment, VmaAllocator p_allocator, VkDevice p_device) noexcept;
-        void Shutdown() noexcept;
+        LFS_VIS_API bool Initialize(VkDeviceSize byte_size, VkDeviceSize device_min_uniform_alignment, VmaAllocator p_allocator, VkDevice p_device) noexcept;
+        LFS_VIS_API void Shutdown() noexcept;
 
-        bool Alloc_GeneralBuffer(VkDeviceSize size, void** p_data, VkDescriptorBufferInfo* p_out, VmaVirtualAllocation* p_alloc) noexcept;
-        bool Alloc_VertexBuffer(uint32_t number_of_elements, uint32_t stride_in_bytes, void** p_data, VkDescriptorBufferInfo* p_out,
-                                VmaVirtualAllocation* p_alloc) noexcept;
-        bool Alloc_IndexBuffer(uint32_t number_of_elements, uint32_t stride_in_bytes, void** p_data, VkDescriptorBufferInfo* p_out,
-                               VmaVirtualAllocation* p_alloc) noexcept;
+        LFS_VIS_API bool Alloc_GeneralBuffer(VkDeviceSize size, void** p_data, VkDescriptorBufferInfo* p_out, pool_allocation_t* p_alloc) noexcept;
+        LFS_VIS_API bool Alloc_VertexBuffer(uint32_t number_of_elements, uint32_t stride_in_bytes, void** p_data, VkDescriptorBufferInfo* p_out,
+                                            pool_allocation_t* p_alloc) noexcept;
+        LFS_VIS_API bool Alloc_IndexBuffer(uint32_t number_of_elements, uint32_t stride_in_bytes, void** p_data, VkDescriptorBufferInfo* p_out,
+                                           pool_allocation_t* p_alloc) noexcept;
 
         void SetDescriptorSet(uint32_t binding_index, uint32_t size, VkDescriptorType descriptor_type, VkDescriptorSet p_set) noexcept;
         void SetDescriptorSet(uint32_t binding_index, VkDescriptorBufferInfo* p_info, VkDescriptorType descriptor_type,
@@ -434,11 +473,14 @@ private:
         void SetDescriptorSet(uint32_t binding_index, VkSampler p_sampler, VkImageLayout layout, VkImageView p_view, VkDescriptorType descriptor_type,
                               VkDescriptorSet p_set) noexcept;
 
-        void Free_Allocation(VmaVirtualAllocation allocation) noexcept;
+        LFS_VIS_API void Free_Allocation(pool_allocation_t allocation) noexcept;
         void Free_GeometryHandle(geometry_handle_t* p_valid_geometry_handle) noexcept;
         void Free_GeometryHandle_ShaderDataOnly(geometry_handle_t* p_valid_geometry_handle) noexcept;
 
     private:
+        friend class RenderInterface_VK;
+        std::unique_ptr<MemoryPool> m_overflow;
+        VkDescriptorSet m_shader_descriptor_set = VK_NULL_HANDLE;
         VkDeviceSize m_memory_total_size;
         VkDeviceSize m_device_min_uniform_alignment;
         char* m_p_data;
@@ -585,9 +627,10 @@ private:
     void StopPreviewWorkerPool() noexcept;
     void EnqueuePreviewWork(preview_work_t work);
     void QueueTextureForDeferredDeletion(texture_data_t* texture);
-    static async_preview_result_t DecodePreviewTexture(std::filesystem::path path,
-                                                       int max_size,
-                                                       bool embedded_project_preview);
+    LFS_VIS_API static async_preview_result_t DecodePreviewTexture(std::filesystem::path path,
+                                                                   int max_size,
+                                                                   bool embedded_project_preview,
+                                                                   bool mask_overlay = false);
 
     void Initialize_Resources(const VkPhysicalDeviceProperties& physical_device_properties) noexcept;
     void Initialize_Allocator() noexcept;
@@ -628,6 +671,13 @@ private:
     void BeginLayerRendering(Rml::LayerHandle layer_handle, bool clear);
     void BeginSwapchainRendering(VkAttachmentLoadOp color_load_op, VkAttachmentLoadOp depth_load_op);
     void EndActiveRendering();
+    // Derives m_scissor and m_scissor_requested from an RmlUi region under the current context offset and clip.
+    void ComputeScissorForRegion(Rml::Rectanglei region);
+    [[nodiscard]] LFS_VIS_API frame_state_t CaptureFrameState() const;
+    void RestoreFrameState(const frame_state_t& state);
+    // Makes the next layer use its own coordinates: RmlUi's render target origin, without the context offset.
+    void EnterLayerFrame();
+    Rml::LayerHandle PushLayerInFrame(bool neutral_frame);
     bool CopySwapchainToLayer(Rml::LayerHandle destination);
     void TransitionImageLayout(VkImage image, std::uint64_t generation, VkImageAspectFlags aspect_mask, VkImageLayout old_layout, VkImageLayout new_layout);
     VkImageAspectFlags DepthStencilAspectMask() const noexcept;
@@ -649,10 +699,8 @@ private:
     uint32_t ActiveResourceSlot() const noexcept;
 
 private:
-    bool m_is_transform_enabled;
     bool m_is_apply_to_regular_geometry_stencil;
     bool m_is_clip_mask_enabled;
-    bool m_is_transformed_scissor_enabled;
     bool m_is_use_scissor_specified;
     bool m_is_use_stencil_pipeline;
     bool m_external_context = false;
@@ -687,10 +735,13 @@ private:
     VkPipeline m_p_pipeline_stencil_for_regular_geometry_that_applied_to_region_with_textures;
     VkPipeline m_p_pipeline_stencil_for_regular_geometry_that_applied_to_region_without_textures;
     VkDescriptorSet m_p_descriptor_set;
+    std::vector<VkDescriptorSet> m_overflow_shader_descriptor_sets;
     VkSampler m_p_sampler_linear;
     VkSampler m_p_sampler_nearest;
     VkRect2D m_scissor;
     VkRect2D m_scissor_requested;
+    // Last region passed to SetScissorRegion, in RmlUi (render target) coordinates.
+    Rml::Rectanglei m_scissor_region{};
 
     // @ means it captures the window size full width and full height, offset equals both x and y to 0
     VkRect2D m_scissor_original;
@@ -716,6 +767,7 @@ private:
     Rml::Vector<VkShaderModule> m_shaders;
     Rml::Array<Rml::Vector<texture_data_t*>, kSwapchainBackBufferCount> m_pending_for_deletion_textures_by_frames;
     std::unordered_set<texture_data_t*> m_live_textures;
+    std::unordered_map<std::string, texture_data_t*> m_preview_textures_by_source;
     std::vector<std::shared_ptr<async_preview_state_t>> m_async_preview_textures;
     std::mutex m_preview_queue_mutex;
     std::condition_variable m_preview_queue_cv;
@@ -733,7 +785,7 @@ private:
     float m_texture_quad_y = 0.0f;
     float m_texture_quad_w = 0.0f;
     float m_texture_quad_h = 0.0f;
-    Rml::Array<Rml::Vector<VmaVirtualAllocation>, kSwapchainBackBufferCount> m_transient_shader_allocations_by_frame;
+    Rml::Array<Rml::Vector<pool_allocation_t>, kSwapchainBackBufferCount> m_transient_shader_allocations_by_frame;
     VkImage m_external_swapchain_image = VK_NULL_HANDLE;
     VkImageView m_external_swapchain_image_view = VK_NULL_HANDLE;
     VkImageView m_external_depth_stencil_image_view = VK_NULL_HANDLE;

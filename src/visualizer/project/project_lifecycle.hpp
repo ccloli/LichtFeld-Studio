@@ -22,15 +22,37 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <vector>
 
+namespace lfs::training {
+    class Trainer;
+}
+
 namespace lfs::vis {
     class VisualizerImpl;
+    class CollisionProjectOpenTest;
+    class PayloadRecaptureTest;
+    class StoredSessionRestoreTest_CompletionPublishesOnViewerThread_Test;
+    class VisualizerImplResetTest_AsyncViewerTrainingStartCanBeCanceledBeforeInitialization_Test;
+    class VisualizerImplResetTest_AsyncTrainingBindCancelDoesNotStart_Test;
+    class VisualizerImplResetTest_AsyncTrainingBoundProjectPropagatesStartRejection_Test;
+
+    class VisualizerImplResetTest_AsyncTrainingBindReturnsBeforeSlowWriteAndCoalescesStarts_Test;
+    class VisualizerImplResetTest_AsyncTrainingBindFailureDoesNotStart_Test;
+    class VisualizerImplResetTest_AsyncTrainingBindCloseDoesNotStart_Test;
+    class VisualizerImplResetTest_AsyncTrainingBindWaitsForAutosave_Test;
+    class VisualizerImplResetTest_AsyncTrainingBindTrainerReplacementCancels_Test;
+    class VisualizerImplResetTest_AsyncPausedPreparationCancelPreservesSession_Test;
+    class VisualizerImplResetTest_AsyncPreparationCancelDrainsDeferredLoad_Test;
+    class VisualizerImplResetTest_AsyncPausedExplicitPreparationAdoptsItsSnapshot_Test;
+
     class VisualizerImplResetTest_ActiveProjectPreviewWritePreservesEditsAndQueuesSave_Test;
     class VisualizerImplResetTest_AsyncCaptureKeepsNewerSceneDirty_Test;
     class VisualizerImplResetTest_AutosaveStartsAfterFirstSaveAsWithoutReopen_Test;
+    class VisualizerImplResetTest_SaveAsSettlesCompletedSidecarAutosave_Test;
     class VisualizerImplResetTest_AutosaveSkipsWhileManualProjectWriteJobIsRunning_Test;
     class VisualizerImplResetTest_RecoveryDeclineKeepsSidecarSuppressesRepeatAndExplicitSaveDeletesIt_Test;
     class VisualizerImplResetTest_NewProjectClearsRecoveryPromptPendingSoNextOpenProceeds_Test;
@@ -44,8 +66,10 @@ namespace lfs::vis {
     class VisualizerImplResetTest_TrainingSnapshotCancelTerminalizesBeforeSettlement_Test;
     class VisualizerImplResetTest_FailedAutosaveSettlementAppliesBackoffBeforeRetry_Test;
     class VisualizerImplResetTest_PendingCloseSuppressesBackgroundAutosave_Test;
-    class VisualizerImplResetTest_StoppingTrainerBlocksIdleCompactionAndAutosave_Test;
-    class VisualizerImplResetTest_SessionSoftDirtyDoesNotPromptOrArmAutosave_Test;
+    class VisualizerImplResetTest_StoppingTrainerBlocksAutosave_Test;
+    class VisualizerImplResetTest_IdleMaintenanceKeepsEverySave_Test;
+    class VisualizerImplResetTest_NavigationVerticalRoundTripPreservesPosesAndGridChoices_Test;
+    class VisualizerImplResetTest_SessionSoftDirtyDoesNotPromptButArmsAutosave_Test;
     class VisualizerImplResetTest_SceneEditStillPromptsAndArmsAutosave_Test;
     class VisualizerImplResetTest_ParametersUnchangedRoundTripStaysClean_Test;
     class VisualizerImplResetTest_ParametersValueChangeIsHardDirty_Test;
@@ -57,6 +81,8 @@ namespace lfs::vis {
     class VisualizerImplResetTest_StartTrainingWithCliOutputPathBindsProjectThere_Test;
     class VisualizerImplResetTest_UntitledTrainingSnapshotAdoptionRegistersProjectInMru_Test;
     class VisualizerImplResetTest_SaveAsAfterAutoCreatedTrainingKeepsOriginalAndCheckpoint_Test;
+    class VisualizerImplResetTest_FreshTrainingStartSaveAsDropsCheckpointHistory_Test;
+    class VisualizerImplResetTest_FailedFreshTrainingStartSaveAsPreservesSourceHistory_Test;
     class VisualizerImplResetTest_UntitledStartConflictNeverReportsExistingOutputProject_Test;
     class VisualizerImplResetTest_CompletedAutoCreatedTrainingSavesRealMasterOnClose_Test;
     class VisualizerImplResetTest_SaveSucceedsOnAutoCreatedTrainingProject_Test;
@@ -107,6 +133,7 @@ namespace lfs::vis {
     class VisualizerImplResetTest_RecoverThenCleanQuitDoesNotReoffer_Test;
     class VisualizerImplResetTest_RecoverThenDiscardExitRemovesMasterSidecar_Test;
     class VisualizerImplResetTest_RecoverThenCrashStillOffersRecovery_Test;
+    class VisualizerImplResetTest_RecoverThenAutosaveEditsForNextRecovery_Test;
     class VisualizerImplResetTest_StartupOffersScratchRecoveryAsUntitled_Test;
     class VisualizerImplResetTest_StartupSweepsEmptyScratchAndDoesNotOffer_Test;
     class VisualizerImplResetTest_RecoverTempWithSidecarThenDiscardExitLeavesNoTempFiles_Test;
@@ -127,7 +154,12 @@ namespace lfs::vis {
     class VisualizerImplResetTest_ProjectCreateOnDirtyEmitsCreatePath_Test;
     class VisualizerImplResetTest_StartupScansLegacyWorkingTmpDirectory_Test;
     class VisualizerImplResetTest_StartupPruneNeverTouchesProjectLocation_Test;
-    class VisualizerImplResetTest_ScratchDirectoryIsFixedUnderRootRegardlessOfPreferences_Test;
+    class VisualizerImplResetTest_ScratchDirectoryFollowsProjectLocationPreference_Test;
+    class VisualizerImplResetTest_ScratchDirectoryFallsBackToRootWhenProjectLocationUnusable_Test;
+    class VisualizerImplResetTest_StartupRecoveryScansRootAndProjectLocationScratch_Test;
+    class VisualizerImplResetTest_UntitledAutosaveDiskFullToastNamesFolder_Test;
+    class VisualizerImplResetTest_AutosaveDiskFullToastShowsOncePerFailureStreak_Test;
+    class VisualizerImplResetTest_ScratchLocationProbeRunsOffCallingThread_Test;
     class VisualizerImplResetTest_ProjectCreateWhileTrainingPromptsWithCreatePath_Test;
     class VisualizerImplResetTest_RecoveredScratchSaveStillRefusesAndStaysOutOfMru_Test;
 } // namespace lfs::vis
@@ -158,7 +190,6 @@ namespace lfs::vis::project {
         std::uint64_t autosave_interval_seconds = 5 * 60;
         std::uint64_t autosave_dirty_epoch_threshold = 20;
         std::uint64_t autosave_quiet_seconds = 2;
-        std::uint64_t compaction_idle_seconds = 30;
         std::vector<ProjectMruEntry> mru;
         std::vector<DismissedRecoveryEntry> dismissed_recovery;
 
@@ -183,6 +214,7 @@ namespace lfs::vis::project {
 
     class LFS_VIS_API ProjectLifecycle {
     public:
+        friend class lfs::vis::StoredSessionRestoreTest_CompletionPublishesOnViewerThread_Test;
         enum class CloseSaveStatus {
             NotDirty,
             NeedsPrompt,
@@ -210,7 +242,8 @@ namespace lfs::vis::project {
         [[nodiscard]] lfs::Result<void>
         saveAs(const std::filesystem::path& path,
                bool regenerate_preview,
-               bool allow_existing_destination_replacement = false);
+               bool allow_existing_destination_replacement = false,
+               bool fresh_training_start = false);
         [[nodiscard]] lfs::Result<void>
         compact();
         void cancelCleanup();
@@ -238,6 +271,11 @@ namespace lfs::vis::project {
         boundDocument() const noexcept {
             return document_;
         }
+        [[nodiscard]] std::uint64_t documentEpoch() const noexcept {
+            return epoch_.load(std::memory_order_acquire);
+        }
+        void recoverDeferredPayloadsAfterUndo(
+            std::vector<lfs::core::Uuid> node_uuids);
         [[nodiscard]] bool isScratchBoundSession() const;
         [[nodiscard]] bool isBlankProject() const;
         [[nodiscard]] bool isBlankUntitledSession() const;
@@ -255,6 +293,7 @@ namespace lfs::vis::project {
                    const std::filesystem::path& expected_path = {},
                    std::string expected_project_uuid = {});
         [[nodiscard]] ProjectWritePoll pollWrite();
+        [[nodiscard]] lfs::Result<ProjectTrainingSource> trainingSource();
         void joinPendingWrite();
         [[nodiscard]] ProjectMenuInfo menuInfo() const;
         [[nodiscard]] lfs::Result<void>
@@ -267,9 +306,13 @@ namespace lfs::vis::project {
             bool defer_recovery_scan = false);
         void runStartupRecoveryScan();
         void markSceneMutation(std::uint32_t mutation_flags);
+        void markSessionChapterCommitted(std::string_view chapter);
         void updateMaintenance();
         void noteProjectFrameRendered(double render_ms);
         [[nodiscard]] bool hasDirtyProject();
+        [[nodiscard]] bool isOpenPending() const noexcept {
+            return pending_collision_open_ != nullptr;
+        }
         [[nodiscard]] lfs::Result<void>
         setReopenLastProject(bool enabled);
         [[nodiscard]] lfs::Result<void>
@@ -302,6 +345,14 @@ namespace lfs::vis::project {
             bool allow_existing_destination_replacement = false);
         [[nodiscard]] lfs::Result<void>
         prepareTrainingStartProject();
+        // GUI callers continue on the scene-owner thread after the durable bind.
+        // Repeated requests while preparation is pending are coalesced.
+        [[nodiscard]] lfs::Result<void>
+        prepareTrainingStartProjectAsync(std::function<lfs::Result<void>()> on_ready);
+        [[nodiscard]] bool isTrainingStartPending() const {
+            return pending_training_start_active_.load(std::memory_order_acquire);
+        }
+        bool cancelTrainingStartPreparation();
         // Returns the blocking conflict a fresh training start would overwrite, if any:
         // the bound checkpoint iteration of the open titled project (in memory or
         // on the titled master), or -1 when an existing titled master is unreadable.
@@ -336,9 +387,25 @@ namespace lfs::vis::project {
             std::string* error_message = nullptr);
 
     private:
+        friend class lfs::vis::CollisionProjectOpenTest;
         friend class lfs::vis::VisualizerImplResetTest_ActiveProjectPreviewWritePreservesEditsAndQueuesSave_Test;
+        friend class lfs::vis::VisualizerImplResetTest_AsyncTrainingBindReturnsBeforeSlowWriteAndCoalescesStarts_Test;
+        friend class lfs::vis::VisualizerImplResetTest_AsyncTrainingBindFailureDoesNotStart_Test;
+        friend class lfs::vis::VisualizerImplResetTest_AsyncTrainingBindCloseDoesNotStart_Test;
+        friend class lfs::vis::VisualizerImplResetTest_AsyncViewerTrainingStartCanBeCanceledBeforeInitialization_Test;
+        friend class lfs::vis::VisualizerImplResetTest_AsyncTrainingBindCancelDoesNotStart_Test;
+        friend class lfs::vis::VisualizerImplResetTest_AsyncTrainingBoundProjectPropagatesStartRejection_Test;
+
+        friend class lfs::vis::VisualizerImplResetTest_AsyncTrainingBindWaitsForAutosave_Test;
+        friend class lfs::vis::VisualizerImplResetTest_AsyncTrainingBindTrainerReplacementCancels_Test;
+        friend class lfs::vis::VisualizerImplResetTest_AsyncPausedPreparationCancelPreservesSession_Test;
+        friend class lfs::vis::VisualizerImplResetTest_AsyncPreparationCancelDrainsDeferredLoad_Test;
+        friend class lfs::vis::VisualizerImplResetTest_AsyncPausedExplicitPreparationAdoptsItsSnapshot_Test;
+
         friend class lfs::vis::VisualizerImplResetTest_AutosaveStartsAfterFirstSaveAsWithoutReopen_Test;
+        friend class lfs::vis::VisualizerImplResetTest_SaveAsSettlesCompletedSidecarAutosave_Test;
         friend class lfs::vis::VisualizerImplResetTest_AsyncCaptureKeepsNewerSceneDirty_Test;
+        friend class lfs::vis::PayloadRecaptureTest;
         friend class lfs::vis::VisualizerImplResetTest_AutosaveSkipsWhileManualProjectWriteJobIsRunning_Test;
         friend class lfs::vis::VisualizerImplResetTest_RecoveryDeclineKeepsSidecarSuppressesRepeatAndExplicitSaveDeletesIt_Test;
         friend class lfs::vis::VisualizerImplResetTest_NewProjectClearsRecoveryPromptPendingSoNextOpenProceeds_Test;
@@ -352,8 +419,10 @@ namespace lfs::vis::project {
         friend class lfs::vis::VisualizerImplResetTest_TrainingSnapshotCancelTerminalizesBeforeSettlement_Test;
         friend class lfs::vis::VisualizerImplResetTest_FailedAutosaveSettlementAppliesBackoffBeforeRetry_Test;
         friend class lfs::vis::VisualizerImplResetTest_PendingCloseSuppressesBackgroundAutosave_Test;
-        friend class lfs::vis::VisualizerImplResetTest_StoppingTrainerBlocksIdleCompactionAndAutosave_Test;
-        friend class lfs::vis::VisualizerImplResetTest_SessionSoftDirtyDoesNotPromptOrArmAutosave_Test;
+        friend class lfs::vis::VisualizerImplResetTest_StoppingTrainerBlocksAutosave_Test;
+        friend class lfs::vis::VisualizerImplResetTest_IdleMaintenanceKeepsEverySave_Test;
+        friend class lfs::vis::VisualizerImplResetTest_NavigationVerticalRoundTripPreservesPosesAndGridChoices_Test;
+        friend class lfs::vis::VisualizerImplResetTest_SessionSoftDirtyDoesNotPromptButArmsAutosave_Test;
         friend class lfs::vis::VisualizerImplResetTest_SceneEditStillPromptsAndArmsAutosave_Test;
         friend class lfs::vis::VisualizerImplResetTest_ParametersUnchangedRoundTripStaysClean_Test;
         friend class lfs::vis::VisualizerImplResetTest_ParametersValueChangeIsHardDirty_Test;
@@ -365,6 +434,8 @@ namespace lfs::vis::project {
         friend class lfs::vis::VisualizerImplResetTest_StartTrainingWithCliOutputPathBindsProjectThere_Test;
         friend class lfs::vis::VisualizerImplResetTest_UntitledTrainingSnapshotAdoptionRegistersProjectInMru_Test;
         friend class lfs::vis::VisualizerImplResetTest_SaveAsAfterAutoCreatedTrainingKeepsOriginalAndCheckpoint_Test;
+        friend class lfs::vis::VisualizerImplResetTest_FreshTrainingStartSaveAsDropsCheckpointHistory_Test;
+        friend class lfs::vis::VisualizerImplResetTest_FailedFreshTrainingStartSaveAsPreservesSourceHistory_Test;
         friend class lfs::vis::VisualizerImplResetTest_UntitledStartConflictNeverReportsExistingOutputProject_Test;
         friend class lfs::vis::VisualizerImplResetTest_CompletedAutoCreatedTrainingSavesRealMasterOnClose_Test;
         friend class lfs::vis::VisualizerImplResetTest_SaveSucceedsOnAutoCreatedTrainingProject_Test;
@@ -415,6 +486,7 @@ namespace lfs::vis::project {
         friend class lfs::vis::VisualizerImplResetTest_RecoverThenCleanQuitDoesNotReoffer_Test;
         friend class lfs::vis::VisualizerImplResetTest_RecoverThenDiscardExitRemovesMasterSidecar_Test;
         friend class lfs::vis::VisualizerImplResetTest_RecoverThenCrashStillOffersRecovery_Test;
+        friend class lfs::vis::VisualizerImplResetTest_RecoverThenAutosaveEditsForNextRecovery_Test;
         friend class lfs::vis::VisualizerImplResetTest_StartupOffersScratchRecoveryAsUntitled_Test;
         friend class lfs::vis::VisualizerImplResetTest_StartupSweepsEmptyScratchAndDoesNotOffer_Test;
         friend class lfs::vis::VisualizerImplResetTest_RecoverTempWithSidecarThenDiscardExitLeavesNoTempFiles_Test;
@@ -435,7 +507,12 @@ namespace lfs::vis::project {
         friend class lfs::vis::VisualizerImplResetTest_ProjectCreateOnDirtyEmitsCreatePath_Test;
         friend class lfs::vis::VisualizerImplResetTest_StartupScansLegacyWorkingTmpDirectory_Test;
         friend class lfs::vis::VisualizerImplResetTest_StartupPruneNeverTouchesProjectLocation_Test;
-        friend class lfs::vis::VisualizerImplResetTest_ScratchDirectoryIsFixedUnderRootRegardlessOfPreferences_Test;
+        friend class lfs::vis::VisualizerImplResetTest_ScratchDirectoryFollowsProjectLocationPreference_Test;
+        friend class lfs::vis::VisualizerImplResetTest_ScratchDirectoryFallsBackToRootWhenProjectLocationUnusable_Test;
+        friend class lfs::vis::VisualizerImplResetTest_StartupRecoveryScansRootAndProjectLocationScratch_Test;
+        friend class lfs::vis::VisualizerImplResetTest_UntitledAutosaveDiskFullToastNamesFolder_Test;
+        friend class lfs::vis::VisualizerImplResetTest_AutosaveDiskFullToastShowsOncePerFailureStreak_Test;
+        friend class lfs::vis::VisualizerImplResetTest_ScratchLocationProbeRunsOffCallingThread_Test;
         friend class lfs::vis::VisualizerImplResetTest_ProjectCreateWhileTrainingPromptsWithCreatePath_Test;
         friend class lfs::vis::VisualizerImplResetTest_RecoveredScratchSaveStillRefusesAndStaysOutOfMru_Test;
         enum class Hydration {
@@ -488,14 +565,14 @@ namespace lfs::vis::project {
 
         struct PendingSplatCapture {
             lfs::core::Uuid uuid;
-            std::uint64_t scene_serial = 0;
+            std::uint64_t payload_serial = 0;
             std::unique_ptr<lfs::io::project::AsyncSplatCapture>
                 capture;
         };
 
         struct CompletedSplatCapture {
             lfs::core::Uuid uuid;
-            std::uint64_t scene_serial = 0;
+            std::uint64_t payload_serial = 0;
             lfs::io::project::SplatChapterPayload payload;
         };
 
@@ -525,9 +602,13 @@ namespace lfs::vis::project {
         scratchAutosaveDirectory() const;
         [[nodiscard]] bool isScratchPath(
             const std::filesystem::path& path) const;
+        [[nodiscard]] std::vector<std::filesystem::path>
+        scratchDirectories() const;
         void freezeTempProjectDirectory();
+        void settleScratchLocationCheck();
         void pruneUnlockedScratchFilesExcept(
             const std::optional<std::filesystem::path>& keep);
+        void joinScratchPrune();
         [[nodiscard]] std::optional<
             lfs::io::project::WriterLockLease>
         snapshotWriterLease(
@@ -547,7 +628,29 @@ namespace lfs::vis::project {
         [[nodiscard]] lfs::Result<void>
         openMaster(
             const std::filesystem::path& path,
-            ProjectSwitchDisposition disposition);
+            ProjectSwitchDisposition disposition,
+            std::move_only_function<lfs::Result<void>()> after_open = {});
+        lfs::Result<void> finishScratchRecovery();
+        struct PreparedOpen;
+        struct PendingCollisionOpen {
+            std::atomic<bool> done{false};
+            lfs::Result<void> result;
+            std::move_only_function<lfs::Result<void>()> install;
+            JobHandle job;
+            std::uint64_t epoch = 0;
+            std::uint64_t scene_serial = 0;
+            std::uint64_t parameter_serial = 0;
+            std::array<std::uint64_t, 2> shader_token{};
+            std::jthread worker;
+        };
+        std::unique_ptr<PendingCollisionOpen> pending_collision_open_;
+        void settleCollisionOpen();
+        lfs::Result<void> commitOpen(PreparedOpen&& prepared);
+        lfs::Result<void> finishRecovered(
+            const std::filesystem::path& master, const std::filesystem::path& sidecar,
+            const std::filesystem::path& temporary, lfs::io::project::RecoverySession session);
+        bool deferCollisionSwitch(std::move_only_function<lfs::Result<void>()>&& retry);
+        [[nodiscard]] bool collisionSwitchPending() const;
         [[nodiscard]] lfs::Result<void>
         openRecovered(
             const std::filesystem::path& master_path,
@@ -569,7 +672,7 @@ namespace lfs::vis::project {
                     ProjectDocumentAutosaveOptions>
                 autosave = std::nullopt);
         [[nodiscard]] lfs::Result<void>
-        startCompaction(bool automatic, bool clean = false,
+        startCompaction(bool clean = false,
                         const std::filesystem::path& destination = {},
                         const lfs::core::Uuid& expected_commit = {});
         [[nodiscard]] lfs::Result<void>
@@ -587,6 +690,9 @@ namespace lfs::vis::project {
         isTrainingCheckpointStale() const;
         [[nodiscard]] bool
         canFlushFinishedTrainerSnapshot() const;
+        // The loaded dataset's folder: the scene's, else the trainer's; empty
+        // without a dataset.
+        [[nodiscard]] std::filesystem::path loadedDatasetPath() const;
         // Keep these guards before snapshot adoption, without duplicating them
         // in the display reader. nullopt means the document needs further checks.
         [[nodiscard]] std::optional<bool> dirtyProjectPreflight() const;
@@ -595,6 +701,9 @@ namespace lfs::vis::project {
         void queueProjectWriteSettlement(
             JobHandle handle);
         void settleProjectWrite();
+        void processPendingTrainingStart();
+        [[nodiscard]] lfs::Result<void>
+        prepareTrainingStartProject(bool wait_for_write);
         void refreshStorageStats();
         void resetMaintenanceClocks();
         void clearAutosaveFailureBackoff();
@@ -634,7 +743,8 @@ namespace lfs::vis::project {
         [[nodiscard]] lfs::Result<void>
         bindUntitledSessionToMaster(
             const std::filesystem::path& destination,
-            bool allow_existing_destination_replacement = false);
+            bool allow_existing_destination_replacement = false,
+            bool wait_for_write = true);
         void resetAdoptedSnapshotCountOnServiceRestart(
             std::uint64_t completed_snapshots);
         [[nodiscard]] lfs::Result<void>
@@ -653,7 +763,8 @@ namespace lfs::vis::project {
         void stopHydrationThreads(bool cancel_open_job = true);
         void markHydrationFailed(
             std::uint64_t epoch,
-            const std::string& detail);
+            const std::string& detail,
+            std::string user_message = {});
         [[nodiscard]] static std::string
         hydrationName(Hydration state);
 
@@ -668,7 +779,9 @@ namespace lfs::vis::project {
             SceneManager& scene_manager,
             lfs::io::project::ProjectDocument& document,
             const lfs::io::project::ProjectDocumentHydrationReport&
-                report);
+                report,
+            const std::function<void(const std::string&)>&
+                on_failure = {});
         // Returns whether a dataset-only session can build its trainer now.
         bool captureStoredTrainingSession(
             const lfs::io::project::ProjectDocumentHydrationReport&
@@ -709,12 +822,24 @@ namespace lfs::vis::project {
         mutable std::mutex settings_mutex_;
         std::filesystem::path settings_path_;
         std::filesystem::path temp_project_directory_;
+        std::filesystem::path root_temp_project_directory_;
+        std::filesystem::path location_temp_project_directory_;
+        struct ScratchLocationCheck {
+            std::atomic<bool> done{false};
+            lfs::Status status;
+        };
+        // Write probe of the project location; runs off the UI thread.
+        std::function<lfs::Status(const std::filesystem::path&)>
+            scratch_location_probe_;
+        std::shared_ptr<ScratchLocationCheck> scratch_location_check_;
         std::filesystem::path legacy_recovery_directory_;
         std::filesystem::path legacy_working_tmp_directory_;
         bool isolated_scratch_storage_ = false;
         bool settings_persistence_enabled_ = true;
         std::atomic<std::uint64_t> epoch_{0};
         std::atomic<std::uint64_t> scene_mutation_serial_{0};
+        // Advances only on MODEL_CHANGED, the mutations that alter payload bytes.
+        std::atomic<std::uint64_t> payload_mutation_serial_{0};
         std::uint64_t active_restore_ticket_ = 0;
         std::atomic<std::uint64_t>
             selection_mutation_serial_{0};
@@ -747,6 +872,15 @@ namespace lfs::vis::project {
         bool autosave_quiesce_logged_ = false;
         std::uint64_t autosave_sequence_ = 0;
         bool autosave_memory_warning_published_ = false;
+        std::optional<std::filesystem::path> autosave_disk_full_destination_;
+        std::atomic<bool> pending_training_start_active_{false};
+        std::function<lfs::Result<void>()> pending_training_start_;
+        std::weak_ptr<lfs::io::project::ProjectDocument> pending_training_document_;
+        std::uint64_t pending_training_trainer_generation_ = 0;
+        bool pending_training_cancel_settlement_ = false;
+        std::optional<lfs::Error> pending_training_error_;
+        bool pending_training_write_started_ = false;
+        int pending_training_bind_attempts_ = 0;
         bool application_close_pending_ = false;
         bool close_discard_requested_ = false;
         bool suppress_training_adoption_ = false;
@@ -763,8 +897,10 @@ namespace lfs::vis::project {
         std::mutex pending_splat_capture_mutex_;
         std::vector<CompletedSplatCapture>
             completed_splat_captures_;
+        // payload_mutation_serial_ at each node's last SPLT capture.
         std::unordered_map<lfs::core::Uuid, std::uint64_t>
             captured_splat_serials_;
+        std::array<std::uint64_t, 2> captured_shader_token_{}, project_write_shader_token_{}, last_autosaved_shader_token_{};
         std::uint64_t
             project_write_dirty_epoch_ = 0;
         std::uint64_t
@@ -773,7 +909,6 @@ namespace lfs::vis::project {
             project_write_parameter_serial_ = 0;
         std::filesystem::path
             project_write_destination_;
-        bool project_write_automatic_ = false;
         std::string last_project_write_error_;
         std::optional<lfs::ErrorCode> last_project_write_error_code_;
         std::optional<lfs::Error> last_project_write_typed_error_;
@@ -797,6 +932,8 @@ namespace lfs::vis::project {
             startup_recovery_scan_candidates_;
         std::atomic<bool> startup_recovery_scan_ready_{false};
         std::jthread startup_recovery_scan_thread_;
+        std::atomic<bool> scratch_prune_running_{false};
+        std::jthread scratch_prune_thread_;
         std::uint64_t recovery_prompt_generation_ = 0;
         std::optional<RecoveryCandidate>
             pending_recovery_candidate_;

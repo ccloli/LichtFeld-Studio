@@ -4,7 +4,9 @@
  */
 
 #include "io/scene_chapter_adapter.hpp"
+#include "io/sfm_observation_chapter.hpp"
 
+#include "core/logger.hpp"
 #include "core/path_utils.hpp"
 #include "io/capture_omit_filter.hpp"
 
@@ -88,8 +90,12 @@ namespace lfs::io::project {
                 return "image";
             case MESH:
                 return "mesh";
+            case COLLISION:
+                return "collision";
             case PLY_SEQUENCE:
                 return "ply_sequence";
+            case CROP_POLYGON:
+                return "crop_polygon";
             case KEYFRAME_GROUP:
             case KEYFRAME:
                 return std::nullopt;
@@ -133,10 +139,27 @@ namespace lfs::io::project {
             if (value == "mesh") {
                 return MESH;
             }
+            if (value == "collision")
+                return COLLISION;
             if (value == "ply_sequence") {
                 return PLY_SEQUENCE;
             }
+            if (value == "crop_polygon") {
+                return CROP_POLYGON;
+            }
             return std::nullopt;
+        }
+
+        // Camera tensors already live on the host; cpu() of a host tensor clones it, and four
+        // clones per camera dominated scene capture on large datasets.
+        std::vector<float> host_floats(const lfs::core::Tensor& value) {
+            if (value.device() == lfs::core::Device::CPU && value.is_contiguous()) {
+                const float* data = value.ptr<float>();
+                return std::vector<float>(data, data + value.numel());
+            }
+            const auto host = value.cpu().contiguous();
+            const float* data = host.ptr<float>();
+            return std::vector<float>(data, data + host.numel());
         }
 
         template <std::size_t N>
@@ -153,9 +176,7 @@ namespace lfs::io::project {
                     "Camera node {} {} must be float32 with {} values",
                     node_uuid.to_string(), field, N));
             }
-            const auto cpu = value.cpu().contiguous();
-            const float* data = cpu.ptr<float>();
-            return std::vector<float>(data, data + N);
+            return host_floats(value);
         }
 
         std::vector<float> tensor_values_bounded(
@@ -171,9 +192,7 @@ namespace lfs::io::project {
                     "Camera node {} {} must be float32 [0..16]",
                     node_uuid.to_string(), field));
             }
-            const auto cpu = value.cpu().contiguous();
-            const float* data = cpu.ptr<float>();
-            return std::vector<float>(data, data + cpu.numel());
+            return host_floats(value);
         }
 
         CameraRecord capture_camera(const lfs::core::Camera& camera,
@@ -219,6 +238,7 @@ namespace lfs::io::project {
             result.has_image = camera.has_image();
             result.split =
                 camera.split() == lfs::core::CameraSplit::Train ? "train" : "eval";
+            result.sfm_observation_count = camera.sfm_observation_count();
             return result;
         }
 
@@ -317,11 +337,13 @@ namespace lfs::io::project {
                 .locked = node.locked.get(),
                 .training_enabled = node.training_enabled,
                 .payload_diverged = node.payload_diverged,
+                .point_cloud_source = node.point_cloud_source,
                 .georef_pose = std::nullopt,
                 .payload = std::nullopt,
                 .cropbox = std::nullopt,
                 .ellipsoid = std::nullopt,
                 .camera = std::nullopt,
+                .crop_polygon = std::nullopt,
             };
             std::copy_n(glm::value_ptr(node.local_transform.get()), 16,
                         result.local_transform.begin());
@@ -357,6 +379,22 @@ namespace lfs::io::project {
                               node.ellipsoid->color.z},
                     .line_width = node.ellipsoid->line_width,
                 };
+            }
+            if (node.crop_polygon) {
+                CropPolygonRecord record{
+                    .vertices = {},
+                    .half_depth = node.crop_polygon->half_depth,
+                    .inverse = node.crop_polygon->inverse,
+                    .enabled = node.crop_polygon->enabled,
+                    .color = {node.crop_polygon->color.x, node.crop_polygon->color.y,
+                              node.crop_polygon->color.z},
+                    .line_width = node.crop_polygon->line_width,
+                };
+                record.vertices.reserve(node.crop_polygon->vertices.size());
+                for (const glm::vec2& vertex : node.crop_polygon->vertices) {
+                    record.vertices.push_back({vertex.x, vertex.y});
+                }
+                result.crop_polygon = std::move(record);
             }
             if (node.camera) {
                 if (node.camera->has_in_memory_mask()) {
@@ -415,7 +453,8 @@ namespace lfs::io::project {
         using UndistortCache = std::map<UndistortCacheKey, lfs::core::UndistortParams>;
 
         std::shared_ptr<lfs::core::Camera> hydrate_camera(
-            const CameraRecord& value, UndistortCache& undistort_cache) {
+            const CameraRecord& value, UndistortCache& undistort_cache, const lfs::core::Uuid& node_uuid,
+            const std::shared_ptr<const SfmObservationChapterSource>& sfm_observations) {
             auto camera = std::make_shared<lfs::core::Camera>(
                 float_tensor(value.rotation, {3, 3}),
                 float_tensor(value.translation, {3}),
@@ -450,6 +489,21 @@ namespace lfs::io::project {
             camera->set_has_image(value.has_image);
             camera->set_split(value.split == "train" ? lfs::core::CameraSplit::Train
                                                      : lfs::core::CameraSplit::Eval);
+            if (value.sfm_observation_count > 0) {
+                bool stored = false;
+                if (sfm_observations) {
+                    const auto& cameras = sfm_observations->index().cameras;
+                    const auto entry = cameras.find(node_uuid);
+                    stored = entry != cameras.end() && entry->second.count == value.sfm_observation_count;
+                }
+                if (stored) {
+                    camera->set_sfm_observation_source(sfm_observations, node_uuid, value.sfm_observation_count);
+                } else {
+                    LOG_WARN("Camera '{}' lists {} SfM observations that the project does not contain; "
+                             "depth AbsRel is unavailable for it",
+                             value.image_name, value.sfm_observation_count);
+                }
+            }
             return camera;
         }
 
@@ -474,6 +528,7 @@ namespace lfs::io::project {
 
         const auto all_nodes = scene.getNodes();
         result.nodes.reserve(all_nodes.size());
+        std::unordered_map<const lfs::core::CollisionVolume*, lfs::core::Uuid> collision_instances;
         std::unordered_set<lfs::core::NodeId> excluded;
         for (const lfs::core::SceneNode* node : all_nodes) {
             if (node->type == lfs::core::NodeType::KEYFRAME ||
@@ -499,6 +554,12 @@ namespace lfs::io::project {
                 return lfs::Result<void>::failure(std::move(captured).error());
             }
             captured->parent_uuid = parent_uuid;
+            if (node.collision) {
+                const auto instance =
+                    collision_instances.emplace(node.collision.get(), node.uuid).first;
+                captured->collision = instance->second;
+                result.collisions.try_emplace(instance->second, node.collision);
+            }
             result.nodes.push_back(std::move(*captured));
             std::uint32_t saved_order = 0;
             for (const lfs::core::NodeId child_id : node.children) {
@@ -536,11 +597,8 @@ namespace lfs::io::project {
             !status) {
             return std::move(status).error();
         }
-        for (const auto& node : state.nodes) {
-            if (auto status = result.upsert_node(node);
-                !status) {
-                return std::move(status).error();
-            }
+        if (auto status = result.replace_nodes(state.nodes); !status) {
+            return std::move(status).error();
         }
         if (auto valid = result.validate_hierarchy(); !valid) {
             return std::move(valid).error();
@@ -567,7 +625,8 @@ namespace lfs::io::project {
             const SceneGraphChapter& chapter, lfs::core::Scene& scene,
             const ScenePayloadResolver& resolver,
             const bool defer_geometry_payloads,
-            const bool payload_units_only) {
+            const bool payload_units_only,
+            const std::unordered_set<lfs::core::Uuid>* selected_payload_nodes = nullptr) {
             UndistortCache undistort_cache;
             auto nodes = chapter.nodes();
             if (!nodes) {
@@ -607,7 +666,9 @@ namespace lfs::io::project {
                     if (type &&
                         (*type == lfs::core::NodeType::SPLAT ||
                          *type == lfs::core::NodeType::POINTCLOUD ||
-                         *type == lfs::core::NodeType::MESH)) {
+                         *type == lfs::core::NodeType::MESH) &&
+                        (!selected_payload_nodes ||
+                         selected_payload_nodes->contains(record.uuid))) {
                         geometry.push_back(record.uuid);
                     }
                 }
@@ -642,6 +703,8 @@ namespace lfs::io::project {
                     *type == lfs::core::NodeType::CROPBOX;
                 const bool is_ellipsoid =
                     *type == lfs::core::NodeType::ELLIPSOID;
+                const bool is_crop_polygon =
+                    *type == lfs::core::NodeType::CROP_POLYGON;
                 const bool is_camera =
                     *type == lfs::core::NodeType::CAMERA;
                 const bool is_geometry =
@@ -649,7 +712,9 @@ namespace lfs::io::project {
                     *type == lfs::core::NodeType::POINTCLOUD ||
                     *type == lfs::core::NodeType::MESH;
                 if (record.cropbox.has_value() != is_cropbox ||
+                    record.collision.has_value() != (*type == lfs::core::NodeType::COLLISION) ||
                     record.ellipsoid.has_value() != is_ellipsoid ||
+                    record.crop_polygon.has_value() != is_crop_polygon ||
                     record.camera.has_value() != is_camera ||
                     record.payload.has_value() != is_geometry) {
                     return fail<void>(
@@ -657,7 +722,7 @@ namespace lfs::io::project {
                         "A scene node has mismatched type-specific state.",
                         std::format(
                             "SCNG node {} type '{}' has an absent or extraneous "
-                            "payload/cropbox/ellipsoid/camera record",
+                            "payload/cropbox/ellipsoid/crop_polygon/camera record",
                             record.uuid.to_string(), record.type),
                         record.uuid);
                 }
@@ -689,6 +754,7 @@ namespace lfs::io::project {
                     .locked = record.locked,
                     .training_enabled = record.training_enabled,
                     .payload_diverged = record.payload_diverged,
+                    .point_cloud_source = record.point_cloud_source,
                     .payload_hydration =
                         is_geometry
                             ? (defer_geometry_payloads
@@ -703,6 +769,7 @@ namespace lfs::io::project {
                     .ellipsoid = nullptr,
                     .camera = nullptr,
                     .keyframe = nullptr,
+                    .crop_polygon = nullptr,
                 };
                 if (record.georef_pose) {
                     desc.georef_pose = lfs::core::GeoreferencePose{
@@ -716,6 +783,20 @@ namespace lfs::io::project {
                                        record.georef_pose->translation[1],
                                        record.georef_pose->translation[2]),
                     };
+                }
+                if (record.collision) {
+                    if (!resolver.collision)
+                        return fail<void>(lfs::ErrorCode::FailedPrecondition,
+                                          "A saved collision payload cannot be resolved.",
+                                          "COLV resolver is missing", record.uuid);
+                    auto payload = resolver.collision(*record.collision);
+                    if (!payload)
+                        return lfs::Result<void>::failure(std::move(payload).error());
+                    if (!*payload)
+                        return fail<void>(lfs::ErrorCode::DataLoss,
+                                          "A saved collision payload resolved to null.",
+                                          "COLV resolver returned null", record.uuid);
+                    desc.collision = std::move(*payload);
                 }
                 if (record.cropbox) {
                     desc.cropbox = std::make_unique<lfs::core::CropBoxData>(
@@ -750,9 +831,25 @@ namespace lfs::io::project {
                             .flash_intensity = 0.0f,
                         });
                 }
+                if (record.crop_polygon) {
+                    auto data = std::make_unique<lfs::core::CropPolygonData>();
+                    data->vertices.reserve(record.crop_polygon->vertices.size());
+                    for (const auto& vertex : record.crop_polygon->vertices) {
+                        data->vertices.emplace_back(vertex[0], vertex[1]);
+                    }
+                    data->half_depth = record.crop_polygon->half_depth;
+                    data->inverse = record.crop_polygon->inverse;
+                    data->enabled = record.crop_polygon->enabled;
+                    data->color = glm::vec3(record.crop_polygon->color[0],
+                                            record.crop_polygon->color[1],
+                                            record.crop_polygon->color[2]);
+                    data->line_width = record.crop_polygon->line_width;
+                    desc.crop_polygon = std::move(data);
+                }
                 if (record.camera) {
                     try {
-                        desc.camera = hydrate_camera(*record.camera, undistort_cache);
+                        desc.camera = hydrate_camera(*record.camera, undistort_cache, record.uuid,
+                                                     resolver.sfm_observations);
                     } catch (const std::exception& error) {
                         // LFS-CENSUS-OK(empty-catch): reject malformed camera tensors before mutating the scene.
                         return fail<void>(
@@ -942,13 +1039,14 @@ namespace lfs::io::project {
         const SceneGraphChapter& chapter,
         lfs::core::Scene& target,
         const ScenePayloadResolver& resolver,
-        const bool payload_units_only) {
+        const bool payload_units_only,
+        const std::unordered_set<lfs::core::Uuid>* selected_payload_nodes) {
         auto staged =
             lfs::core::Scene::createRestoreStage(target);
         if (auto populated =
                 populate_scene_stage(
                     chapter, *staged, resolver, false,
-                    payload_units_only);
+                    payload_units_only, selected_payload_nodes);
             !populated) {
             return std::move(populated).error();
         }
@@ -958,12 +1056,15 @@ namespace lfs::io::project {
     lfs::Result<std::unique_ptr<lfs::core::Scene>>
     stage_scene_shell(
         const SceneGraphChapter& chapter,
-        lfs::core::Scene& target) {
+        lfs::core::Scene& target,
+        std::shared_ptr<const SfmObservationChapterSource> sfm_observations,
+        CollisionPayloadResolver collision) {
         auto staged =
             lfs::core::Scene::createRestoreStage(target);
         if (auto populated =
                 populate_scene_stage(
-                    chapter, *staged, {}, true, false);
+                    chapter, *staged, ScenePayloadResolver{.splat = {}, .point_cloud = {}, .mesh = {}, .sfm_observations = std::move(sfm_observations), .collision = std::move(collision)},
+                    true, false);
             !populated) {
             return std::move(populated).error();
         }

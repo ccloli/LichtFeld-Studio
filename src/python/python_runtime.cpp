@@ -7,6 +7,7 @@
 #include "core/modal_event.hpp"
 #include "core/operator_callbacks.hpp"
 #include "gil.hpp"
+#include "visualizer/visualizer.hpp"
 
 #include <atomic>
 #include <cassert>
@@ -106,6 +107,8 @@ namespace lfs::python {
         GetThumbnailTextureCallback g_get_thumbnail_texture_cb = nullptr;
 
         // Viewport overlay callbacks
+        GetUIListInstanceCallback g_uilist_instance_cb = nullptr;
+        WrapUIListLayoutCallback g_uilist_layout_cb = nullptr;
         HasViewportDrawHandlersCallback g_has_viewport_draw_handlers_cb = nullptr;
         InvokeViewportOverlayCallback g_invoke_viewport_overlay_cb = nullptr;
         SyncViewportOverlayDocumentCallback g_sync_viewport_overlay_document_cb = nullptr;
@@ -351,6 +354,28 @@ namespace lfs::python {
     void set_visualizer(vis::Visualizer* viewer) { g_visualizer.store(viewer); }
     vis::Visualizer* get_visualizer() { return g_visualizer.load(); }
 
+    void markProjectSessionChapterCommitted(
+        const std::string_view chapter) {
+        auto* const viewer = get_visualizer();
+        if (!viewer)
+            return;
+        if (viewer->isOnViewerThread()) {
+            viewer->projectMarkSessionChapterCommitted(chapter);
+            return;
+        }
+        // Panel callbacks can be deferred until after session restore returns.
+        if (viewer->projectSessionRestoreInProgress())
+            return;
+        if (!viewer->acceptsPostedWork())
+            return;
+        const std::string chapter_copy(chapter);
+        viewer->postWork({.run = [viewer, chapter_copy] {
+            if (get_visualizer() == viewer &&
+                !viewer->projectSessionRestoreInProgress())
+                viewer->projectMarkSessionChapterCommitted(chapter_copy);
+        }});
+    }
+
     void set_parameter_manager(vis::ParameterManager* pm) { g_parameter_manager.store(pm); }
     vis::ParameterManager* get_parameter_manager() { return g_parameter_manager.load(); }
 
@@ -414,6 +439,9 @@ namespace lfs::python {
         std::function<float()> g_splat_simplify_progress;
         std::function<std::string()> g_splat_simplify_stage;
         std::function<std::string()> g_splat_simplify_error;
+        std::mutex g_camera_selection_operation_mutex;
+        std::string g_camera_selection_operation;
+        uint64_t g_camera_selection_group_id = 0;
     } // namespace
 
     void set_splat_simplify_callbacks(SplatSimplifyStartFn start,
@@ -444,6 +472,26 @@ namespace lfs::python {
     float invoke_splat_simplify_progress() { return g_splat_simplify_progress ? g_splat_simplify_progress() : 0.0f; }
     std::string invoke_splat_simplify_stage() { return g_splat_simplify_stage ? g_splat_simplify_stage() : std::string{}; }
     std::string invoke_splat_simplify_error() { return g_splat_simplify_error ? g_splat_simplify_error() : std::string{}; }
+
+    void set_camera_selection_operation(std::string operation) {
+        const std::lock_guard lock(g_camera_selection_operation_mutex);
+        g_camera_selection_operation = std::move(operation);
+    }
+
+    std::string get_camera_selection_operation() {
+        const std::lock_guard lock(g_camera_selection_operation_mutex);
+        return g_camera_selection_operation;
+    }
+
+    void set_camera_selection_group_id(const uint64_t group_id) {
+        const std::lock_guard lock(g_camera_selection_operation_mutex);
+        g_camera_selection_group_id = group_id;
+    }
+
+    uint64_t get_camera_selection_group_id() {
+        const std::lock_guard lock(g_camera_selection_operation_mutex);
+        return g_camera_selection_group_id;
+    }
 
     namespace {
         GetSelectedCameraUidCallback g_get_selected_camera_cb = nullptr;
@@ -1555,6 +1603,19 @@ namespace lfs::python {
         if (g_signal_bridge_callbacks.flush) {
             g_signal_bridge_callbacks.flush();
         }
+    }
+
+    void set_uilist_callbacks(GetUIListInstanceCallback get_instance, WrapUIListLayoutCallback wrap_layout) {
+        g_uilist_instance_cb = get_instance;
+        g_uilist_layout_cb = wrap_layout;
+    }
+
+    void* wrap_uilist_layout(void* layout) {
+        return g_uilist_layout_cb ? g_uilist_layout_cb(layout) : nullptr;
+    }
+
+    void* get_uilist_instance(const char* id) {
+        return g_uilist_instance_cb ? g_uilist_instance_cb(id) : nullptr;
     }
 
     void set_viewport_overlay_callbacks(HasViewportDrawHandlersCallback has_cb,

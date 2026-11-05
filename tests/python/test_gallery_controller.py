@@ -34,6 +34,8 @@ def gallery(monkeypatch, panel_module):
     native_io = import_module('lichtfeld.io')
     monkeypatch.setattr(module.lf, "io", SimpleNamespace(
         inspect_project=lambda path: SimpleNamespace(project_uuid="project", commit_uuid=""),
+        inspect_project_details=lambda _path, **_kwargs: SimpleNamespace(chapters=[]),
+        ProjectRowKind=native_io.ProjectRowKind,
         project_content_stamp=native_io.project_content_stamp), raising=False)
     panel = module.GalleryController()
     yield panel, state, actions
@@ -644,6 +646,34 @@ def test_publish_review_save_choice_only_for_open_project(gallery, monkeypatch, 
     assert 'data-if="show_unlinked_hint">{{unlinked_copy}}' in rml
 
 
+@pytest.mark.parametrize("open_project, live_shaders, stored_row, warned", [
+    (True, ["asset"], None, True),
+    (False, ["asset"], None, False),
+    (False, [], "LIVE", True),
+    (False, [], "TOMBSTONE", False),
+])
+def test_publish_review_warns_that_user_shaders_stay_local(gallery, monkeypatch, tmp_path, open_project, live_shaders, stored_row, warned):
+    from lfs_plugins.gallery_file_panel import GalleryFilePanel
+    module = import_module("lfs_plugins.gallery_file_panel")
+    controller, _, _ = gallery
+    path = tmp_path / "project-a.licht"
+    path.write_bytes(b"saved project")
+    kind = module.lf.io.ProjectRowKind
+    chapters = [SimpleNamespace(fourcc="SHDR", row_kind=getattr(kind, stored_row))] if stored_row else []
+    monkeypatch.setattr(module.lf.io, "inspect_project_details", lambda _path, checkpoint_byte_budget: SimpleNamespace(chapters=chapters))
+    monkeypatch.setattr(module.lf, "shaders", SimpleNamespace(list=lambda: live_shaders), raising=False)
+    monkeypatch.setattr(module.lf, "project_poll_write", lambda: {"path": str(path) if open_project else ""}, raising=False)
+    monkeypatch.setattr(module.lf, "project_is_dirty", lambda: False, raising=False)
+    monkeypatch.setattr(module.lf.ui, "get_panel_object", lambda _: None, raising=False)
+    monkeypatch.setattr(module.lf.ui, "set_panel_enabled", lambda *_: None, raising=False)
+    monkeypatch.setattr(module.lf.ui, "request_redraw", lambda: None, raising=False)
+    panel = GalleryFilePanel()
+    panel.show(controller=controller, asset={"id": "project", "path": str(path), "name": "Project"},
+               scene=None, action="publish", fields={"title": "Project", "description": "", "upload_format": "sog"},
+               warning="Quota low")
+    assert panel._review["warning"] == ("Quota low shader.publication_omitted" if warned else "Quota low")
+
+
 def test_pull_review_folder_dropdown_browse_and_submit(gallery, monkeypatch, tmp_path):
     from lfs_plugins.gallery_file_panel import GalleryFilePanel
     module = import_module("lfs_plugins.gallery_file_panel")
@@ -1052,12 +1082,12 @@ def test_local_file_problem_prefers_project_error(gallery):
 
     assert facts["reason"] == "permission denied"
 
-def test_upload_format_persists_and_defaults_to_sog(gallery, tmp_path):
+def test_upload_format_persists_and_defaults_to_auto(gallery, tmp_path):
     panel, _, _ = gallery
     panel.service.root = tmp_path
+    assert panel.upload_format == 'auto'
+    panel.upload_format = 'sog'
     assert panel.upload_format == 'sog'
-    panel.upload_format = 'ssog'
-    assert panel.upload_format == 'ssog'
     with pytest.raises(ValueError):
         panel.upload_format = 'zip'
 
@@ -1424,7 +1454,7 @@ def test_U2_portal_404_sentence_requests_refresh(gallery, monkeypatch):
     monkeypatch.setattr(module.lf.ui, 'tr', lambda key: 'localized:' + key)
     assert localize_message('This gallery item is no longer available. Refresh the gallery.') == 'localized:projects.gallery.sidebar.refresh'
 
-@pytest.mark.parametrize('status,expected', [('completed', '134 KB'), ('canceled', '1.0 KB'), ('running', '1.0 KB / 134 KB')])
+@pytest.mark.parametrize('status,expected', [('completed', '137 KB'), ('canceled', '1.0 KB'), ('running', '1.0 KB / 137 KB')])
 def test_A5_finished_overlay_rows_show_one_adaptive_size(gallery, monkeypatch, status, expected):
     from lfs_plugins.gallery_transfer_ui import transfer_rows
     module = import_module('lfs_plugins.gallery_controller')
@@ -1575,6 +1605,14 @@ def test_presentation_metadata_and_scene_content_have_separate_relationships(gal
     assert asset_sync_state(asset, link, dict(remote, contentRevision="c2"))["state"] == "remote_content"
     assert asset_sync_state(asset, link, None, established=False)["state"] == "not_checked"
     assert asset_sync_state(asset, dict(link, commitUuid=""), remote)["state"] == "unknown"
+
+
+def test_missing_hdr_background_is_not_reported_as_external_splat_data(gallery):
+    from lfs_plugins.gallery_actions import gallery_eligibility
+    asset = dict(id="project", commit_uuid="saved", exists=True)
+    failed = dict(project="project", commitUuid="saved", nativePreparation=True,
+                  failureReason="gallery_project_hdr_unavailable: The HDR background file is missing.")
+    assert gallery_eligibility(asset, dict(signed_in=True, job=failed))["reasons"] == ["hdr_missing"]
 
 
 def test_eligibility_uses_only_checks_for_the_saved_commit(gallery):
@@ -2235,6 +2273,7 @@ def test_publish_preserves_gallery_description_text_exactly(gallery, monkeypatch
     from lfs_plugins.gallery_file_panel import GalleryFilePanel
     module = import_module("lfs_plugins.gallery_file_panel")
     monkeypatch.setattr(module.lf.ui, "request_redraw", lambda: None, raising=False)
+    monkeypatch.setattr(module.lf.ui, "get_panel_object", lambda _id: None, raising=False)
     description = 'first line\n"quoted" <tag> & 😀 https://example.com/a?x=1&y=2\n'
     submitted = []
     controller = SimpleNamespace(

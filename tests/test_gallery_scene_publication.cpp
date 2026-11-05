@@ -6,12 +6,14 @@
 #include "core/scene.hpp"
 #include "core/tensor.hpp"
 #include "gui/gallery_scene_publication.hpp"
+#include "io/exporter.hpp"
 #include "io/formats/sogs.hpp"
 #include "io/formats/spz.hpp"
 #include "io/project_document.hpp"
 #include "licht_test_support.hpp"
 #include "project/session_state.hpp"
 #include "rendering/rendering_types.hpp"
+#include "user_shader_sources.hpp"
 
 #include <gtest/gtest.h>
 
@@ -207,6 +209,42 @@ namespace {
     }
 
 } // namespace
+
+TEST(GalleryScenePublicationTest, PublicationStripsOnlyCustomClipFromCopiedTimeline) {
+    TemporaryDirectory temporary;
+    auto request = base_request(temporary.path / "shader.scene", ExportFormat::GALLERY_SCENE);
+    request.nodes.push_back({.snapshot = cpu_snapshot(), .name = "Generated"});
+    request.published_timeline = {{"version", 1}, {"keyframes", nlohmann::json::array()}, {"extension", "retained"}, {"reveal_clip", {{"effect", 12}, {"shader_id", fixed_uuid(19101).to_string()}, {"start", 0}, {"end", 1}, {"softness", 0.1}}}};
+    const auto original = request.published_timeline;
+    writeGalleryScenePublication(request, {}, {});
+    EXPECT_TRUE(request.shaders_omitted);
+    EXPECT_TRUE(original.contains("reveal_clip"));
+    auto reader = require_result(lfs::io::project::ProjectReader::open(request.path / "project.licht"));
+    EXPECT_FALSE(reader.find(lfs::io::project::FOURCC_SHDR, reader.superblock().project_uuid));
+    EXPECT_FALSE(reader.commit().required_reader_capabilities.contains(lfs::io::project::USER_SHADERS_V1));
+    const auto* row = reader.find(lfs::io::project::FOURCC_SEQR, reader.superblock().project_uuid);
+    ASSERT_NE(row, nullptr);
+    const auto chapter = require_result(lfs::io::project::SequencerSessionChapter::from_bytes(require_result(reader.read_chunk(*row))));
+    EXPECT_FALSE(chapter.dom().get_json("timeline.reveal_clip"));
+    EXPECT_EQ(chapter.dom().get<std::string>("timeline.extension"), "retained");
+    EXPECT_TRUE(chapter.dom().get_json("timeline.keyframes")->empty());
+    const auto source_path = request.path / "project.licht";
+    auto source = require_result(ProjectDocument::open(source_path));
+    ASSERT_TRUE(source.edit_shaders().dom().set_json("assets", nlohmann::json::array({{{"uuid", fixed_uuid(19101).to_string()}, {"name", "Generated"}, {"language", "slang"}, {"source", lfs::test::kIdentity}, {"parameters", nlohmann::json::object()}}})));
+    ASSERT_TRUE(source.edit_sequencer().dom().set_json("timeline", original));
+    ASSERT_TRUE(source.save(source_path));
+    const auto source_bytes = read_file_bytes(source_path);
+    GalleryScenePublishRequest saved;
+    std::string commit;
+    lfs::vis::gui::prepareGalleryProjectPublication({source_path, temporary.path / "saved.scene", ExportFormat::GALLERY_SCENE, ""}, saved, commit);
+    EXPECT_TRUE(saved.shaders_omitted);
+    writeGalleryScenePublication(saved, {}, {});
+    EXPECT_EQ(read_file_bytes(source_path), source_bytes);
+    auto published = require_result(ProjectDocument::open(saved.path / "project.licht"));
+    EXPECT_TRUE(published.shaders().dom().get_json("assets")->empty());
+    EXPECT_FALSE(published.sequencer().dom().get_json("timeline.reveal_clip"));
+    EXPECT_FALSE(published.source_reader()->commit().required_writer_capabilities.contains(lfs::io::project::USER_SHADERS_V1));
+}
 
 TEST(GalleryScenePublicationTest, PublishedCameraRecordsWorldExtentFromSettingsScale) {
     Viewport viewport(1920, 1080);
@@ -456,6 +494,79 @@ std::vector<std::byte> ngsp_v4_stub(const std::uint32_t count, const std::uint8_
     return bytes;
 }
 
+namespace {
+    lfs::io::SsogArchiveSummary summarize_file(const std::filesystem::path& path) {
+        const auto bytes = read_file_bytes(path);
+        const auto summary = lfs::io::summarize_ssog_archive(
+            bytes.size(), [&](const std::uint64_t offset, const std::span<std::byte> destination) {
+                if (offset > bytes.size() || destination.size() > bytes.size() - offset)
+                    return false;
+                std::memcpy(destination.data(), bytes.data() + offset, destination.size());
+                return true;
+            });
+        if (!summary)
+            throw std::runtime_error(summary.error().format());
+        return *summary;
+    }
+
+    std::vector<std::byte> ssog_bytes(const SplatData& data, const std::filesystem::path& path, const int levels) {
+        if (const auto saved = lfs::io::save_ssog(data, {.output_path = path, .lod_levels = levels}); !saved)
+            throw std::runtime_error(saved.error().format());
+        return read_file_bytes(path);
+    }
+} // namespace
+
+// A streamable SSOG copied unchanged keeps its bytes; re-encoding it would cost a full SSOG export.
+TEST(GalleryScenePublicationTest, StreamableSsogIsByteIdenticalAfterPublication) {
+    TemporaryDirectory temporary;
+    auto snapshot = cpu_snapshot();
+    const auto original = ssog_bytes(*snapshot.data, temporary.path / "source.ssog", 1);
+    auto request = base_request(temporary.path / "identical-ssog.scene", ExportFormat::GALLERY_SSOG);
+    request.nodes.push_back(GalleryScenePublishNode{
+        .snapshot = snapshot,
+        .name = "clean-ssog",
+        .encoded = owned_asset("ssog", original, fixed_uuid(31)),
+    });
+    writeGalleryScenePublication(request, {}, {});
+    EXPECT_EQ(read_file_bytes(request.path / "0.ssog"), original);
+}
+
+// A copied SSOG with an empty level would publish as not streamable; it must be encoded again instead.
+TEST(GalleryScenePublicationTest, SsogWithEmptyLevelIsReencodedBeforePublication) {
+    TemporaryDirectory temporary;
+    auto snapshot = cpu_snapshot();
+    const auto original = ssog_bytes(*snapshot.data, temporary.path / "source.ssog", 6);
+    ASSERT_EQ(summarize_file(temporary.path / "source.ssog").counts.back(), 0u);
+    auto request = base_request(temporary.path / "reencoded-ssog.scene", ExportFormat::GALLERY_SSOG);
+    request.nodes.push_back(GalleryScenePublishNode{
+        .snapshot = snapshot,
+        .name = "sparse-levels",
+        .encoded = owned_asset("ssog", original, fixed_uuid(32)),
+    });
+    writeGalleryScenePublication(request, {}, {});
+    const auto summary = summarize_file(request.path / "0.ssog");
+    EXPECT_EQ(summary.counts, std::vector<std::size_t>{snapshot.row_count});
+    EXPECT_TRUE(summary.webp_stored);
+}
+
+// Phones load the coarsest whole level: each gallery level halves the splats until it holds 500k or fewer.
+TEST(GalleryScenePublicationTest, GallerySsogHalvesUntilTheCoarsestLevelFitsPhones) {
+    TemporaryDirectory temporary;
+    Scene::SplatSnapshot snapshot;
+    snapshot.data = std::shared_ptr<SplatData>(make_splat(1'200'000).release());
+    snapshot.row_count = static_cast<std::size_t>(snapshot.data->size());
+    snapshot.active_sh_degree = snapshot.data->get_active_sh_degree();
+    auto request = base_request(temporary.path / "levels.scene", ExportFormat::GALLERY_SSOG);
+    request.nodes.push_back(GalleryScenePublishNode{.snapshot = snapshot, .name = "large"});
+    writeGalleryScenePublication(request, {}, {});
+    const auto summary = summarize_file(request.path / "0.ssog");
+    ASSERT_EQ(summary.counts.size(), 3u);
+    EXPECT_EQ(summary.counts.front(), snapshot.row_count);
+    EXPECT_LE(summary.counts.back(), 500'000u);
+    EXPECT_TRUE(summary.webp_stored);
+    EXPECT_FALSE(summary.empty_license);
+}
+
 TEST(GalleryScenePublicationTest, UnchangedSpzV4AssetIsByteIdenticalAfterPublication) {
     TemporaryDirectory temporary;
     const auto original = ngsp_v4_stub(8, 0);
@@ -626,7 +737,8 @@ namespace {
     using lfs::vis::gui::verifyGalleryProjectCommit;
 
     std::filesystem::path portable_fixture(const std::string& kind) {
-        return std::filesystem::path(__FILE__).parent_path() / "data" / ("portable-" + kind + ".licht");
+        // __FILE__ is relative when compiler-cache builds map the source prefix.
+        return std::filesystem::path(PROJECT_ROOT_PATH) / "tests" / "data" / ("portable-" + kind + ".licht");
     }
 
     // Deliberately invalid bindings cannot pass ProjectDocument::save validation.
@@ -827,6 +939,58 @@ TEST(GalleryProjectExportTest, CommitMismatchRefusesBeforeStagingAndDetectsLater
     const auto saved = require_result(source.save(path));
     EXPECT_NE(saved.commit_uuid.to_string(), commit);
     EXPECT_THROW(verifyGalleryProjectCommit(path, commit), std::runtime_error);
+}
+
+// Catches a saved project whose HDR background is an external file failing to publish (it only accepted an
+// embedded HDR), and a missing HDR reported with the external splat data code instead of its own.
+TEST(GalleryProjectExportTest, ExternalHdrBackgroundPublishesAndMissingOneHasItsOwnError) {
+    TemporaryDirectory temporary;
+    const auto hdr = temporary.path / "sky.hdr";
+    std::filesystem::copy_file(std::filesystem::path(PROJECT_ROOT_PATH) / "src" / "visualizer" / "gui" / "assets" /
+                                   "environments" / "alps_field_1k.hdr",
+                               hdr);
+    const auto path = temporary.path / "external_hdr.licht";
+    std::filesystem::copy_file(portable_fixture("sog"), path);
+    auto source = require_result(ProjectDocument::open(path));
+    const auto reference = require_result(lfs::io::project::upsert_path_reference(
+        source.edit_references(), path.parent_path(), hdr, "view.environment", "environment_map"));
+    require_status(source.edit_view().dom().set("render_settings.environment_reference_uuid", reference.to_string()));
+    (void)require_result(source.save(path));
+
+    GalleryScenePublishRequest publication;
+    std::string commit;
+    prepareGalleryProjectPublication({path, temporary.path / "external.scene", ExportFormat::GALLERY_SOG, ""},
+                                     publication, commit);
+    EXPECT_EQ(std::filesystem::weakly_canonical(publication.environment_source), std::filesystem::weakly_canonical(hdr));
+
+    std::filesystem::remove(hdr);
+    GalleryScenePublishRequest missing;
+    try {
+        prepareGalleryProjectPublication({path, temporary.path / "missing.scene", ExportFormat::GALLERY_SOG, ""},
+                                         missing, commit);
+        FAIL() << "A missing HDR background must be refused";
+    } catch (const std::runtime_error& error) {
+        EXPECT_TRUE(std::string(error.what()).starts_with("gallery_project_hdr_unavailable:")) << error.what();
+    }
+}
+
+// Catches the bundled HDR background, which a project stores by name instead of as a file reference,
+// being refused as external or missing.
+TEST(GalleryProjectExportTest, BuiltinHdrBackgroundPublishes) {
+    TemporaryDirectory temporary;
+    const auto path = temporary.path / "builtin_hdr.licht";
+    std::filesystem::copy_file(portable_fixture("sog"), path);
+    auto source = require_result(ProjectDocument::open(path));
+    require_status(source.edit_view().dom().set_json("render_settings.environment_reference_uuid", nullptr));
+    require_status(source.edit_view().dom().set("render_settings.environment_builtin",
+                                                std::string(lfs::vis::kDefaultEnvironmentMapPath)));
+    (void)require_result(source.save(path));
+
+    GalleryScenePublishRequest publication;
+    std::string commit;
+    prepareGalleryProjectPublication({path, temporary.path / "builtin.scene", ExportFormat::GALLERY_SOG, ""},
+                                     publication, commit);
+    EXPECT_EQ(publication.environment_source, std::filesystem::path(lfs::vis::kDefaultEnvironmentMapPath));
 }
 
 TEST(GalleryProjectExportTest, MissingAndExternalPayloadsGiveSpecificFallbackError) {

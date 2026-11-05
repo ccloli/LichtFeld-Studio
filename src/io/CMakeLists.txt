@@ -11,6 +11,8 @@ add_library(lfs_io_cuda STATIC
         cuda/splat_decimate.cu
         cuda/image_format_kernels.cuh
         cuda/image_format_kernels.cu
+        cuda/masked_image_fill.cu
+        cuda/image_sharpen.cu
 )
 
 target_include_directories(lfs_io_cuda
@@ -111,7 +113,8 @@ set_target_properties(spz_lib PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # Video encoding library (FFmpeg + CUDA for GPU-accelerated encoding)
 find_package(PkgConfig REQUIRED)
-pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
+# Keep pkg-config results separate from FindFFMPEG's cached variables.
+pkg_check_modules(LFS_FFMPEG REQUIRED IMPORTED_TARGET
         libavcodec
         libavformat
         libswscale
@@ -122,6 +125,8 @@ pkg_check_modules(LIBPLACEBO REQUIRED IMPORTED_TARGET libplacebo)
 add_library(lfs_video STATIC
         include/io/video/video_encoder_interface.hpp
         include/io/video/video_export_options.hpp
+        include/io/video/video_frame_rate.hpp
+        include/io/video/video_frame_geometry.hpp
         include/io/video/video_extensions.hpp
         video/video_encoder.hpp
         video/video_encoder.cpp
@@ -129,6 +134,8 @@ add_library(lfs_video STATIC
         video/color_convert.cu
         video/cuda_frame_handoff.hpp
         video/cuda_frame_handoff.cpp
+        video/video_metadata.hpp
+        video/video_metadata.cpp
         video_frame_extractor.hpp
         video_frame_extractor.cpp
         hdr_tonemap.hpp
@@ -155,7 +162,8 @@ target_include_directories(lfs_video SYSTEM PRIVATE
 
 target_link_libraries(lfs_video
         PRIVATE
-        PkgConfig::FFMPEG
+        lfs_core
+        PkgConfig::LFS_FFMPEG
         spdlog::spdlog
         CUDA::cudart
         CUDA::cuda_driver
@@ -234,6 +242,7 @@ else()
 endif()
 
 add_library(lfs_io STATIC
+    collision_export.cpp
         # Implementation file only (header is in include/io/)
         loader.cpp
         splat_decimate.cpp
@@ -326,6 +335,7 @@ add_library(lfs_io STATIC
         project/project_chapters.cpp
         project/session_chapters.cpp
         project/project_document.cpp
+        project/sfm_observation_chapter.cpp
         project/project_preview.cpp
         project/project_recovery.cpp
         project/project_inspector.cpp
@@ -406,7 +416,7 @@ target_link_libraries(lfs_io
         ${WEBP_DECODE_LIB}     # WebP for SOG decompression
         ${WEBP_ENCODE_LIB}     # WebP for SOG/HTML export
         ${ARCHIVE_LIB}         # LibArchive for SOG bundle support
-        ZLIB::ZLIB             # gzip/msgpack payloads inside NuRec USDZ
+        ZLIB::ZLIB             # gzip/msgpack payloads inside NuRec USDZ, deflated SSOG members
         $<IF:$<TARGET_EXISTS:libdeflate::libdeflate_shared>,libdeflate::libdeflate_shared,libdeflate::libdeflate_static> # fast DEFLATE for RAD
         zstd::libzstd          # .licht project container chunk compression
         OpenSSL::Crypto

@@ -14,6 +14,40 @@ import pytest
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
+def _all_file_items(file_menu):
+    def walk(items):
+        for item in items:
+            yield item
+            yield from walk(item.get("items", []))
+    return list(walk(file_menu.FileMenu().menu_items()))
+
+
+def test_file_menu_groups_preserve_existing_operators(monkeypatch):
+    module = _load_file_menu(monkeypatch)
+    calls = []
+    monkeypatch.setattr(module.lf.ui, "get_panel_object", lambda _: SimpleNamespace(show=calls.append), raising=False)
+    assert module.CollisionOperator().execute(None) == {"FINISHED"}
+    assert calls == [True]
+    items = module.FileMenu().menu_items()
+    submenus = {item["label"]: item["items"] for item in items if item["type"] == "submenu"}
+    assert list(submenus) == [
+        "tr:menu.file.open_recent", "tr:menu.file.import", "tr:menu.file.export_menu",
+        "tr:menu.tools.gallery", "tr:menu.file.project_maintenance",
+    ]
+    exports = submenus["tr:menu.file.export_menu"]
+    assert [item["operator_id"].split(".")[-1] for item in exports] == [
+        "CollisionOperator", "ExportOperator", "ExportConfigOperator",
+    ]
+    maintenance = submenus["tr:menu.file.project_maintenance"]
+    assert [item["operator_id"].split(".")[-1] for item in maintenance if "operator_id" in item] == [
+        "EmbedDatasetOperator", "CleanProjectOperator", "CompactProjectOperator",
+    ]
+    assert not any(item.get("type") == "toggle" for item in items)
+    assert [item["label"] for item in submenus["tr:menu.tools.gallery"]] == [
+        "tr:menu.file.open_gallery", "tr:menu.file.publish_to_gallery", "tr:menu.tools.gallery_transfers",
+    ]
+
+
 def _load_file_menu(monkeypatch, recent_paths=()):
     for module_name in list(sys.modules):
         if module_name == "lfs_plugins" or module_name.startswith("lfs_plugins."):
@@ -116,6 +150,8 @@ def _load_file_menu(monkeypatch, recent_paths=()):
     lf_stub.is_dataset_path = lambda _path: True
     lf_stub.read_checkpoint_header = lambda _path: object()
     lf_stub.read_checkpoint_params = lambda _path: object()
+    lf_stub.scene = SimpleNamespace(NodeType=SimpleNamespace(SPLAT="splat"))
+    lf_stub.get_scene = lambda: SimpleNamespace(get_nodes=lambda: [], is_node_effectively_visible=lambda _node: True)
     monkeypatch.setitem(sys.modules, "lichtfeld", lf_stub)
 
     class Operator:
@@ -194,7 +230,7 @@ def _recent_item_callback(file_menu):
 
 def _thumbnail_item(file_menu):
     return next(
-        (item for item in file_menu.FileMenu().menu_items()
+        (item for item in _all_file_items(file_menu)
          if item.get("label") == "tr:menu.file.update_thumbnail_from_view"),
         None,
     )
@@ -359,7 +395,7 @@ def test_file_menu_publishes_current_project_from_review_without_asset_index(
     monkeypatch.setitem(sys.modules, "lfs_plugins.gallery_controller", controller_module)
 
     item = next(
-        item for item in file_menu.FileMenu().menu_items()
+        item for item in _all_file_items(file_menu)
         if item.get("label") == "tr:menu.file.publish_to_gallery"
     )
     assert item["enabled"] is True
@@ -463,7 +499,7 @@ def test_file_menu_linked_project_uses_gallery_primary_action(monkeypatch, tmp_p
     gallery_panel.open_gallery_file_panel = lambda **review: opened.append(review)
     monkeypatch.setitem(sys.modules, "lfs_plugins.gallery_file_panel", gallery_panel)
 
-    item = next(item for item in file_menu.FileMenu().menu_items()
+    item = next(item for item in _all_file_items(file_menu)
                 if item.get("label") == "tr:menu.file.publish_to_gallery")
     item["callback"]()
 
@@ -529,7 +565,7 @@ def _linked_file_publish_harness(monkeypatch, tmp_path, snapshot):
 
     def invoke():
         item = next(
-            item for item in file_menu.FileMenu().menu_items()
+            item for item in _all_file_items(file_menu)
             if item.get("label") == "tr:menu.file.publish_to_gallery"
         )
         item["callback"]()
@@ -712,7 +748,7 @@ def test_file_menu_publish_is_disabled_without_a_scene(monkeypatch):
     file_menu.lf.project_has_path = lambda: False
 
     item = next(
-        item for item in file_menu.FileMenu().menu_items()
+        item for item in _all_file_items(file_menu)
         if item.get("label") == "tr:menu.file.publish_to_gallery"
     )
 
@@ -744,7 +780,7 @@ def test_file_menu_publish_refuses_a_copy_of_another_project(monkeypatch, tmp_pa
     monkeypatch.setitem(sys.modules, "lfs_plugins.gallery_file_panel", gallery_panel)
 
     item = next(
-        item for item in file_menu.FileMenu().menu_items()
+        item for item in _all_file_items(file_menu)
         if item.get("label") == "tr:menu.file.publish_to_gallery"
     )
     item["callback"]()
@@ -767,7 +803,7 @@ def test_file_menu_publish_rejects_missing_saved_project(monkeypatch, tmp_path):
     monkeypatch.setitem(sys.modules, "lfs_plugins.gallery_file_panel", gallery_panel)
 
     item = next(
-        item for item in file_menu.FileMenu().menu_items()
+        item for item in _all_file_items(file_menu)
         if item.get("label") == "tr:menu.file.publish_to_gallery"
     )
     item["callback"]()
@@ -858,7 +894,7 @@ def test_open_project_with_confirmation_reports_open_error(monkeypatch):
 
 
 def _compact_project_item(file_menu):
-    for item in file_menu.FileMenu().menu_items():
+    for item in _all_file_items(file_menu):
         if str(item.get("operator_id", "")).endswith("CompactProjectOperator"):
             return item
     raise AssertionError("CompactProjectOperator menu entry missing")
@@ -1055,6 +1091,25 @@ def test_new_project_asks_before_stopping_training(monkeypatch, stop):
     assert file_menu.lf.project_create_calls == []
 
 
+def test_project_switch_confirmation_keeps_prior_training_approval(monkeypatch):
+    file_menu = _load_file_menu(monkeypatch)
+    file_menu.lf.project_is_dirty = lambda: True
+    file_menu.lf.is_training_active = lambda: True
+
+    file_menu._show_project_switch_confirmation(
+        True, "", False, "", False, True
+    )
+
+    assert len(file_menu.lf.confirm_dialogs) == 1
+    title, _message, buttons, callback = file_menu.lf.confirm_dialogs[0]
+    assert title == "tr:menu.file.new_project"
+    callback(buttons[1])
+
+    assert len(file_menu.lf.confirm_dialogs) == 1
+    assert file_menu.lf.new_project_calls == [(True, True)]
+    assert file_menu.lf.project_create_calls == []
+
+
 def test_open_recent_while_training_prompts_instead_of_opening(
     monkeypatch, tmp_path
 ):
@@ -1159,16 +1214,17 @@ def test_load_file_confirmation_title_for_splat_and_dataset(monkeypatch):
     assert dataset_title == "tr:load_dataset_popup.save_title"
 
 
-def test_load_file_confirmation_preserves_one_ordered_batch(monkeypatch):
+@pytest.mark.parametrize("paths", [["/tmp/a.ply"], ["/tmp/a.ply", "/tmp/b.ply"]])
+def test_load_file_confirmation_preserves_one_ordered_batch(monkeypatch, paths):
     file_menu = _load_file_menu(monkeypatch)
     calls = []
     file_menu.lf.load_files = lambda *args, **kwargs: calls.append((args, kwargs))
     file_menu._show_load_file_confirmation(
-        ["/tmp/a.ply", "/tmp/b.ply"], False, True, True
+        paths, False, True, True
     )
     assert file_menu.lf.load_file_calls == []
     assert calls == [
-        ((["/tmp/a.ply", "/tmp/b.ply"],),
+        ((paths,),
          {"discard_changes": True, "replace": True, "stop_training": False, "_user_batch": True})
     ]
 
@@ -1199,7 +1255,9 @@ def test_menu_bar_transfer_operator_shows_overlay(monkeypatch):
     assert calls == ['overlay']
 
 
-def test_registered_load_confirmation_keeps_batch_after_prompt(monkeypatch):
+@pytest.mark.parametrize("paths", [["/tmp/first.ply"], ["/tmp/first.ply", "/tmp/second.ply"]])
+@pytest.mark.parametrize("choice", ["discard", "cancel", "save_failed"])
+def test_registered_load_confirmation_keeps_batch_after_prompt(monkeypatch, paths, choice):
     file_menu = _load_file_menu(monkeypatch)
     callbacks = {}
     file_menu.lf.register_class = lambda _cls: None
@@ -1215,15 +1273,24 @@ def test_registered_load_confirmation_keeps_batch_after_prompt(monkeypatch):
     calls = []
     file_menu.lf.load_files = lambda *args, **kwargs: calls.append((args, kwargs))
     callbacks["on_show_load_file_confirmation_with_batch"](
-        ["/tmp/first.ply", "/tmp/second.ply"], False, True, True
+        paths, False, True, True
     )
     assert calls == []
     assert len(file_menu.lf.confirm_dialogs) == 1
     _title, _message, buttons, on_result = file_menu.lf.confirm_dialogs[0]
     assert "tr:unsaved_work.continue_without_saving" in buttons
-    on_result("tr:unsaved_work.continue_without_saving")
+    if choice == "save_failed":
+        file_menu.lf.project_save = lambda **_kwargs: False
+        on_result(buttons[0])
+    elif choice == "cancel":
+        on_result("tr:common.cancel")
+    else:
+        on_result("tr:unsaved_work.continue_without_saving")
+    if choice != "discard":
+        assert calls == []
+        return
     assert calls == [
-        ((["/tmp/first.ply", "/tmp/second.ply"],),
+        ((paths,),
          {"discard_changes": True, "replace": True,
           "stop_training": False, "_user_batch": True})
     ]

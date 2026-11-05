@@ -8,14 +8,18 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <glm/glm.hpp>
 #include <memory>
+#include <optional>
+#include <span>
 #include <vector>
 #include <vulkan/vulkan.h>
 
 namespace lfs::core {
     struct MeshData;
-}
+    struct CollisionVolume;
+} // namespace lfs::core
 
 namespace lfs::vis {
 
@@ -27,15 +31,17 @@ namespace lfs::vis {
     // wired (master defaults shadow_enabled=false; will be a follow-up depth-only pass).
     struct VulkanMeshDrawItem {
         const lfs::core::MeshData* mesh = nullptr;
+        std::shared_ptr<const lfs::core::CollisionVolume> collision{};
+        float collision_opacity = 1.0f;
         glm::mat4 model{1.0f};
         glm::vec3 light_dir{0.3f, 1.0f, 0.5f};
+        bool camera_relative_light = false;
         float light_intensity = 0.7f;
         float ambient = 0.4f;
         bool backface_culling = true;
         // Selection emphasis (matches master's mesh_pbr.frag).
         bool is_emphasized = false;
         bool dim_non_emphasized = false;
-        float flash_intensity = 0.0f;
         // Wireframe overlay drawn after the main mesh pass.
         bool wireframe_overlay = false;
         glm::vec3 wireframe_color{0.2f, 0.2f, 0.2f};
@@ -43,22 +49,38 @@ namespace lfs::vis {
         // Shadow map: depth-only pre-pass per mesh, then sampler2DShadow read in main shader.
         bool shadow_enabled = false;
         int shadow_map_resolution = 2048;
-    };
-
-    struct VulkanMeshPassParams {
-        glm::mat4 view_projection{1.0f};
-        glm::vec3 camera_position{0.0f};
-        std::vector<VulkanMeshDrawItem> items;
-        std::size_t frame_slot = 0;
-        std::size_t draw_group = 0;
-        std::size_t draw_group_count = 1;
+        // Bit i set: drawn in viewport panel i (split view sides compare different meshes).
+        std::uint32_t panel_mask = ~0u;
     };
 
     struct VulkanMeshViewportPanel {
         float start_position = 0.0f;
         float end_position = 1.0f;
         glm::mat4 view_projection{1.0f};
+        glm::mat4 view{1.0f};
+        glm::mat4 projection{1.0f};
         glm::vec3 camera_position{0.0f};
+        glm::vec3 camera_backward{0.0f, 0.0f, 1.0f};
+        bool equirectangular = false;
+        // The projection spans the whole viewport; the panel range only clips.
+        bool full_viewport_projection = false;
+    };
+
+    struct VulkanMeshPassParams {
+        glm::mat4 view_projection{1.0f};
+        glm::vec3 camera_position{0.0f};
+        glm::vec3 camera_backward{0.0f, 0.0f, 1.0f};
+        bool depth_view = false;
+        float depth_view_min = 0.0f;
+        float depth_view_max = 1.0f;
+        bool depth_grayscale = false;
+        std::vector<VulkanMeshDrawItem> items;
+        std::span<const VulkanMeshViewportPanel> panels;
+        // Clip rect inside the viewport rect passed to record(); defaults to all of it.
+        std::optional<VkRect2D> scissor;
+        std::size_t frame_slot = 0;
+        std::size_t draw_group = 0;
+        std::size_t draw_group_count = 1;
     };
 
     class LFS_VIS_API VulkanMeshPass {
@@ -75,7 +97,8 @@ namespace lfs::vis {
         // must match the render-pass attachments the caller will record into.
         [[nodiscard]] bool init(VulkanContext& context,
                                 VkFormat color_format,
-                                VkFormat depth_stencil_format);
+                                VkFormat depth_stencil_format,
+                                std::function<void()> collision_wake = {});
 
         // Upload any new / changed mesh GPU buffers. Idempotent — caches by
         // (MeshData*, generation).

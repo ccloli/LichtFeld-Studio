@@ -3,19 +3,20 @@
 """File menu implementation using Blender-style operators."""
 
 from collections.abc import Callable
-from pathlib import Path, PureWindowsPath
+from _lfs_path_io import Path
+from pathlib import PureWindowsPath
 import threading
 import uuid
 
 import lichtfeld as lf
 from .asset_index import display_name
+from .tools_menu import _open_gallery_scope, _open_projects_scope
 from .types import Operator
 from .layouts.menus import (
     menu_action,
     menu_operator,
     menu_separator,
     menu_submenu,
-    menu_toggle,
     register_menu,
 )
 from .training_confirm import _project_has_path, confirm_discard_work_then
@@ -383,6 +384,14 @@ class ImportConfigOperator(Operator):
         return {"FINISHED"}
 
 
+class CollisionOperator(Operator):
+    label = "collision.title"
+
+    def execute(self, context) -> set:
+        lf.ui.get_panel_object("lfs.collision").show(True)
+        return {"FINISHED"}
+
+
 class ExportOperator(Operator):
     label = "menu.file.export"
     description = "Export the scene"
@@ -490,24 +499,31 @@ def _show_project_switch_confirmation(
     keep_asset_manager_open: bool = False,
     create_path: str = "",
     overwrite: bool = False,
+    stop_training: bool = False,
 ) -> None:
+    prior_stop_approval = stop_training
     if new_project:
         title = lf.ui.tr("menu.file.new_project")
         if create_path:
-            callback = lambda stop_training: lf.project_create(
+            callback = lambda confirmed_stop: lf.project_create(
                 create_path,
                 discard_changes=True,
-                stop_training=stop_training,
+                stop_training=prior_stop_approval or confirmed_stop,
                 overwrite=overwrite,
             )
         else:
-            callback = lambda stop_training: _new_project(True, stop_training)
+            callback = lambda approved_stop: _new_project(
+                True, prior_stop_approval or approved_stop
+            )
     else:
         title = lf.ui.tr("menu.file.open_project")
-        callback = lambda stop_training: _open_project(
-            path, True, stop_training, keep_asset_manager_open
+        callback = lambda confirmed_stop: _open_project(
+            path, True, prior_stop_approval or confirmed_stop,
+            keep_asset_manager_open
         )
-    confirm_discard_work_then(title, callback)
+    confirm_discard_work_then(
+        title, callback, ask_stop_training=not prior_stop_approval
+    )
 
 
 def _show_stop_training_confirmation(
@@ -592,23 +608,31 @@ def _can_publish_scene() -> bool:
     return _project_has_path() or bool(getattr(lf, "has_scene", lambda: False)())
 
 
+def _visible_splats() -> list:
+    scene = lf.get_scene()
+    return [node for node in scene.get_nodes()
+            if node.type == lf.scene.NodeType.SPLAT and scene.is_node_effectively_visible(node.id)]
+
+
+def _splat_publication(nodes) -> dict:
+    """What the gallery review estimates from; the SH degree is unknown without materializing geometry."""
+    return {"estimatedPoints": sum(node.gaussian_count for node in nodes)}
+
+
 def _open_unlinked_gallery_review() -> None:
     from .gallery_controller import get_gallery_controller
     from .gallery_file_panel import open_gallery_file_panel
-    from .gallery_actions import gallery_quota
+    from .gallery_storage import quota_message
     from .gallery_messages import tr as gallery_tr
 
-    scene = lf.get_scene()
-    nodes = [node for node in scene.get_nodes()
-             if node.type == lf.scene.NodeType.SPLAT and scene.is_node_effectively_visible(node.id)]
+    nodes = _visible_splats()
     name = nodes[0].name if len(nodes) == 1 else lf.ui.tr("menu.file.untitled_scene")
     controller = get_gallery_controller()
     state = controller.snapshot()
-    quota_bytes, used_bytes, _ = gallery_quota(state)
-    quota = (gallery_tr("quota.used", used=f"{used_bytes / 1e9:.1f}", quota=f"{quota_bytes / 1e9:g}")
-             if quota_bytes is not None else "")
+    quota = quota_message(state)
     asset = {"id": str(uuid.uuid4()), "path": "", "name": name, "exists": True,
-             "status": "AVAILABLE", "publication": {"visibleSplats": len(nodes)}}
+             "status": "AVAILABLE",
+             "publication": dict(_splat_publication(nodes), visibleSplats=len(nodes))}
     open_gallery_file_panel(controller=controller, asset=asset, scene=None, action="publish",
                             fields={"title": name, "description": "", "visibility": "private",
                                     "upload_format": controller.upload_format},
@@ -767,7 +791,7 @@ def _publish_current_project_to_gallery(*, refresh_once: bool = True) -> None:
             "has_preview": bool(card.has_preview),
             "exists": True,
             "status": "AVAILABLE",
-            "publication": {},
+            "publication": _splat_publication(_visible_splats()),
         }
         fields = {
             "title": str(linked_fields.get("title") or project_name),
@@ -776,10 +800,9 @@ def _publish_current_project_to_gallery(*, refresh_once: bool = True) -> None:
             "upload_format": controller.upload_format,
         }
         from .gallery_actions import gallery_quota
-        quota_bytes, used_bytes, remaining_bytes = gallery_quota(state)
-        quota = (gallery_tr("quota.used", used=f"{used_bytes / 1e9:.1f}",
-                            quota=f"{quota_bytes / 1e9:g}")
-                 if quota_bytes is not None else "")
+        _, _, remaining_bytes = gallery_quota(state)
+        from .gallery_storage import quota_message
+        quota = quota_message(state)
         warning = (gallery_tr("quota.warning")
                    if remaining_bytes is not None and asset["file_size_bytes"] > remaining_bytes
                    else "")
@@ -857,6 +880,12 @@ def _publish_current_project_to_gallery(*, refresh_once: bool = True) -> None:
         lf.ui.message_dialog(title, message, "error")
 
 
+
+def _open_gallery_transfers():
+    from .overlays import show_gallery_transfers
+    show_gallery_transfers()
+
+
 @register_menu
 class FileMenu:
     """File menu for the menu bar."""
@@ -902,52 +931,61 @@ class FileMenu:
                 lf.ui.tr("menu.file.open_recent"),
                 recent_items,
             ),
+            menu_action(lf.ui.tr("menu.file.browse_projects"), _open_projects_scope),
+            menu_separator(),
             menu_operator(
                 SaveProjectOperator,
                 shortcut="Ctrl+S",
             ),
             menu_operator(SaveProjectAsOperator),
-            menu_action(
-                lf.ui.tr("menu.file.update_thumbnail_from_view"),
-                _update_thumbnail_from_view,
-                enabled=_can_update_thumbnail_from_view(),
-            ),
-            menu_action(
-                lf.ui.tr("menu.file.publish_to_gallery"),
-                _publish_current_project_to_gallery,
-                enabled=_can_publish_scene(),
-            ),
-            menu_operator(EmbedDatasetOperator, enabled=bool(getattr(lf, "project_can_embed_dataset", lambda: False)())),
-            menu_operator(CleanProjectOperator, enabled=_can_compact_project()),
-            menu_operator(
-                CompactProjectOperator,
-                enabled=_can_compact_project(),
-            ),
-            menu_toggle(
-                lf.ui.tr("menu.file.auto_save_on_close"),
-                lambda: lf.project_set_auto_save_on_close(
-                    not lf.project_auto_save_on_close_enabled()
-                ),
-                lf.project_auto_save_on_close_enabled(),
-            ),
             menu_separator(),
             menu_submenu(
                 lf.ui.tr("menu.file.import"),
                 [
-                    menu_operator(ImportDatasetOperator),
-                    menu_operator(ImportPlyOperator),
-                    menu_operator(ImportSsogOperator),
-                    menu_operator(ImportMeshOperator),
-                    menu_operator(ImportCheckpointOperator),
+                    menu_operator(ImportDatasetOperator, label=lf.ui.tr("menu.file.dataset")),
+                    menu_operator(ImportPlyOperator, label=lf.ui.tr("menu.file.splat_file")),
+                    menu_operator(ImportSsogOperator, label=lf.ui.tr("menu.file.ssog_folder")),
+                    menu_operator(ImportMeshOperator, label=lf.ui.tr("menu.file.mesh")),
+                    menu_operator(ImportCheckpointOperator, label=lf.ui.tr("menu.file.checkpoint")),
                     menu_separator(),
-                    menu_operator(ImportConfigOperator),
+                    menu_operator(ImportConfigOperator, label=lf.ui.tr("menu.file.configuration")),
                 ],
             ),
-            menu_operator(ExportOperator),
-            menu_operator(ExportConfigOperator),
+            menu_submenu(lf.ui.tr("menu.file.export_menu"), [
+                menu_operator(CollisionOperator),
+                menu_operator(ExportOperator, label=lf.ui.tr("menu.file.export_scene")),
+                menu_operator(ExportConfigOperator, label=lf.ui.tr("menu.file.configuration")),
+            ]),
+            menu_submenu(
+                lf.ui.tr("menu.tools.gallery"),
+                [
+                    menu_action(lf.ui.tr("menu.file.open_gallery"), _open_gallery_scope),
+                    menu_action(
+                        lf.ui.tr("menu.file.publish_to_gallery"),
+                        _publish_current_project_to_gallery,
+                        enabled=_can_publish_scene(),
+                    ),
+                    menu_action(lf.ui.tr("menu.tools.gallery_transfers"), _open_gallery_transfers),
+                ],
+            ),
             menu_separator(),
-            menu_operator(Mesh2SplatOperator),
-            menu_operator(ExtractVideoFramesOperator),
+            menu_submenu(
+                lf.ui.tr("menu.file.project_maintenance"),
+                [
+                    menu_action(
+                        lf.ui.tr("menu.file.update_thumbnail_from_view"),
+                        _update_thumbnail_from_view,
+                        enabled=_can_update_thumbnail_from_view(),
+                    ),
+                    menu_operator(
+                        EmbedDatasetOperator,
+                        enabled=bool(getattr(lf, "project_can_embed_dataset", lambda: False)()),
+                    ),
+                    menu_separator(),
+                    menu_operator(CleanProjectOperator, enabled=_can_compact_project()),
+                    menu_operator(CompactProjectOperator, enabled=_can_compact_project()),
+                ],
+            ),
             menu_separator(),
             menu_operator(ExitOperator),
         ]
@@ -967,6 +1005,7 @@ _operator_classes = [
     ImportMeshOperator,
     ImportCheckpointOperator,
     ImportConfigOperator,
+    CollisionOperator,
     ExportOperator,
     ExportConfigOperator,
     Mesh2SplatOperator,

@@ -3,12 +3,15 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "training/training_manager.hpp"
+#include "core/cuda/memory_arena.hpp"
 #include "core/error.hpp"
 #include "core/error_envelope.hpp"
 #include "core/error_reporter.hpp"
+#include "core/event_bridge/localization_manager.hpp"
 #include "core/events.hpp"
 #include "core/guarded_task.hpp"
 #include "core/logger.hpp"
+#include "core/native_fs.hpp"
 #include "core/parameter_manager.hpp"
 #include "core/path_utils.hpp"
 #include "core/reactive/store.hpp"
@@ -18,13 +21,16 @@
 #include "core/tensor.hpp"
 #include "core/tensor/internal/size_bucketed_pool.hpp"
 #include "core/tensor/internal/tensor_ops.hpp"
+#include "gui/gui_manager.hpp"
 #include "python/gil.hpp"
 #include "python/python_runtime.hpp"
 #include "rendering/vulkan_external_tensor.hpp"
+#include "training/camera_training_notice.hpp"
 #include "training/control/command_api.hpp"
 #include "training/rasterization/fast_rasterizer.hpp"
 #include "training/rasterization/gsplat/Ops.h"
 #include "training/rasterization/gsplat_rasterizer.hpp"
+#include "training/training_cropbox_mask.hpp"
 #include "training/training_setup.hpp"
 #include "visualizer/app_store.hpp"
 #include "visualizer/post_work_utils.hpp"
@@ -34,6 +40,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <cuda_runtime.h>
@@ -45,14 +52,117 @@
 #include <shared_mutex>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <utility>
 
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
+
 namespace lfs::vis {
+
+    namespace {
+#ifdef __GLIBC__
+        std::atomic<training_memory_detail::ClearTrainerTrimHook> clear_trainer_trim_hook{nullptr};
+
+        class HeapTrimWorker {
+        public:
+            HeapTrimWorker()
+                : worker_([this] { run(); }) {}
+
+            ~HeapTrimWorker() {
+                shutdown();
+            }
+
+            void shutdown() {
+                {
+                    std::lock_guard lock(mutex_);
+                    stopping_ = true;
+                }
+                condition_.notify_one();
+                if (worker_.joinable())
+                    worker_.join();
+            }
+
+            void request() {
+                {
+                    std::lock_guard lock(mutex_);
+                    if (stopping_) {
+                        if (worker_.joinable())
+                            return;
+                        stopping_ = false;
+                        worker_ = std::thread([this] { run(); });
+                    }
+                    pending_ = true;
+                }
+                condition_.notify_one();
+            }
+
+        private:
+            void run() {
+                std::unique_lock lock(mutex_);
+                while (true) {
+                    condition_.wait(lock, [this] { return stopping_ || pending_; });
+                    if (stopping_ && !pending_)
+                        return;
+                    pending_ = false;
+                    lock.unlock();
+                    if (const auto hook = clear_trainer_trim_hook.load(std::memory_order_acquire))
+                        hook();
+                    else
+                        (void)malloc_trim(0);
+                    lock.lock();
+                }
+            }
+
+            std::mutex mutex_;
+            std::condition_variable condition_;
+            std::thread worker_;
+            bool pending_ = false;
+            bool stopping_ = false;
+        };
+
+        HeapTrimWorker& heap_trim_worker() {
+            static HeapTrimWorker worker;
+            return worker;
+        }
+
+        void shutdown_heap_trim_worker() {
+            heap_trim_worker().shutdown();
+        }
+#else
+        void shutdown_heap_trim_worker() {}
+#endif
+    } // namespace
+
+    void training_memory_detail::setClearTrainerTrimHookForTesting(ClearTrainerTrimHook hook) noexcept {
+#ifdef __GLIBC__
+        clear_trainer_trim_hook.store(hook, std::memory_order_release);
+#else
+        (void)hook;
+#endif
+    }
+
+    void training_memory_detail::shutdownHeapTrimWorker() noexcept {
+        shutdown_heap_trim_worker();
+    }
 
     using namespace lfs::core::events;
 
     namespace {
+        const core::param::OptimizationParameters* ready_presentation_params(const TrainerManager& manager) {
+            const auto* trainer = manager.getTrainer();
+            if (!trainer || trainer->isInitialized() || manager.getState() != TrainingState::Ready)
+                return nullptr;
+
+            // Before Start, the editable configuration is authoritative; the
+            // placeholder trainer receives these parameters in applyPendingParams.
+            if (const auto* params = services().paramsOrNull(); params && params->isLoaded())
+                return &params->getActiveParams();
+            return &manager.getEditableOptParams();
+        }
+
         [[nodiscard]] std::vector<size_t> normalize_save_steps(std::vector<size_t> steps) {
             steps.erase(std::remove(steps.begin(), steps.end(), 0), steps.end());
             std::sort(steps.begin(), steps.end());
@@ -138,10 +248,12 @@ namespace lfs::vis {
             bool completed = false;
             bool stopped = false;
             bool hydrated = false;
+            bool restoring = false;
             int iteration = 0;
             int max_iterations = 0;
             int num_gaussians = 0;
             std::string strategy;
+            std::string restore_error;
         };
 
         LastStoredSessionPublish g_last_stored_session_publish;
@@ -283,7 +395,11 @@ namespace lfs::vis {
                   run_on_owner(std::move(run_on_owner)) {
                 const auto* const model_node =
                     scene.getNodeByUuid(scene.getTrainingModelNodeUuid());
-                if (model_node && model_node->model) {
+                // Training starts from the dataset over a transient preview
+                // (see prepareTrainingModel); a rollback binds the preview again.
+                if (model_node && model_node->transient) {
+                    transient_model_uuid = model_node->uuid;
+                } else if (model_node && model_node->model) {
                     had_model = true;
                     model_name = model_node->name;
                     original_model = std::make_unique<lfs::core::SplatData>(
@@ -297,18 +413,17 @@ namespace lfs::vis {
                 }
 
                 if (!had_model) {
-                    for (const auto* node : scene.getNodes()) {
-                        if (!node || node->type != lfs::core::NodeType::POINTCLOUD ||
-                            !node->point_cloud) {
-                            continue;
-                        }
+                    if (const auto* node = scene.getDatasetPointCloudNode()) {
                         point_cloud = makeRestoreNodeDesc(*node);
                         const auto cropbox_id = scene.getCropBoxForSplat(node->id);
                         if (const auto* cropbox_node = scene.getNodeById(cropbox_id);
                             cropbox_node && cropbox_node->cropbox) {
                             cropbox = makeRestoreNodeDesc(*cropbox_node);
                         }
-                        break;
+                        if (const auto* polygon_node = scene.getNodeById(scene.getCropPolygonForSplat(node->id));
+                            polygon_node && polygon_node->crop_polygon) {
+                            crop_polygon = makeRestoreNodeDesc(*polygon_node);
+                        }
                     }
                 }
             }
@@ -353,11 +468,15 @@ namespace lfs::vis {
                 result.locked = node.locked.get();
                 result.training_enabled = node.training_enabled;
                 result.payload_diverged = node.payload_diverged;
+                result.point_cloud_source = node.point_cloud_source;
                 result.payload_hydration = node.payload_hydration;
                 result.georef_pose = node.georef_pose;
                 result.point_cloud = node.point_cloud;
                 if (node.cropbox) {
                     result.cropbox = std::make_unique<lfs::core::CropBoxData>(*node.cropbox);
+                }
+                if (node.crop_polygon) {
+                    result.crop_polygon = std::make_unique<lfs::core::CropPolygonData>(*node.crop_polygon);
                 }
                 return result;
             }
@@ -374,7 +493,8 @@ namespace lfs::vis {
                         scene->replaceNodeModel(model_name, std::move(original_model));
                     } else if (graph_mutated) {
                         const auto model_id = scene->getTrainingModelNodeId();
-                        if (model_id != lfs::core::NULL_NODE) {
+                        if (model_id != lfs::core::NULL_NODE &&
+                            scene->getTrainingModelNodeUuid() != transient_model_uuid) {
                             scene->removeNodeById(model_id, false);
                         }
                         if (point_cloud) {
@@ -386,8 +506,15 @@ namespace lfs::vis {
                                 restored_cropbox.parent = point_cloud_id;
                                 static_cast<void>(scene->restoreNodeWithUuid(std::move(restored_cropbox)));
                             }
+                            if (point_cloud_id != lfs::core::NULL_NODE && crop_polygon) {
+                                auto restored_polygon = std::move(*crop_polygon);
+                                restored_polygon.parent = point_cloud_id;
+                                static_cast<void>(scene->restoreNodeWithUuid(std::move(restored_polygon)));
+                            }
                         }
-                        scene->setTrainingModelNode(lfs::core::Uuid{});
+                        scene->setTrainingModelNode(scene->getNodeByUuid(transient_model_uuid)
+                                                        ? transient_model_uuid
+                                                        : lfs::core::Uuid{});
                     }
                     scene->setInitialPointCloud(initial_point_cloud);
                     scene->setPointCloudModified(point_cloud_modified);
@@ -401,10 +528,12 @@ namespace lfs::vis {
 
             lfs::core::Scene* scene = nullptr;
             bool had_model = false;
+            lfs::core::Uuid transient_model_uuid;
             std::string model_name;
             std::unique_ptr<lfs::core::SplatData> original_model;
             std::optional<lfs::core::Scene::RestoreNodeDesc> point_cloud;
             std::optional<lfs::core::Scene::RestoreNodeDesc> cropbox;
+            std::optional<lfs::core::Scene::RestoreNodeDesc> crop_polygon;
             std::shared_ptr<lfs::core::PointCloud> initial_point_cloud;
             bool point_cloud_modified = false;
             std::vector<std::pair<std::shared_ptr<lfs::core::Camera>, lfs::core::CameraSplit>> camera_splits;
@@ -505,17 +634,6 @@ namespace lfs::vis {
                 if (interop_alloc_result) {
                     splat_interop_allocator_ = std::move(*interop_alloc_result);
                     tensor_allocator = splat_interop_allocator_;
-                    LOG_INFO("Training tensors share one CUDA-exportable VMM block "
-                             "imported into Vulkan (live≈{}, capacity={}, reserve={}, "
-                             "sh_degree={}, committed={} MiB reserved={} MiB chunks={}) "
-                             "— zero-copy viewer interop during live-N growth",
-                             live_estimate,
-                             exportable_capacity,
-                             reserve_capacity,
-                             sh_degree,
-                             splat_storage_->block->committed_bytes >> 20,
-                             splat_storage_->block->reserved_bytes >> 20,
-                             splat_storage_->block->chunks.size());
                 } else {
                     LOG_WARN("Exportable-interop allocator failed ({}); dropping storage "
                              "and falling back to legacy Vulkan-external allocator",
@@ -621,12 +739,24 @@ namespace lfs::vis {
         if (splat_storage_->capacity() >= needed_rows) {
             return true;
         }
-        const std::size_t want = lfs::core::SplatExportableStorage::growthCapacity(
-            needed_rows, splat_storage_->reservedCapacity());
-
         auto* model_ptr = scene_ ? scene_->getTrainingModel() : nullptr;
         if (!model_ptr) {
             return false;
+        }
+
+        std::size_t want = lfs::core::SplatExportableStorage::growthCapacity(
+            needed_rows, splat_storage_->reservedCapacity());
+        // Densification grows the model up to the VRAM limit; headroom past
+        // needed_rows must not take the free VRAM the rasterizer arena needs.
+        std::size_t free_bytes = 0;
+        std::size_t total_bytes = 0;
+        if (want > needed_rows && cudaMemGetInfo(&free_bytes, &total_bytes) == cudaSuccess) {
+            const std::size_t headroom_bytes =
+                (want - splat_storage_->capacity()) *
+                lfs::core::SplatExportableStorage::layoutBytesPerSplat(model_ptr->get_max_sh_degree());
+            if (free_bytes < headroom_bytes + 2 * lfs::core::RasterizerMemoryArena::growth_headroom_bytes(total_bytes)) {
+                want = needed_rows;
+            }
         }
 
         const std::size_t old_capacity = splat_storage_->capacity();
@@ -689,12 +819,6 @@ namespace lfs::vis {
         if (trainer_) {
             trainer_->setSplatTensorAllocator(alloc);
         }
-        LOG_INFO("Exportable splat storage grew for densify: capacity={} committed={} MiB "
-                 "gen={} chunks={} (appended/bound, no re-import)",
-                 splat_storage_->capacity(),
-                 splat_storage_->block->committed_bytes >> 20,
-                 splat_storage_->generation(),
-                 splat_storage_->block->chunks.size());
         model_ptr = scene_ ? scene_->getTrainingModel() : nullptr;
         return model_ptr && model_ptr->means_raw().capacity() >= needed_rows;
     }
@@ -733,6 +857,9 @@ namespace lfs::vis {
     }
 
     TrainerManager::~TrainerManager() {
+        for (const auto& [type, id] : event_handlers_) {
+            lfs::event::EventBridge::instance().unsubscribe(type, id);
+        }
         if (g_last_stored_session_publish.owner == this) {
             g_last_stored_session_publish = {};
         }
@@ -773,6 +900,8 @@ namespace lfs::vis {
             const auto& params = trainer->getParams();
             pending_opt_params_ = params.optimization;
             pending_dataset_params_ = params.dataset;
+            if (auto* const param_mgr = services().paramsOrNull())
+                param_mgr->getDatasetConfig() = params.dataset;
             // A new training run has no resumable elapsed-time authority.
             clearRestoredProjectMetrics();
             accumulated_training_time_ =
@@ -789,6 +918,7 @@ namespace lfs::vis {
             if (!state_machine_.transitionTo(TrainingState::Ready)) {
                 LOG_WARN("Failed to transition to Ready");
             }
+            trainer_->prewarm_image_decoders();
 
             internal::TrainerReady{}.emit();
         }
@@ -824,6 +954,7 @@ namespace lfs::vis {
                 if (scene_ && trainer_) {
                     scene_->setLiveModelMutex(&trainer_->getRenderMutex());
                 }
+                trainer_->prewarm_image_decoders();
             }
             internal::TrainerReady{}.emit();
 
@@ -853,10 +984,18 @@ namespace lfs::vis {
     }
 
     bool TrainerManager::canPerform(const TrainingAction action) const {
-        if (action == TrainingAction::Stop && !trainer_ && viewer_ &&
+        if (viewer_ && viewer_->isTrainingStartPending()) {
+            return action == TrainingAction::Stop;
+        }
+        if ((action == TrainingAction::Stop || action == TrainingAction::Resume) && !trainer_ && viewer_ &&
             getState() == TrainingState::Paused) {
             const auto session = viewer_->projectTrainingSessionState();
-            return session.available && !session.hydrated && !session.restoring;
+            if (action == TrainingAction::Stop) {
+                return session.available && !session.hydrated &&
+                       !session.restoring;
+            }
+            return session.available && !session.hydrated &&
+                   !session.restoring && session.error.empty();
         }
         return state_machine_.canPerform(action);
     }
@@ -877,14 +1016,28 @@ namespace lfs::vis {
     void TrainerManager::clearStoredSessionPresentation() {
         stored_session_presentation_active_ = false;
         stored_session_presentation_completed_ = false;
+        stored_session_presentation_gut_ = false;
         stored_session_presentation_iteration_ = 0;
         stored_session_presentation_max_iterations_ = 0;
+        stored_session_presentation_max_cap_ = 0;
         stored_session_presentation_strategy_.clear();
     }
 
     void TrainerManager::publishStoredSessionPresentation() {
         if (trainer_) {
+            const auto& last = g_last_stored_session_publish;
+            const bool restore_completed =
+                last.owner == this && last.valid && last.available &&
+                !last.hydrated;
             clearStoredSessionPresentation();
+            if (restore_completed) {
+                auto& generation =
+                    app_store().stored_session_generation;
+                generation.set(generation.get() + 1);
+            }
+            g_last_stored_session_publish = {};
+            g_last_stored_session_publish.owner = this;
+            g_last_stored_session_publish.valid = true;
             return;
         }
         Visualizer::ProjectTrainingSessionState session;
@@ -896,6 +1049,8 @@ namespace lfs::vis {
         desired.owner = this;
         desired.valid = true;
         desired.available = session.available;
+        desired.restoring = session.restoring;
+        desired.restore_error = session.error;
         if (session.available) {
             const core::Scene* scene = scene_;
             if (!scene && viewer_) {
@@ -928,12 +1083,21 @@ namespace lfs::vis {
             last.completed == desired.completed &&
             last.stopped == desired.stopped &&
             last.hydrated == desired.hydrated &&
+            last.restoring == desired.restoring &&
             last.iteration == desired.iteration &&
             last.max_iterations == desired.max_iterations &&
             last.num_gaussians == desired.num_gaussians &&
-            last.strategy == desired.strategy) {
+            last.strategy == desired.strategy &&
+            last.restore_error == desired.restore_error) {
             return;
         }
+
+        const bool restore_state_changed =
+            !last.valid || last.owner != this ||
+            last.available != desired.available ||
+            last.hydrated != desired.hydrated ||
+            last.restoring != desired.restoring ||
+            last.restore_error != desired.restore_error;
 
         if (!session.available) {
             clearStoredSessionPresentation();
@@ -950,6 +1114,10 @@ namespace lfs::vis {
                 python::update_trainer_loaded(false, 0, 0);
                 python::flush_signals();
             }
+            if (restore_state_changed) {
+                app_store().stored_session_generation.set(
+                    app_store().stored_session_generation.get() + 1);
+            }
             g_last_stored_session_publish = desired;
             return;
         }
@@ -960,6 +1128,14 @@ namespace lfs::vis {
         stored_session_presentation_max_iterations_ =
             session.max_iterations;
         stored_session_presentation_strategy_ = desired.strategy;
+        stored_session_presentation_gut_ = false;
+        stored_session_presentation_max_cap_ = 0;
+        if (const auto* params = services().paramsOrNull();
+            params && params->isLoaded()) {
+            const auto& active = params->getActiveParams();
+            stored_session_presentation_gut_ = active.gut;
+            stored_session_presentation_max_cap_ = active.max_cap;
+        }
         const char* const presented_state =
             desired.stopped ? "stopped" : session.completed ? "completed"
                                                             : "paused";
@@ -985,6 +1161,10 @@ namespace lfs::vis {
                 session.iteration, 0.0f,
                 static_cast<std::size_t>(std::max(0, desired.num_gaussians)));
             python::flush_signals();
+        }
+        if (restore_state_changed) {
+            app_store().stored_session_generation.set(
+                app_store().stored_session_generation.get() + 1);
         }
 
         lfs::training::CommandCenter::instance().update_snapshot(
@@ -1031,12 +1211,15 @@ namespace lfs::vis {
         // Pause events and no-thread stops do not run TrainingEnd's clear_snapshot.
         lfs::training::CommandCenter::instance().reset_snapshot();
 
+        [[maybe_unused]] bool released_trainer = false;
         {
             std::lock_guard<std::mutex> lock(trainer_lifetime_mutex_);
             if (scene_) {
                 scene_->setLiveModelMutex(nullptr);
             }
+            released_trainer = trainer_ != nullptr;
             trainer_.reset();
+            trainer_generation_.fetch_add(1, std::memory_order_release);
             // Model tensors retain their own shared ownership while edit/view mode
             // still uses the exportable block. The manager must not remain the final
             // owner after scene teardown.
@@ -1048,6 +1231,15 @@ namespace lfs::vis {
         // Trainer::shutdown() trims before Tensor-valued members are destroyed.
         // Trim again after destruction so those returned blocks do not survive clear.
         lfs::core::Tensor::trim_memory_pool();
+#ifdef __GLIBC__
+        if (released_trainer) {
+            try {
+                heap_trim_worker().request();
+            } catch (const std::system_error& error) {
+                LOG_WARN("Could not schedule background heap trim: {}", error.what());
+            }
+        }
+#endif
 
         if (state_machine_.getState() != TrainingState::Idle && !state_machine_.transitionTo(TrainingState::Idle)) {
             LOG_WARN("Failed to transition to Idle");
@@ -1055,7 +1247,6 @@ namespace lfs::vis {
 
         python::update_training_state(false, "idle");
         python::update_trainer_loaded(false, 0);
-        LOG_INFO("Trainer cleared");
         return true;
     }
 
@@ -1077,6 +1268,23 @@ namespace lfs::vis {
             return false;
         }
         return getCurrentIteration() == *checkpoint_baseline_iteration_;
+    }
+
+    void TrainerManager::syncCropBox() {
+        if (!trainer_ || !scene_)
+            return;
+        trainer_->setCropBoxSnapshot(lfs::training::resolve_training_cropbox_geom(*scene_));
+    }
+
+    std::optional<lfs::training::TrainingCropBoxGeometry> TrainerManager::exportCropBox() const {
+        // The editable setting is what the toolbar shows; it reaches the trainer only while training runs.
+        const auto* const params = services().paramsOrNull();
+        const bool crop = params && params->isLoaded()
+                              ? params->getActiveParams().crop_to_cropbox
+                              : trainer_ && trainer_->getParams().optimization.crop_to_cropbox;
+        if (!crop || !scene_)
+            return std::nullopt;
+        return lfs::training::resolve_training_cropbox_geom(*scene_);
     }
 
     bool TrainerManager::startTraining() {
@@ -1133,7 +1341,6 @@ namespace lfs::vis {
         }
         launchTrainingThread();
 
-        LOG_INFO("Training initialization started - {} iterations planned", getTotalIterations());
         return true;
     }
 
@@ -1144,11 +1351,29 @@ namespace lfs::vis {
         }
 
         std::unique_lock lock(initialization_mutex_);
-        initialization_cv_.wait(lock, [this] { return initialization_complete_; });
+        initialization_cv_.wait(lock, [this] {
+            return !training_preparation_pending_ && initialization_complete_;
+        });
         if (initialization_error_) {
             return lfs::Result<void>::failure(*initialization_error_);
         }
         return {};
+    }
+
+    void TrainerManager::beginTrainingStartPreparation() {
+        std::lock_guard lock(initialization_mutex_);
+        training_preparation_pending_ = true;
+        initialization_error_.reset();
+    }
+
+    void TrainerManager::finishTrainingStartPreparation(std::optional<lfs::Error> error) {
+        {
+            std::lock_guard lock(initialization_mutex_);
+            training_preparation_pending_ = false;
+            if (error)
+                initialization_error_ = std::move(error);
+        }
+        initialization_cv_.notify_all();
     }
 
     void TrainerManager::runOnSceneOwnerThread(std::function<void()> run,
@@ -1217,7 +1442,7 @@ namespace lfs::vis {
         if (!trainer_->isInitialized() && params.init_path && !params.init_path->empty()) {
             std::error_code path_error;
             const auto init_path = lfs::core::utf8_to_path(*params.init_path);
-            if (!std::filesystem::exists(init_path, path_error)) {
+            if (!lfs::core::native_fs::exists(init_path, path_error)) {
                 const auto reason = path_error
                                         ? std::format("Cannot access training initialization file '{}': {}",
                                                       *params.init_path,
@@ -1259,23 +1484,11 @@ namespace lfs::vis {
         } else {
             std::optional<lfs::training::TrainingModelGraphInstall> pending_install;
             if (scene_) {
-                const std::size_t estimate =
-                    graph_capture->training_model
-                        ? static_cast<std::size_t>(graph_capture->training_model->size())
-                    : graph_capture->point_cloud
-                        ? static_cast<std::size_t>(graph_capture->point_cloud->size())
-                        : 0;
-                auto tensor_allocator_result =
-                    createTrainingSplatTensorAllocator(params, estimate);
-                if (!tensor_allocator_result) {
-                    return lfs::Result<void>::failure(std::move(tensor_allocator_result.error()));
-                }
-                auto tensor_allocator = std::move(*tensor_allocator_result);
-                trainer_->setSplatTensorAllocator(tensor_allocator);
+                // The shared tensor storage is sized from the assembled model: splats appended with
+                // --add-splat are only known once prepareTrainingModel has loaded them.
                 std::unique_lock scene_lock(trainer_->getRenderMutex());
                 auto prepared = lfs::training::prepareTrainingModel(
-                    params, *scene_, std::move(tensor_allocator),
-                    graph_capture ? &*graph_capture : nullptr);
+                    params, *scene_, {}, graph_capture ? &*graph_capture : nullptr);
                 if (!prepared) {
                     return lfs::Result<void>::failure(
                         training_initialization_error(prepared.error()));
@@ -1283,7 +1496,23 @@ namespace lfs::vis {
                 if (*prepared) {
                     pending_install = std::move(**prepared);
                 }
-                lfs::core::Tensor::log_storage_memory("After training model initialization");
+                auto* const model = pending_install ? pending_install->model.get() : graph_capture->training_model;
+                scene_lock.unlock();
+
+                auto tensor_allocator_result = createTrainingSplatTensorAllocator(
+                    params, model ? static_cast<std::size_t>(model->size()) : 0);
+                if (!tensor_allocator_result) {
+                    return lfs::Result<void>::failure(std::move(tensor_allocator_result.error()));
+                }
+                auto tensor_allocator = std::move(*tensor_allocator_result);
+                trainer_->setSplatTensorAllocator(tensor_allocator);
+                if (model) {
+                    scene_lock.lock();
+                    if (auto result = lfs::training::migrateTrainingModelToAllocator(params, *model, tensor_allocator);
+                        !result) {
+                        return lfs::Result<void>::failure(training_initialization_error(result.error()));
+                    }
+                }
             }
 
             if (scene_) {
@@ -1326,7 +1555,6 @@ namespace lfs::vis {
                 return lfs::Result<void>::failure(
                     training_initialization_error(result.error()));
             }
-            lfs::core::Tensor::log_storage_memory("After trainer initialization");
             lfs::core::Tensor::trim_memory_pool();
             if (scene_) {
                 installExportableDensifyBarrier();
@@ -1390,7 +1618,6 @@ namespace lfs::vis {
                         if (!state_machine_.transitionTo(TrainingState::Paused)) {
                             LOG_WARN("Failed to transition to Paused after initialization pause request");
                         }
-                        state::TrainingPaused{.iteration = getCurrentIteration()}.emit();
                     }
                 }
             } catch (const std::exception& error) {
@@ -1447,8 +1674,7 @@ namespace lfs::vis {
                 LOG_WARN("Failed to transition to Paused");
             }
 
-            state::TrainingPaused{.iteration = getCurrentIteration()}.emit();
-            LOG_INFO("Training paused at iteration {}", getCurrentIteration());
+            LOG_INFO("Training pause requested at iteration {}", getCurrentIteration());
         }
     }
 
@@ -1547,6 +1773,13 @@ namespace lfs::vis {
     }
 
     void TrainerManager::stopTraining() {
+        if (viewer_ && !viewer_->isOnViewerThread()) {
+            runOnSceneOwnerThread([this] { stopTraining(); }, [] {});
+            return;
+        }
+        if (viewer_ && viewer_->cancelTrainingStartPreparation()) {
+            return;
+        }
         if (!canStop()) {
             LOG_TRACE("Cannot stop: {}", getActionBlockedReason(TrainingAction::Stop));
             return;
@@ -1562,6 +1795,9 @@ namespace lfs::vis {
         }
 
         LOG_DEBUG("Requesting training stop");
+        if (getState() == TrainingState::Running) {
+            accumulated_training_time_ += std::chrono::steady_clock::now() - training_start_time_;
+        }
         if (!state_machine_.transitionTo(TrainingState::Stopping)) {
             LOG_WARN("Failed to transition to Stopping");
         }
@@ -1661,6 +1897,7 @@ namespace lfs::vis {
         completion_pending_.store(true, std::memory_order_release);
 
         last_training_error_.clear();
+        syncCropBox();
         auto worker = std::make_unique<std::jthread>(
             [this](const std::stop_token stop_token) {
                 trainingInitializationThreadFunc(stop_token);
@@ -1741,6 +1978,15 @@ namespace lfs::vis {
             LOG_INFO("Training finished: iter={}, loss={:.6f}, time={:.1f}s",
                      completion.iteration, completion.final_loss, completion.elapsed_seconds);
             completion_pending_.store(false, std::memory_order_release);
+            std::string error_message_key;
+            if (completion.typed_error && !completion.typed_error->frames().empty()) {
+                for (const auto& field : completion.typed_error->frames().front().fields.entries()) {
+                    if (field.key == "message_key") {
+                        if (const auto* key = std::get_if<std::string>(&field.value))
+                            error_message_key = *key;
+                    }
+                }
+            }
             state::TrainingCompleted{
                 .iteration = completion.iteration,
                 .final_loss = completion.final_loss,
@@ -1752,7 +1998,8 @@ namespace lfs::vis {
                 .error_info = completion.typed_error
                                   ? std::optional(core::to_wire_error(*completion.typed_error))
                                   : std::nullopt,
-                .suppress_notification = suppress_completion_notification_.exchange(false, std::memory_order_relaxed)}
+                .suppress_notification = suppress_completion_notification_.exchange(false, std::memory_order_relaxed),
+                .error_message_key = std::move(error_message_key)}
                 .emit();
         };
 
@@ -1771,9 +2018,26 @@ namespace lfs::vis {
         emit_completion();
     }
 
+    void TrainerManager::dispatchTrainingPaused(const int iteration) {
+        auto emit_paused = [iteration] {
+            state::TrainingPaused{.iteration = iteration}.emit();
+        };
+
+        if (viewer_) {
+            if (!viewer_->postWork({
+                    .run = std::move(emit_paused),
+                    .cancel = [] {},
+                })) {
+                LOG_WARN("Training pause event dropped during viewer shutdown");
+            }
+            return;
+        }
+        emit_paused();
+    }
+
     int TrainerManager::getCurrentIteration() const {
         if (trainer_) {
-            return trainer_->get_current_iteration();
+            return trainer_->get_progress_iteration();
         }
         if (stored_session_presentation_active_) {
             return stored_session_presentation_iteration_;
@@ -1825,9 +2089,20 @@ namespace lfs::vis {
     }
 
     int TrainerManager::getMaxGaussians() const {
-        if (!trainer_)
+        if (const auto* params = ready_presentation_params(*this))
+            return params->max_cap;
+        if (!trainer_) {
+            if (stored_session_presentation_active_)
+                return stored_session_presentation_max_cap_;
             return 0;
+        }
         return trainer_->getParams().optimization.max_cap;
+    }
+
+    std::optional<lfs::training::DensificationVramRoom> TrainerManager::getDensificationVramRoom() const {
+        if (!trainer_)
+            return std::nullopt;
+        return lfs::training::densification_vram_room();
     }
 
     std::vector<size_t> TrainerManager::getSaveSteps() const {
@@ -1862,6 +2137,12 @@ namespace lfs::vis {
     }
 
     const char* TrainerManager::getStrategyType() const {
+        if (const auto* params = ready_presentation_params(*this)) {
+            // Return a static name: other threads (TCP, MCP, Python) read this
+            // while the panel may replace the editable strategy string.
+            const auto name = core::param::canonical_strategy_name(params->strategy);
+            return name.empty() ? "unknown" : name.data();
+        }
         if (trainer_ && trainer_->isInitialized()) {
             return trainer_->get_strategy().strategy_type();
         }
@@ -1873,8 +2154,13 @@ namespace lfs::vis {
     }
 
     bool TrainerManager::isGutEnabled() const {
-        if (!trainer_)
+        if (const auto* params = ready_presentation_params(*this))
+            return params->gut;
+        if (!trainer_) {
+            if (stored_session_presentation_active_)
+                return stored_session_presentation_gut_;
             return false;
+        }
         return trainer_->getParams().optimization.gut;
     }
 
@@ -2264,7 +2550,6 @@ namespace lfs::vis {
     }
 
     void TrainerManager::trainingInitializationThreadFunc(std::stop_token stop_token) {
-        LOG_INFO("Training initialization thread started");
         lfs::Result<void> initialization_result;
         try {
             initialization_result = initializeTrainingOnWorker(stop_token);
@@ -2347,8 +2632,6 @@ namespace lfs::vis {
         initialization_cv_.notify_all();
         release_training_thread_local_cuda_caches();
         training_thread_cv_.notify_one();
-
-        LOG_INFO("Training initialization thread finished");
     }
 
     void TrainerManager::trainingThreadFunc(std::stop_token stop_token) {
@@ -2360,13 +2643,15 @@ namespace lfs::vis {
                 return;
             }
         }
-        LOG_INFO("Training thread started");
         LOG_TIMER("Training execution");
 
         trainer_->setOnIterationStart([this] {
             if (auto* pm = services().paramsOrNull(); pm && pm->consumeDirty()) {
                 applyPendingParams();
             }
+        });
+        trainer_->setOnPaused([this](const int iteration) {
+            dispatchTrainingPaused(iteration);
         });
 
         lfs::core::run_guarded<void>(
@@ -2382,8 +2667,6 @@ namespace lfs::vis {
             },
             [this](lfs::Result<void>&& result) {
                 if (result) {
-                    LOG_INFO("Training {}",
-                             trainer_->has_stopped() ? "stopped by user" : "completed successfully");
                     handleTrainingComplete(true);
                 } else {
                     const auto& error = result.error();
@@ -2399,8 +2682,6 @@ namespace lfs::vis {
             });
 
         release_training_thread_local_cuda_caches();
-
-        LOG_INFO("Training thread finished");
     }
 
     void TrainerManager::handleTrainingComplete(const bool success, const std::string& error,
@@ -2449,42 +2730,63 @@ namespace lfs::vis {
 
         lfs::training::CommandCenter::instance().bind_state_events();
 
+        const auto keep = [this](const std::type_index type, const lfs::event::HandlerId id) {
+            event_handlers_.emplace_back(type, id);
+        };
+
         // Training control commands
-        cmd::StartTraining::when([this](const auto&) {
-            if (viewer_) {
-                if (auto result = viewer_->startTraining();
-                    !result) {
-                    LOG_ERROR(
-                        "Failed to start training: {}",
-                        result.error());
-                }
-                return;
-            }
-            startTraining();
-        });
+        keep(typeid(cmd::StartTraining), cmd::StartTraining::when([this](const auto&) {
+                 if (viewer_) {
+                     if (auto result = viewer_->startTraining();
+                         !result) {
+                         LOG_ERROR(
+                             "Failed to start training: {}",
+                             result.error());
+                     }
+                     return;
+                 }
+                 startTraining();
+             }));
 
-        cmd::PauseTraining::when([this](const auto&) {
-            pauseTraining();
-        });
+        keep(typeid(cmd::PauseTraining), cmd::PauseTraining::when([this](const auto&) {
+                 pauseTraining();
+             }));
 
-        cmd::ResumeTraining::when([this](const auto&) {
-            resumeTraining();
-        });
+        keep(typeid(cmd::ResumeTraining), cmd::ResumeTraining::when([this](const auto&) {
+                 resumeTraining();
+             }));
 
-        cmd::StopTraining::when([this](const auto&) {
-            stopTraining();
-        });
+        keep(typeid(cmd::StopTraining), cmd::StopTraining::when([this](const auto&) {
+                 stopTraining();
+             }));
+
+        keep(typeid(state::SceneChanged), state::SceneChanged::when([this](const auto& event) {
+                 if (!viewer_)
+                     return;
+                 auto* const gui_manager = viewer_->getGuiManager();
+                 if (!gui_manager)
+                     return;
+                 const bool training_active = hasLiveTrainingThread() && (isRunning() || isPaused());
+                 detail::dispatch_camera_training_notice(event.mutation_flags, training_active, [gui_manager] {
+                     gui_manager->enqueueToast({
+                         .title = LOC("window.training"),
+                         .message = LOC("toast.camera_training_next_run"),
+                         .level = gui::ErrorNoticeLevel::Info,
+                         .fingerprint = 0x4c465343414d0001ULL,
+                     });
+                 });
+             }));
 
         // Listen for training progress events - update loss buffer
-        state::TrainingProgress::when([this](const auto& event) {
-            updateLoss(event.loss);
-        });
+        keep(typeid(state::TrainingProgress), state::TrainingProgress::when([this](const auto& event) {
+                 updateLoss(event.loss);
+             }));
 
         // Listen for evaluation completed events - update PSNR buffer
-        state::EvaluationCompleted::when([this](const auto& event) {
-            updateEvaluationMetrics(event.iteration, event.psnr, event.ssim,
-                                    event.lpips);
-        });
+        keep(typeid(state::EvaluationCompleted), state::EvaluationCompleted::when([this](const auto& event) {
+                 updateEvaluationMetrics(event.iteration, event.psnr, event.ssim,
+                                         event.lpips);
+             }));
     }
 
     std::vector<std::shared_ptr<lfs::core::Camera>> TrainerManager::getAllCamList() const {
@@ -2516,6 +2818,70 @@ namespace lfs::vis {
         return trainer_->computeCameraMetrics(*cam, include_ssim, appearance);
     }
 
+    bool TrainerManager::hasInitializedTrainer() const {
+        std::lock_guard<std::mutex> lock(trainer_lifetime_mutex_);
+        return trainer_ && trainer_->isInitialized();
+    }
+
+    lfs::core::param::DatasetConfig& TrainerManager::getEditableDatasetParams() {
+        if (auto* const param_mgr = services().paramsOrNull())
+            return param_mgr->getDatasetConfig();
+        return pending_dataset_params_;
+    }
+
+    const lfs::core::param::DatasetConfig& TrainerManager::getEditableDatasetParams() const {
+        if (const auto* const param_mgr = services().paramsOrNull())
+            return param_mgr->getDatasetConfig();
+        return pending_dataset_params_;
+    }
+
+    bool TrainerManager::isDatasetEditable() const {
+        return !hasTrainer() || (getState() == TrainingState::Ready && getCurrentIteration() == 0);
+    }
+
+    bool TrainerManager::canChangeStrategy(const std::string_view strategy) const {
+        if (!trainer_)
+            return true;
+        // A finished run cannot continue: Start resets to a fresh trainer that takes the edited preset.
+        if (isFinished())
+            return true;
+        const auto canonical = core::param::canonical_strategy_name(strategy);
+        if (trainer_->isInitialized())
+            return canonical == trainer_->get_strategy().strategy_type();
+        if (isDatasetEditable())
+            return true;
+        return canonical == core::param::canonical_strategy_name(trainer_->getParams().optimization.strategy);
+    }
+
+    bool TrainerManager::rejectsIterationLimit(const std::size_t iterations) const {
+        return isPaused() &&
+               iterations <= static_cast<std::size_t>(std::max(0, getCurrentIteration()));
+    }
+
+    bool TrainerManager::canChangeProperty(const core::prop::PropertyMeta& meta,
+                                           const std::any& current_value,
+                                           const std::any& new_value) const {
+        if (!meta.needs_restart())
+            return true;
+        if (!trainer_ || isDatasetEditable() || isFinished())
+            return true;
+        return meta.values_equal(current_value, new_value);
+    }
+
+    lfs::core::param::TrainingParameters TrainerManager::getEditableTrainingParams(
+        const ParameterManager& parameter_manager) const {
+        const auto& configured_dataset = parameter_manager.getDatasetConfig();
+        auto params = parameter_manager.createForDataset(
+            configured_dataset.data_path,
+            configured_dataset.output_path);
+        if (hasTrainer() && trainer_->isInitialized() && !isDatasetEditable()) {
+            params.dataset = trainer_->getParams().dataset;
+        } else if (services().paramsOrNull() || hasTrainer() || !pending_dataset_params_.data_path.empty()) {
+            params.dataset = getEditableDatasetParams();
+        }
+        return params;
+    }
+
     void TrainerManager::applyPendingParams() {
         if (!trainer_)
             return;
@@ -2523,26 +2889,37 @@ namespace lfs::vis {
         if (trainer_->isInitialized() && trainer_->getParams().resume_checkpoint.has_value()) {
             if (auto* const param_mgr = services().paramsOrNull()) {
                 auto params = trainer_->getParams();
-                params.optimization.save_steps = param_mgr->copyActiveParams().save_steps;
+                const auto active = param_mgr->copyActiveParams();
+                params.optimization.save_steps = active.save_steps;
+                params.optimization.keep_all_checkpoints = active.keep_all_checkpoints;
                 trainer_->setParams(params);
                 param_mgr->importTrainingParams(params);
             }
-            LOG_DEBUG("Ignoring parameter updates for checkpoint-backed trainer (save steps kept)");
+            LOG_DEBUG("Applied save preferences for checkpoint-backed trainer");
             return;
         }
 
         const auto previous_params = trainer_->getParams();
         auto params = previous_params;
-        params.dataset = pending_dataset_params_;
 
-        // Use ParameterManager in GUI mode, fallback to pending_opt_params_ for headless
+        // Export and training use the same shared editable configuration.
         if (auto* const param_mgr = services().paramsOrNull()) {
-            params.optimization = param_mgr->copyActiveParams();
+            const auto editable_params = getEditableTrainingParams(*param_mgr);
+            params.dataset = editable_params.dataset;
+            params.optimization = editable_params.optimization;
+            params.server = editable_params.server;
             LOG_DEBUG("Applied params: strategy={}, iter={}, max_cap={}",
                       params.optimization.strategy, params.optimization.iterations, params.optimization.max_cap);
         } else {
+            params.dataset = pending_dataset_params_;
             params.optimization = pending_opt_params_;
         }
+
+        // A different preset belongs to the next run. The current strategy owns
+        // optimizer/refinement state that cannot consume another strategy's settings.
+        const bool first_start = !trainer_->isInitialized() && getState() == TrainingState::Starting;
+        if (!first_start && !canChangeStrategy(params.optimization.strategy))
+            return;
 
         const bool evaluation_split_changed =
             previous_params.optimization.holds_out_eval_images() != params.optimization.holds_out_eval_images() ||

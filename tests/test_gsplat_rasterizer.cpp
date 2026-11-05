@@ -7,17 +7,25 @@
 #include "core/alloc_counter.hpp"
 #include "core/camera.hpp"
 #include "core/cuda/memory_arena.hpp"
+#include "core/cuda/sh_layout.cuh"
 #include "core/cuda/vmm_device_buffer.hpp"
 #include "core/environment.hpp"
+#include "core/image_io.hpp"
 #include "core/splat_data.hpp"
 #include "core/tensor.hpp"
+#include "core/tensor/internal/cuda_stream_context.hpp"
+#include "core/tensor/internal/memory_pool.hpp"
 #include "lfs/training/sh_value_codec.hpp"
 #include "lfs/training/sh_value_storage.hpp"
 #include "optimizer/adam_optimizer.hpp"
 #include "training/components/ppisp.hpp"
+#include "training/depth_anchor/depth_anchor_cache.hpp"
 #include "training/kernels/densification_kernels.hpp"
+#include "training/kernels/depth_loss.hpp"
+#include "training/kernels/normal_consistency_loss.hpp"
 #include "training/rasterization/fast_rasterizer.hpp"
 #include "training/rasterization/gsplat/Common.h"
+#include "training/rasterization/gsplat/GeometryFeatures.h"
 #include "training/rasterization/gsplat/IntersectionCount.h"
 #include "training/rasterization/gsplat/Ops.h"
 #include "training/rasterization/gsplat_rasterizer.hpp"
@@ -25,6 +33,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -703,7 +712,7 @@ TEST_F(GsplatRasterizerTest, GutModeSteadyStateAllocs) {
 }
 
 // gut/gsplat forward+backward with default quant ON + sh_degree>0.
-// Saves dequant temp in ctx so backward does not dtype-abort on q16 codes.
+// Forward and backward retain the resident q16 storage.
 TEST(GsplatRasterizerQuantTest, GutForwardBackwardWithDefaultQuantAndShDegree) {
     // Default flags: quant ON (no force-off).
     lfs::training::sh_value::set_sh_value_quant_enabled_for_testing(true);
@@ -746,10 +755,9 @@ TEST(GsplatRasterizerQuantTest, GutForwardBackwardWithDefaultQuantAndShDegree) {
         /*use_gut=*/true);
     ASSERT_TRUE(result.has_value()) << result.error();
     auto& [output, ctx] = *result;
-    // ctx must hold float dequant, not raw Float16 codes.
     ASSERT_TRUE(ctx.shN.is_valid());
-    EXPECT_EQ(ctx.shN.dtype(), DataType::Float32)
-        << "backward requires float dequant temp in ctx under q16";
+    EXPECT_EQ(ctx.shN.dtype(), DataType::Float16);
+    EXPECT_EQ(ctx.shN.data_ptr(), splat.shN().data_ptr());
 
     auto grad_image = Tensor::ones_like(output.image);
     auto grad_alpha = Tensor::zeros_like(output.alpha);
@@ -1288,7 +1296,9 @@ namespace {
         auto T = Tensor::from_vector({0.f, 0.f, 3.f}, {3}, Device::CUDA);
         Tensor radial, tangential;
         if (model == lfs::core::CameraModelType::PINHOLE) {
-            radial = Tensor::from_vector({0.03f, -0.01f, 0.002f, 0.f, 0.f, 0.f}, {6}, Device::CPU);
+            radial = Tensor::from_vector(
+                {0.03f, -0.01f, 0.002f, 0.004f, -0.001f, 0.0002f},
+                {6}, Device::CPU);
             tangential = Tensor::from_vector({0.001f, -0.002f}, {2}, Device::CPU);
         } else if (model == lfs::core::CameraModelType::THIN_PRISM_FISHEYE) {
             radial = Tensor::from_vector({0.035f, 0.007f, 0.0006f, -0.0003f}, {4}, Device::CPU);
@@ -1473,6 +1483,102 @@ TEST_F(GsplatRasterizerTest, TileBatchesPreserveShRestAlphaAndDensificationGradi
     }
 }
 
+// [N] holds the error row alone: it must equal row 1 of [2, N], and dropping
+// the weight row must leave every parameter gradient unchanged.
+TEST_F(GsplatRasterizerTest, ErrorRowOnlyMatchesTwoRowLayout) {
+    constexpr size_t n = 4096;
+    auto model = make_parity_splat(n, 0xC0FFEE02u);
+    auto camera = make_extra_parity_camera(lfs::core::CameraModelType::PINHOLE, 96, 64);
+    auto bg = Tensor::full({3}, 0.25f, Device::CUDA);
+    AdamConfig config;
+    config.initial_capacity = n;
+    AdamOptimizer opt(*model, config);
+    opt.allocate_gradients(n);
+    for (const bool with_error_map : {true, false}) {
+        SCOPED_TRACE(with_error_map ? "pixel error map" : "screen gradient");
+        const auto error_map = with_error_map ? Tensor::full({64, 96}, 0.2f, Device::CUDA) : Tensor{};
+        Tensor two_rows;
+        std::vector<Tensor> gradients;
+        for (const bool error_row_only : {false, true}) {
+            opt.zero_grad(1);
+            model->_densification_info = error_row_only ? Tensor::zeros({n}, Device::CUDA)
+                                                        : Tensor::zeros({2, n}, Device::CUDA);
+            auto result = gsplat_rasterize_forward(camera, *model, bg, 0, 0, 0, 0, 1.f, false, GsplatRenderMode::RGB, true);
+            ASSERT_TRUE(result.has_value()) << result.error();
+            gsplat_rasterize_backward(result->second, Tensor::full(result->first.image.shape(), 0.7f, Device::CUDA),
+                                      Tensor::full(result->first.alpha.shape(), 0.4f, Device::CUDA), *model, opt,
+                                      error_map);
+            ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+            if (!error_row_only) {
+                two_rows = model->_densification_info.clone();
+                EXPECT_GT(two_rows.slice(0, 0, 1).abs().max().item<float>(), 0.f) << "weight row";
+                for (auto param : AdamOptimizer::all_param_types())
+                    gradients.push_back(opt.get_grad(param).clone());
+                continue;
+            }
+            ASSERT_EQ(model->_densification_info.ndim(), 1u);
+            const auto error_row = two_rows.slice(0, 1, 2).contiguous().reshape({static_cast<int>(n)});
+            EXPECT_LT(max_rel_diff_tensors(error_row, model->_densification_info), 1e-4f);
+            if (with_error_map)
+                EXPECT_GT(model->_densification_info.abs().max().item<float>(), 0.f);
+            size_t i = 0;
+            for (auto param : AdamOptimizer::all_param_types())
+                EXPECT_LT(max_rel_diff_tensors(gradients[i++], opt.get_grad(param)), 1e-4f);
+        }
+    }
+}
+
+TEST(FastGSInference, PreservesTrainingStateAndScaleRefinement) {
+    int device_count = 0;
+    ASSERT_EQ(cudaGetDeviceCount(&device_count), cudaSuccess);
+    if (device_count == 0)
+        GTEST_SKIP() << "CUDA device unavailable";
+
+    auto model = make_visible_splat(1);
+    model->means() = Tensor::zeros({1, 3}, Device::CUDA);
+    model->scaling_raw() = Tensor::zeros({1, 3}, Device::CUDA);
+    model->_max_screen_share = Tensor::zeros({1}, Device::CUDA);
+    model->_densification_info = Tensor::full({2, 1}, 0.125f, Device::CUDA);
+    auto camera = make_camera(64, 64);
+    auto background = Tensor::zeros({3}, Device::CUDA);
+
+    const std::array<const Tensor*, 8> state{
+        &model->means(), &model->sh0(), &model->rotation_raw(),
+        &model->scaling_raw(), &model->opacity_raw(), &model->shN(),
+        &model->_densification_info, &model->_max_screen_share};
+    std::vector<Tensor> before;
+    for (const auto* tensor : state)
+        before.push_back(tensor->cpu().clone());
+
+    auto reference_scales = model->scaling_raw().clone();
+    auto reference_share = model->_max_screen_share.clone();
+    const auto output = fast_rasterize(camera, *model, background);
+    ASSERT_TRUE(output.image.is_valid());
+    ASSERT_GT(output.alpha.max().item<float>(), 0.f);
+    for (size_t i = 0; i < state.size(); ++i) {
+        SCOPED_TRACE(i);
+        const auto after = state[i]->cpu();
+        ASSERT_EQ(before[i].bytes(), after.bytes());
+        if (after.bytes() != 0)
+            EXPECT_EQ(std::memcmp(before[i].data_ptr(), after.data_ptr(), after.bytes()), 0);
+    }
+
+    // Both strategies consume this statistic through the same scale clip.
+    kernels::launch_clip_log_scale_by_screen_share(
+        reference_scales.ptr<float>(), reference_share.ptr<float>(), nullptr, 0, 0.01f, 1);
+    kernels::launch_clip_log_scale_by_screen_share(
+        model->scaling_raw().ptr<float>(), model->_max_screen_share.ptr<float>(), nullptr, 0, 0.01f, 1);
+    const auto expected = reference_scales.cpu();
+    const auto actual = model->scaling_raw().cpu();
+    EXPECT_EQ(std::memcmp(expected.data_ptr(), actual.data_ptr(), expected.bytes()), 0);
+
+    // The training forward must still collect a nonzero measurement.
+    auto training = fast_rasterize_forward(camera, *model, background);
+    ASSERT_TRUE(training.has_value());
+    training->second.release_forward_context();
+    EXPECT_GT(model->_max_screen_share.max().item<float>(), 0.01f);
+}
+
 // Regression for issue #2189. Run with and without the existing pair-budget
 // test override to cover both the single-list and tile replay dispatch paths.
 class GutScreenShare : public ::testing::TestWithParam<int> {};
@@ -1609,7 +1715,6 @@ TEST_P(GutScreenShare, MrnfPreservesGrowthCoverageAndConstrainsMatureSplats) {
             params.gut = true;
             params.sh_degree = 0;
             params.max_cap = n;
-            params.background_improvements = false;
             params.use_edge_map = false;
             params.start_refine = 2000;
             params.refine_every = 250;
@@ -1641,64 +1746,6 @@ TEST_P(GutScreenShare, MrnfPreservesGrowthCoverageAndConstrainsMatureSplats) {
                 EXPECT_GT(diff, 0.f);
             else
                 EXPECT_EQ(diff, 0.f);
-        }
-    }
-}
-
-TEST_P(GutScreenShare, MrnfClipsAfterGrowthAndLeavesUnsetLimitUnchanged) {
-    using Model = lfs::core::CameraModelType;
-    const int variant = GetParam();
-    auto camera = variant == 0 ? make_camera(96, 64)
-                               : make_extra_parity_camera(variant == 1   ? Model::PINHOLE
-                                                          : variant == 2 ? Model::FISHEYE
-                                                          : variant == 3 ? Model::EQUIRECTANGULAR
-                                                                         : Model::THIN_PRISM_FISHEYE);
-    constexpr size_t n = 50000;
-    Tensor unset_scales[2];
-    for (bool enabled : {false, true}) {
-        for (bool mature : {false, true}) {
-            auto model = make_parity_splat(n, 0xC0FFEE01u);
-            MRNF strategy(*model);
-            auto params = lfs::core::param::OptimizationParameters::mrnf_defaults();
-            params.gut = true;
-            params.sh_degree = 0;
-            params.max_cap = n; // isolate clipping: no spare growth budget
-            params.background_improvements = false;
-            params.use_edge_map = false;
-            params.start_refine = 2000;
-            params.refine_every = 250;
-            params.grow_until_iter = 15000;
-            params.stop_refine = 28500;
-            params.iterations = 30000;
-            params.max_screen_share = enabled ? .0001f : 0.f;
-            params.screen_share_penalty = 0.f;
-            params.means_noise_weight = 0.f;
-            params.scale_decay = 0.f;
-            params.opacity_decay = 0.f;
-            strategy.initialize(params);
-            auto& opt = strategy.get_optimizer();
-            opt.allocate_gradients(n);
-            const int iteration = mature ? 15000 : 2250;
-            auto bg = Tensor::full({3}, .25f, Device::CUDA);
-            auto r = gsplat_rasterize_forward(camera, *model, bg, 0, 0, 0, 0, 1.f, false, GsplatRenderMode::RGB, true);
-            ASSERT_TRUE(r.has_value()) << r.error();
-            auto before = model->scaling_raw().clone();
-            gsplat_rasterize_backward(r->second, Tensor::zeros_like(r->first.image), Tensor{}, *model, opt);
-            if (enabled)
-                EXPECT_GT(model->_max_screen_share.max().item<float>(), params.max_screen_share);
-            strategy.post_backward(iteration, r->first);
-            ASSERT_EQ(model->size(), n);
-            const float diff = max_abs_diff_tensors(before, model->scaling_raw());
-            if (!enabled) {
-                // Existing decay performs an exp/log round trip even at zero
-                // strength. Record that baseline to compare growth exactly.
-                EXPECT_LT(diff, 1e-6f);
-                unset_scales[mature] = model->scaling_raw().clone();
-            } else if (mature) {
-                EXPECT_GT(max_abs_diff_tensors(unset_scales[mature], model->scaling_raw()), 1e-3f);
-            } else {
-                EXPECT_EQ(max_abs_diff_tensors(unset_scales[mature], model->scaling_raw()), 0.f);
-            }
         }
     }
 }
@@ -1745,7 +1792,6 @@ TEST(GutScreenShareStrategy, RendererSwitchStartsANewMeasurementWindow) {
     params.gut = true;
     params.max_cap = 100;
     params.sh_degree = 0;
-    params.background_improvements = false;
     strategy.initialize(params);
     ASSERT_TRUE(strategy.get_optimizer().collect_projected_screen_share());
     model->_max_screen_share.fill_(.5f);
@@ -1763,62 +1809,691 @@ TEST(GutScreenShareStrategy, RendererSwitchStartsANewMeasurementWindow) {
     EXPECT_FALSE(strategy.get_optimizer().collect_projected_screen_share());
 }
 
-TEST(GutScreenShareStrategy, MatureRefinementsReduceActualProjectedAreaBelowLimit) {
-    auto camera = make_camera(96, 64);
-    for (bool enabled : {false, true}) {
-        auto model = make_visible_splat(1);
-        model->means().zero_();
-        // Front-facing surface: isolate clipping of the projected axes.
-        model->scaling_raw() = Tensor::from_vector({-2.f, -2.f, -6.f}, {1, 3}, Device::CUDA);
-        MRNF strategy(*model);
-        auto params = lfs::core::param::OptimizationParameters::mrnf_defaults();
-        params.gut = true;
-        params.sh_degree = 0;
-        params.max_cap = 1;
-        params.background_improvements = false;
-        params.use_edge_map = false;
-        params.start_refine = 2000;
-        params.refine_every = 250;
-        params.grow_until_iter = 15000;
-        params.stop_refine = 28500;
-        params.iterations = 30000;
-        params.max_screen_share = enabled ? .1f : 0.f;
-        params.screen_share_penalty = 0.f;
-        params.means_noise_weight = 0.f;
-        params.scale_decay = 0.f;
-        params.opacity_decay = 0.f;
-        strategy.initialize(params);
-        auto& opt = strategy.get_optimizer();
+TEST_F(GsplatRasterizerTest, GeometryChannelsAndGradientsMatchEveryCameraModel) {
+    struct ForwardStream {
+        cudaStream_t stream = nullptr;
+        ForwardStream() {
+            if (cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) != cudaSuccess)
+                throw std::runtime_error("failed to create test stream");
+        }
+        ~ForwardStream() {
+            release_gsplat_rasterizer_thread_local_caches();
+            gsplat_lfs::release_intersect_thread_local_cache();
+            CudaMemoryPool::instance().release_stream(stream);
+            cudaStreamDestroy(stream);
+        }
+    } forward_stream;
+    for (const auto model : {lfs::core::CameraModelType::PINHOLE,
+                             lfs::core::CameraModelType::FISHEYE,
+                             lfs::core::CameraModelType::EQUIRECTANGULAR,
+                             lfs::core::CameraModelType::THIN_PRISM_FISHEYE}) {
+        SCOPED_TRACE(static_cast<int>(model));
+        const size_t w = 64, h = 48;
+        auto R = Tensor::from_vector({1.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 1.f}, {3, 3}, Device::CUDA);
+        auto T = Tensor::zeros({3}, Device::CUDA);
+        const bool pinhole = model == lfs::core::CameraModelType::PINHOLE;
+        Camera camera(R, T, 28.f, 28.f, w / 2.f, h / 2.f,
+                      Tensor::zeros({pinhole ? 3UL : 4UL}, Device::CPU),
+                      Tensor::zeros({pinhole ? 2UL : 4UL}, Device::CPU),
+                      model, "geometry", "", {}, w, h, 0);
+        auto means = Tensor::from_vector({.4f, .2f, 3.f}, {1, 3}, Device::CUDA);
+        auto rotation = Tensor::from_vector({1.f, .1f, .2f, .05f}, {1, 4}, Device::CUDA);
+        auto scales = Tensor::from_vector({-.3f, -.5f, -1.5f}, {1, 3}, Device::CUDA);
+        SplatData splat(0, means, Tensor::full({1, 1, 3}, .5f, Device::CUDA),
+                        Tensor::zeros({1, 0, 3}, Device::CUDA), scales, rotation,
+                        Tensor::full({1}, 2.f, Device::CUDA), 1.f);
+        auto bg = Tensor::full({3}, .25f, Device::CUDA);
+        auto rgb = gsplat_rasterize(camera, splat, bg, 1.f, false, GsplatRenderMode::RGB, true).image.cpu();
+        auto plain_depth = gsplat_rasterize(camera, splat, bg, 1.f, false, GsplatRenderMode::RGB_D, true);
+        auto depth_cpu = plain_depth.depth.cpu();
+        auto alpha_cpu = plain_depth.alpha.cpu();
+        auto image_cpu = plain_depth.image.cpu();
+        const float expected = model == lfs::core::CameraModelType::PINHOLE ? 3.f : std::sqrt(9.2f);
+        int covered = 0;
+        for (size_t i = 0; i < w * h; ++i) {
+            if (alpha_cpu.ptr<float>()[i] > .1f) {
+                ++covered;
+                EXPECT_NEAR(depth_cpu.ptr<float>()[i] / alpha_cpu.ptr<float>()[i], expected, 2e-5f);
+            }
+            for (int c = 0; c < 3; ++c)
+                EXPECT_NEAR(image_cpu.ptr<float>()[c * w * h + i], rgb.ptr<float>()[c * w * h + i], 2e-5f);
+        }
+        EXPECT_GT(covered, 10);
+        AdamConfig cfg;
+        cfg.initial_capacity = 1;
+        AdamOptimizer opt(splat, cfg);
         opt.allocate_gradients(1);
-        auto bg = Tensor::zeros({3}, Device::CUDA);
-        float initial_area = 0.f;
-        float final_area = 0.f;
-        for (int window = 0; window <= 52; ++window) {
-            auto r = gsplat_rasterize_forward(camera, *model, bg, 0, 0, 0, 0, 1.f, false, GsplatRenderMode::RGB, true);
-            ASSERT_TRUE(r.has_value()) << r.error();
-            int32_t radii[2]{};
-            float center[2]{};
-            ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
-            ASSERT_EQ(cudaMemcpy(radii, r->second.radii_ptr, sizeof(radii), cudaMemcpyDeviceToHost), cudaSuccess);
-            ASSERT_EQ(cudaMemcpy(center, r->second.means2d_ptr, sizeof(center), cudaMemcpyDeviceToHost), cudaSuccess);
-            const float dx = std::max(0.f, std::min(96.f, center[0] + radii[0]) - std::max(0.f, center[0] - radii[0]));
-            const float dy = std::max(0.f, std::min(64.f, center[1] + radii[1]) - std::max(0.f, center[1] - radii[1]));
-            final_area = radii[0] > 0 && radii[1] > 0 ? dx * dy / (96.f * 64.f) : 0.f;
-            if (window == 0)
-                initial_area = final_area;
-            gsplat_rasterize_backward(r->second, Tensor::zeros_like(r->first.image), Tensor{}, *model, opt);
-            if (window < 52)
-                strategy.post_backward(15000 + 250 * window, r->first);
+        auto r = [&] {
+            CUDAStreamGuard guard(forward_stream.stream);
+            return gsplat_rasterize_forward(camera, splat, bg, 0, 0, 0, 0, 1.f, false, GsplatRenderMode::RGB_D_N, true);
+        }();
+        ASSERT_TRUE(r.has_value());
+        std::vector<float> depth_weights(w * h);
+        for (size_t i = 0; i < w * h; ++i)
+            depth_weights[i] = alpha_cpu.ptr<float>()[i] > .2f ? .3f / (w * h) : 0.f;
+        auto gd = Tensor::from_vector(depth_weights, {h, w}, Device::CUDA);
+        std::vector<float> normal_weights(3 * w * h);
+        for (size_t i = 0; i < w * h; ++i) {
+            normal_weights[i] = depth_weights[i] * (2.f / 3.f);
+            normal_weights[w * h + i] = depth_weights[i] * (-4.f / 3.f);
+            normal_weights[2 * w * h + i] = depth_weights[i] / 3.f;
         }
-        std::cout << "GUT projected-area constraint: enabled=" << enabled
-                  << " initial=" << initial_area << " final=" << final_area << '\n';
-        EXPECT_GT(initial_area, .1f);
-        if (enabled) {
-            EXPECT_GT(final_area, 0.f); // Constrain it without deleting it.
-            EXPECT_LE(final_area, .1f);
-        } else {
-            EXPECT_EQ(final_area, initial_area);
+        auto gn = Tensor::from_vector(normal_weights, {3, h, w}, Device::CUDA);
+        gsplat_rasterize_backward(r->second, Tensor::zeros_like(r->first.image),
+                                  Tensor::zeros_like(r->first.alpha), splat, opt, {}, {}, {}, gd, gn);
+        auto gm = opt.get_grad(ParamType::Means).cpu();
+        auto gq = opt.get_grad(ParamType::Rotation).cpu();
+        auto objective = [&]() {
+            auto out = gsplat_rasterize(camera, splat, bg, 1.f, false, GsplatRenderMode::RGB_D_N, true);
+            auto d = out.depth.cpu(), n = out.normal.cpu();
+            double sum = 0;
+            for (size_t i = 0; i < w * h; ++i)
+                sum += depth_weights[i] * d.ptr<float>()[i] + normal_weights[i] * n.ptr<float>()[i] + normal_weights[w * h + i] * n.ptr<float>()[w * h + i] + normal_weights[2 * w * h + i] * n.ptr<float>()[2 * w * h + i];
+            return sum;
+        };
+        auto check = [&](Tensor& param, const Tensor& grad) {
+            auto host = param.cpu();
+            for (size_t j = 0; j < param.numel(); ++j) {
+                const float original = host.ptr<float>()[j], eps = 1e-3f;
+                float v = original + eps;
+                ASSERT_EQ(cudaMemcpy(param.ptr<float>() + j, &v, sizeof(float), cudaMemcpyHostToDevice), cudaSuccess);
+                const double plus = objective();
+                v = original - eps;
+                ASSERT_EQ(cudaMemcpy(param.ptr<float>() + j, &v, sizeof(float), cudaMemcpyHostToDevice), cudaSuccess);
+                const double minus = objective();
+                ASSERT_EQ(cudaMemcpy(param.ptr<float>() + j, &original, sizeof(float), cudaMemcpyHostToDevice), cudaSuccess);
+                const double numeric = (plus - minus) / (2 * eps);
+                EXPECT_NEAR(grad.ptr<float>()[j], numeric, 2e-4 + .03 * std::abs(numeric)) << "component " << j;
+            }
+        };
+        check(means, gm);
+        check(rotation, gq);
+    }
+}
+
+TEST_F(GsplatRasterizerTest, GeometryAnchorsAndDepthNormalsFollowCameraRays) {
+    constexpr size_t w = 64, h = 48, pixels = w * h;
+    auto view = Tensor::from_vector({1.f, 0.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 0.f, 1.f}, {16}, Device::CUDA);
+    for (const auto model : {::CameraModelType::PINHOLE, ::CameraModelType::FISHEYE,
+                             ::CameraModelType::EQUIRECTANGULAR, ::CameraModelType::THIN_PRISM_FISHEYE}) {
+        SCOPED_TRACE(static_cast<int>(model));
+        const bool equi = model == ::CameraModelType::EQUIRECTANGULAR;
+        auto K = Tensor::from_vector({equi ? float(w) : 28.f, 0.f, equi ? 0.f : w / 2.f,
+                                      0.f, equi ? float(h) : 28.f, equi ? 0.f : h / 2.f, 0.f, 0.f, 1.f},
+                                     {9}, Device::CUDA);
+        auto radial = Tensor::from_vector({.02f, -.003f, 0.f, 0.f, 0.f, 0.f}, {6}, Device::CUDA);
+        auto rays = Tensor::empty({h, w, 3}, Device::CUDA);
+        gsplat_lfs::geometry_camera_rays(rays.ptr<float>(), w, h, K.ptr<float>(), model, radial.ptr<float>(), nullptr, nullptr, nullptr);
+        ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+        const auto host = rays.cpu();
+        std::vector<float> points(3 * pixels), prior(pixels), normals(3 * pixels), depths(pixels, 2.f);
+        size_t valid = 0;
+        for (size_t i = 0; i < pixels; ++i) {
+            const float d = 2.f + .001f * i;
+            prior[i] = 2.f * d + 1.f;
+            if (std::isfinite(host.ptr<float>()[3 * i]))
+                ++valid;
+            for (int c = 0; c < 3; ++c) {
+                points[3 * i + c] = d * host.ptr<float>()[3 * i + c];
+                normals[c * pixels + i] = model == ::CameraModelType::PINHOLE ? (c == 2 ? -1.f : 0.f) : -host.ptr<float>()[3 * i + c];
+            }
         }
-        ASSERT_EQ(model->size(), 1);
+        auto pts = Tensor::from_vector(points, {pixels, 3}, Device::CUDA);
+        auto pr = Tensor::from_vector(prior, {h, w}, Device::CUDA);
+        kernels::DepthCameraProjection projection;
+        projection.model = static_cast<int>(model);
+        projection.radial[0] = .02f;
+        projection.radial[1] = -.003f;
+        const float lo[3] = {-100, -100, -100}, hi[3] = {100, 100, 100};
+        auto pairs = kernels::collect_depth_anchor_samples(pts.ptr<float>(), pixels, view.ptr<float>(), 28, 28, w / 2.f, h / 2.f,
+                                                           pr.ptr<float>(), w, h, .01f, lo, hi, nullptr, projection);
+        EXPECT_EQ(pairs.size(), valid);
+        EXPECT_GT(pairs.size(), pixels / 2);
+        for (auto pair : pairs)
+            EXPECT_NEAR(pair.y, (pair.x - 1.f) / 2.f, 2e-5f);
+        const auto fit = kernels::fit_depth_anchor_from_samples(pairs);
+        ASSERT_TRUE(fit.depth.valid);
+        EXPECT_NEAR(fit.depth.scale, .5f, 2e-4f);
+        EXPECT_NEAR(fit.depth.shift, -.5f, 2e-4f);
+        auto normal = Tensor::from_vector(normals, {3, h, w}, Device::CUDA);
+        auto depth = Tensor::from_vector(depths, {h, w}, Device::CUDA);
+        auto alpha = Tensor::ones({h, w}, Device::CUDA);
+        auto gn = Tensor::zeros_like(normal), gd = Tensor::zeros_like(depth), ga = Tensor::zeros_like(depth);
+        auto loss = Tensor::zeros({1}, Device::CUDA);
+        auto partials = Tensor::empty({kernels::normal_consistency_partial_count(pixels)}, Device::CUDA);
+        kernels::launch_normal_consistency_loss(normal.ptr<float>(), depth.ptr<float>(), alpha.ptr<float>(),
+                                                gn.ptr<float>(), gd.ptr<float>(), ga.ptr<float>(), loss.ptr<float>(), partials.ptr<float>(),
+                                                w, h, 28, 28, w / 2.f, h / 2.f, 1.f, nullptr, nullptr, rays.ptr<float>(), equi);
+        ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+        EXPECT_NEAR(loss.cpu().ptr<float>()[0], 0.f, 2e-4f);
+        const auto stats = partials.cpu();
+        EXPECT_EQ(stats.ptr<float>()[kernels::normal_consistency_slots::kValid], 1.f);
+        if (equi)
+            EXPECT_EQ(stats.ptr<float>()[kernels::normal_consistency_slots::kCount], float(w * (h - 2)));
+    }
+}
+
+class DepthAnchorSetupTest : public ::testing::Test {
+protected:
+    std::filesystem::path directory;
+    Tensor means;
+
+    void SetUp() override {
+        directory = std::filesystem::temp_directory_path() /
+                    ("lfs_anchor_setup_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+        std::filesystem::create_directories(directory);
+        means = Tensor::from_vector({0.f, 0.f, 2.f}, {1, 3}, Device::CUDA);
+    }
+
+    void TearDown() override { std::filesystem::remove_all(directory); }
+
+    std::shared_ptr<Camera> camera(const std::filesystem::path& depth_path) {
+        auto rotation = Tensor::from_vector({1.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 1.f}, {3, 3}, Device::CPU);
+        auto cam = std::make_shared<Camera>(
+            rotation, Tensor::zeros({3}, Device::CPU), 50, 50, 32, 24, Tensor(), Tensor(),
+            lfs::core::CameraModelType::PINHOLE, "view.png", std::filesystem::path{}, std::filesystem::path{},
+            64, 48, 0, 0, depth_path);
+        cam->set_image_dimensions(64, 48);
+        return cam;
+    }
+};
+
+TEST_F(DepthAnchorSetupTest, FingerprintTracksDepthContentWithPreservedMetadata) {
+    const auto path = directory / "view.png";
+    std::vector<std::uint16_t> prior(64 * 48, 100);
+    ASSERT_TRUE(save_png(path, prior.data(), 64, 48, 1, 16, 0));
+    const auto cam = camera(path);
+    const auto original = computeAnchorFingerprint(means, {cam});
+    const auto size = std::filesystem::file_size(path);
+    const auto mtime = std::filesystem::last_write_time(path);
+    prior[100] = 200;
+    ASSERT_TRUE(save_png(path, prior.data(), 64, 48, 1, 16, 0));
+    std::filesystem::last_write_time(path, mtime);
+    ASSERT_EQ(std::filesystem::file_size(path), size);
+    EXPECT_NE(computeAnchorFingerprint(means, {cam}), original);
+}
+
+TEST_F(DepthAnchorSetupTest, FingerprintTracksObservedGeometry) {
+    const auto path = directory / "view.png";
+    std::ofstream(path) << "depth";
+    const auto cam = camera(path);
+    cam->set_sfm_observations({{0.f, 0.f, 0.f, 0.f, 2.f}});
+    const auto original = computeAnchorFingerprint(means, {cam});
+    cam->set_sfm_observations({{0.f, 0.f, 0.f, 0.f, 4.f}});
+    EXPECT_NE(computeAnchorFingerprint(means, {cam}), original);
+}
+
+TEST_F(DepthAnchorSetupTest, FingerprintTracksSeedGeometryAndPreservesDeviceParity) {
+    const auto path = directory / "view.png";
+    std::ofstream(path) << "depth";
+    const auto cam = camera(path);
+    const auto original = computeAnchorFingerprint(means, {cam});
+    EXPECT_EQ(computeAnchorFingerprint(means.cpu(), {cam}), original);
+    const auto changed = Tensor::from_vector({0.f, 0.f, 4.f}, {1, 3}, Device::CUDA);
+    const auto sidecar = depthAnchorSidecarPath({cam});
+    ASSERT_TRUE(writeDepthAnchorSidecar(sidecar, {}, original));
+    EXPECT_NE(computeAnchorFingerprint(changed, {cam}), original);
+    EXPECT_FALSE(readDepthAnchorSidecar(sidecar, computeAnchorFingerprint(changed, {cam})));
+    EXPECT_TRUE(readDepthAnchorSidecar(sidecar, computeAnchorFingerprint(means, {cam})));
+}
+
+TEST_F(DepthAnchorSetupTest, UnreadableDepthCannotReuseOrPublishSidecar) {
+    const auto path = directory / "missing.png";
+    const auto cam = camera(path);
+    const auto fingerprint = computeAnchorFingerprint(means, {cam});
+    const auto sidecar = depthAnchorSidecarPath({cam});
+    EXPECT_FALSE(writeDepthAnchorSidecar(sidecar, {}, fingerprint));
+    std::ofstream(sidecar) << R"({"schema_version":0,"fingerprint":"0000000000000000","anchors":{}})";
+    EXPECT_FALSE(readDepthAnchorSidecar(sidecar, fingerprint));
+}
+
+TEST_F(DepthAnchorSetupTest, FingerprintAndSidecarPreserveUnchangedInputs) {
+    const auto path = directory / "view.png";
+    std::ofstream(path) << "depth";
+    const auto cam = camera(path);
+    const auto original = computeAnchorFingerprint(means, {cam});
+    EXPECT_EQ(computeAnchorFingerprint(means, {nullptr, camera({}), cam}), original);
+    EXPECT_EQ(computeAnchorFingerprint(means, {camera(path)}), original);
+    const auto copy = directory / "copy.png";
+    std::filesystem::copy_file(path, copy);
+    std::filesystem::last_write_time(copy, std::filesystem::last_write_time(path));
+    EXPECT_EQ(computeAnchorFingerprint(means, {camera(copy)}), original);
+
+    kernels::DepthAnchor anchor;
+    anchor.valid = true;
+    anchor.model = 1;
+    anchor.scale = 3.25f;
+    anchor.shift = 0.5f;
+    anchor.floor = 0.01f;
+    anchor.corr = 0.98f;
+    anchor.samples = 250;
+    anchor.depth = {true, 3.25f, 0.5f, 0.98f, 250};
+    const auto sidecar = depthAnchorSidecarPath({cam});
+    ASSERT_TRUE(writeDepthAnchorSidecar(sidecar, {{cam->image_name(), anchor}}, original));
+    const auto cached = readDepthAnchorSidecar(sidecar, original);
+    ASSERT_TRUE(cached);
+    ASSERT_EQ(cached->size(), 1);
+    const auto& actual = cached->at(cam->image_name());
+    EXPECT_EQ(actual.valid, anchor.valid);
+    EXPECT_EQ(actual.model, anchor.model);
+    EXPECT_EQ(actual.scale, anchor.scale);
+    EXPECT_EQ(actual.shift, anchor.shift);
+    EXPECT_EQ(actual.floor, anchor.floor);
+    EXPECT_EQ(actual.corr, anchor.corr);
+    EXPECT_EQ(actual.samples, anchor.samples);
+    EXPECT_EQ(actual.depth.valid, anchor.depth.valid);
+    EXPECT_EQ(actual.depth.scale, anchor.depth.scale);
+    EXPECT_EQ(actual.depth.shift, anchor.depth.shift);
+    EXPECT_EQ(actual.depth.corr, anchor.depth.corr);
+    EXPECT_EQ(actual.depth.samples, anchor.depth.samples);
+    auto mismatch = original;
+    ++mismatch.hash;
+    EXPECT_FALSE(readDepthAnchorSidecar(sidecar, mismatch));
+    mismatch = original;
+    ++mismatch.version;
+    EXPECT_FALSE(readDepthAnchorSidecar(sidecar, mismatch));
+    std::ofstream(sidecar) << "{invalid";
+    EXPECT_FALSE(readDepthAnchorSidecar(sidecar, original));
+}
+
+TEST_F(DepthAnchorSetupTest, FingerprintStillTracksMetadataAndPose) {
+    const auto path = directory / "view.png";
+    std::ofstream(path) << "depth";
+    const auto cam = camera(path);
+    const auto original = computeAnchorFingerprint(means, {cam});
+    const auto mtime = std::filesystem::last_write_time(path);
+    std::filesystem::last_write_time(path, mtime + std::chrono::seconds(1));
+    EXPECT_NE(computeAnchorFingerprint(means, {cam}), original);
+    std::filesystem::last_write_time(path, mtime);
+    cam->translate(Tensor::from_vector({1.f, 0.f, 0.f}, {3}, Device::CPU));
+    EXPECT_NE(computeAnchorFingerprint(means, {cam}), original);
+}
+
+TEST_F(DepthAnchorSetupTest, DamagedDepthPropagatesDecodeError) {
+    const auto path = directory / "view.tiff";
+    std::ofstream(path) << "not an image\n";
+    auto cam = camera(path);
+    // The caller must receive the decoder error after the fit workers have joined.
+    EXPECT_THROW((void)computeRawDepthAnchors(means, {cam}, -1, 0), std::exception);
+}
+
+TEST_F(DepthAnchorSetupTest, ProgressFailurePropagatesWithIdleWorkers) {
+    const auto path = directory / "view.png";
+    std::vector<std::uint16_t> prior(64 * 48, 0);
+    ASSERT_TRUE(save_png(path, prior.data(), 64, 48, 1, 16, 1));
+    auto cam = camera(path);
+    EXPECT_THROW((void)computeRawDepthAnchors(means, {cam}, -1, 0,
+                                              [](std::size_t, std::size_t) { throw std::runtime_error("progress failed"); }),
+                 std::runtime_error);
+}
+
+TEST_F(DepthAnchorSetupTest, MissingAndZeroDepthRemainEmpty) {
+    EXPECT_TRUE(computeRawDepthAnchors(means, {nullptr, camera({})}, -1, 0).empty());
+    const auto path = directory / "view.png";
+    std::vector<std::uint16_t> prior(64 * 48, 0);
+    ASSERT_TRUE(save_png(path, prior.data(), 64, 48, 1, 16, 1));
+    std::size_t calls = 0;
+    EXPECT_TRUE(computeRawDepthAnchors(means, {nullptr, camera({}), camera(path)}, -1, 0,
+                                       [&](std::size_t completed, std::size_t total) {
+                                           EXPECT_EQ(completed, 1);
+                                           EXPECT_EQ(total, 1);
+                                           ++calls;
+                                       })
+                    .empty());
+    EXPECT_EQ(calls, 1);
+    EXPECT_TRUE(computeRawDepthAnchors(Tensor(), {camera(path)}, -1, 0).empty());
+}
+
+// The anchor must come from the surface the camera sees. The sparse cloud also holds points behind that surface on
+// the same rays; fitting the prior against them made every target too far. Here the hidden points are the
+// majority, so an anchor fitted against the whole cloud lands on them (shift near 3) instead of the surface.
+TEST(DepthAnchorFit, UsesOnlyThePointsTheCameraObserved) {
+    constexpr int width = 64;
+    constexpr int height = 48;
+    constexpr float focal = 50.0f;
+    const auto surface_depth = [](const float u) { return 2.0f + 2.0f * u / width; };
+
+    const auto directory = std::filesystem::temp_directory_path() / "lfs_depth_anchor_visible";
+    std::filesystem::create_directories(directory);
+    const auto depth_path = directory / "view.png";
+    std::vector<std::uint16_t> prior(static_cast<size_t>(width) * height);
+    for (int y = 0; y < height; ++y)
+        for (int x = 0; x < width; ++x)
+            prior[static_cast<size_t>(y) * width + x] =
+                static_cast<std::uint16_t>(std::lround(surface_depth(x + 0.5f) / 10.0f * 65535.0f));
+    ASSERT_TRUE(lfs::core::save_png(depth_path, prior.data(), width, height, 1, 16, 1));
+
+    auto R = Tensor::from_vector(std::vector<float>{1, 0, 0, 0, 1, 0, 0, 0, 1}, {3, 3}, Device::CPU);
+    auto T = Tensor::zeros({3}, Device::CPU);
+    auto camera = std::make_shared<lfs::core::Camera>(
+        R, T, focal, focal, width / 2.0f, height / 2.0f, Tensor(), Tensor(), lfs::core::CameraModelType::PINHOLE,
+        "view.png", std::filesystem::path{}, std::filesystem::path{}, width, height, 0, 0, depth_path);
+    camera->set_image_dimensions(width, height);
+
+    std::vector<lfs::core::Camera::SfmObservation> observations;
+    std::vector<float> cloud;
+    for (int y = 1; y < height; y += 2) {
+        for (int x = 1; x < width; x += 2) {
+            const float u = x + 0.5f;
+            const float v = y + 0.5f;
+            const float rx = (u - width / 2.0f) / focal;
+            const float ry = (v - height / 2.0f) / focal;
+            const float z = surface_depth(u);
+            observations.push_back({u, v, rx * z, ry * z, z});
+            cloud.insert(cloud.end(), {rx * z, ry * z, z});
+            for (int k = 0; k < 3; ++k) {
+                const float hidden = z + 3.0f + 0.01f * k;
+                cloud.insert(cloud.end(), {rx * hidden, ry * hidden, hidden});
+            }
+        }
+    }
+    camera->set_sfm_observations(std::move(observations));
+    const auto means = Tensor::from_vector(cloud, {cloud.size() / 3, size_t{3}}, Device::CUDA);
+
+    const auto anchors = lfs::training::computeRawDepthAnchors(means, {camera}, -1, 0);
+    std::filesystem::remove_all(directory);
+    ASSERT_TRUE(anchors.contains("view.png"));
+    const auto& depth = anchors.at("view.png").depth;
+    ASSERT_TRUE(depth.valid);
+    EXPECT_NEAR(depth.scale, 10.0f, 0.1f);
+    EXPECT_NEAR(depth.shift, 0.0f, 0.05f);
+}
+
+TEST_F(GsplatRasterizerTest, ExpectedRadialDepthBehindCameraHasCorrectGradients) {
+    for (const auto model : {lfs::core::CameraModelType::EQUIRECTANGULAR, lfs::core::CameraModelType::FISHEYE, lfs::core::CameraModelType::THIN_PRISM_FISHEYE}) {
+        SCOPED_TRACE(static_cast<int>(model));
+        auto R = Tensor::from_vector({1.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 1.f}, {3, 3}, Device::CUDA);
+        Camera camera(R, Tensor::zeros({3}, Device::CUDA), 16, 16, 32, 24, {}, {},
+                      model, "rear", "", {}, 64, 48, 0);
+        auto splat = make_visible_splat(1);
+        const float pos[3] = {3.f, .2f, -.4f};
+        ASSERT_EQ(cudaMemcpy(splat->means().ptr<float>(), pos, sizeof(pos), cudaMemcpyHostToDevice), cudaSuccess);
+        const float scales[3] = {-.3f, -.5f, -1.5f};
+        ASSERT_EQ(cudaMemcpy(splat->scaling_raw().ptr<float>(), scales, sizeof(scales), cudaMemcpyHostToDevice), cudaSuccess);
+        auto bg = Tensor::full({3}, .7f, Device::CUDA);
+        for (const auto mode : {GsplatRenderMode::ED, GsplatRenderMode::RGB_ED}) {
+            AdamConfig cfg;
+            cfg.initial_capacity = 1;
+            AdamOptimizer opt(*splat, cfg);
+            opt.allocate_gradients(1);
+            auto r = gsplat_rasterize_forward(camera, *splat, bg, 0, 0, 0, 0, 1.f, false, mode, true);
+            ASSERT_TRUE(r.has_value());
+            auto alpha = r->first.alpha.cpu(), depth = r->first.depth.cpu();
+            std::vector<float> weights(64 * 48, 0.f);
+            int count = 0;
+            for (size_t i = 0; i < weights.size(); ++i)
+                if (alpha.ptr<float>()[i] > .2f) {
+                    weights[i] = 1.f;
+                    ++count;
+                    EXPECT_NEAR(depth.ptr<float>()[i], std::sqrt(9.2f), 2e-5f);
+                }
+            if (count <= 10) {
+                release_ctx_arena(r->second);
+                FAIL() << "Insufficient rear-hemisphere coverage: " << count;
+            }
+            for (auto& weight : weights)
+                weight /= count;
+            auto gd = Tensor::from_vector(weights, {48, 64}, Device::CUDA);
+            gsplat_rasterize_backward(r->second, {}, {}, *splat, opt, {}, {}, {}, gd, {}, .6f);
+            auto gm = opt.get_grad(ParamType::Means).cpu();
+            for (int c = 0; c < 3; ++c)
+                EXPECT_NEAR(gm.ptr<float>()[c], pos[c] / std::sqrt(9.2f), 2e-4f);
+            auto go = opt.get_grad(ParamType::Opacity).cpu();
+            EXPECT_NEAR(go.ptr<float>()[0], 0.f, 1e-5f);
+            auto gs = opt.get_grad(ParamType::Scaling).cpu();
+            EXPECT_NEAR(gs.ptr<float>()[0], 0.f, 1e-5f);
+            EXPECT_NEAR(gs.ptr<float>()[1], 0.f, 1e-5f);
+            EXPECT_NEAR(gs.ptr<float>()[2], .6f * std::exp(-1.5f), 1e-5f);
+        }
+    }
+}
+
+namespace {
+
+    struct GutQuantGuard {
+        GutQuantGuard() { sh_value::set_sh_value_quant_enabled_for_testing(true); }
+        ~GutQuantGuard() { sh_value::set_sh_value_quant_enabled_for_testing(std::nullopt); }
+    };
+
+    std::vector<uint8_t> gut_tensor_bytes(const Tensor& tensor) {
+        const auto host = tensor.cpu().contiguous();
+        const auto* data = static_cast<const uint8_t*>(host.data_ptr());
+        return {data, data + host.bytes()};
+    }
+
+    // Fisheye distortion with the pinhole fixture's focal length, so the
+    // millimetre-sized SH fixture covers pixels of a single 16x16 tile.
+    Camera make_narrow_fisheye_camera(int w, int h) {
+        auto R = Tensor::from_vector({1.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 1.f}, {3, 3}, Device::CUDA);
+        auto T = Tensor::from_vector({0.f, 0.f, 3.f}, {3}, Device::CUDA);
+        auto radial = Tensor::from_vector(
+            {0.03556234340872849f, 0.007709264733622488f,
+             0.0006652110074087792f, -0.0003144582282973898f},
+            {4}, Device::CPU);
+        return Camera(
+            R, T,
+            500.f, 500.f,
+            static_cast<float>(w) * 0.5f, static_cast<float>(h) * 0.5f,
+            radial, Tensor(),
+            lfs::core::CameraModelType::FISHEYE,
+            "test_narrow_fisheye",
+            "",
+            std::filesystem::path{},
+            w, h,
+            0);
+    }
+
+    SplatData make_sh_storage_fixture(size_t n, int degree) {
+        const size_t rest = sh_rest_coefficients_for_degree(degree);
+        std::vector<float> means(n * 3), rotation(n * 4, 0.f), sh(n * rest * 3);
+        std::vector<float> opacity(n, -100.f);
+        for (size_t i = 0; i < n; ++i) {
+            means[3 * i] = (static_cast<float>(i % 17) - 8.f) * 0.001f;
+            means[3 * i + 1] = (static_cast<float>(i % 13) - 6.f) * 0.001f;
+            rotation[4 * i] = 1.f;
+            for (size_t j = 0; j < rest * 3; ++j)
+                sh[i * rest * 3 + j] = (static_cast<float>((i * 7 + j * 11) % 43) - 21.f) *
+                                       (0.003f + 0.001f * static_cast<float>(i / 256));
+        }
+        opacity[0] = 2.f;
+        opacity[256] = 1.f;
+        return SplatData(degree,
+                         Tensor::from_vector(means, {n, 3}, Device::CUDA),
+                         Tensor::full({n, 1, 3}, 0.3f, Device::CUDA),
+                         Tensor::from_vector(sh, {n, rest, 3}, Device::CUDA),
+                         Tensor::full({n, 3}, -4.f, Device::CUDA),
+                         Tensor::from_vector(rotation, {n, 4}, Device::CUDA),
+                         Tensor::from_vector(opacity, {n, 1}, Device::CUDA), 1.f);
+    }
+
+    SplatData decoded_sh_reference(const SplatData& quantized) {
+        auto reference = quantized.clone();
+        reference.shN() = Tensor::zeros(
+            {sh_swizzled_float_count(quantized.size(), quantized.max_sh_coeffs_rest())}, Device::CUDA);
+        sh_value::decode_shN_u16_to_float4(
+            reinterpret_cast<const uint16_t*>(quantized.shN().data_ptr()),
+            quantized.shN_value_bounds().ptr<float>(), reference.shN().ptr<float>(),
+            quantized.size(), quantized.max_sh_coeffs_rest());
+        reference.shN_value_bounds() = {};
+        return reference;
+    }
+
+} // namespace
+
+TEST(GsplatRasterizerQuantTest, DecodedFp32AndQ16AreBitwiseEqualAcrossBandsAndWarmup) {
+    GutQuantGuard guard;
+    constexpr size_t n = 257;
+    for (const int layout_degree : {1, 2, 3}) {
+        auto seed = make_sh_storage_fixture(n, layout_degree);
+        ASSERT_TRUE(sh_value::apply_shN_value_quant(seed));
+        auto decoded = decoded_sh_reference(seed);
+        for (bool fisheye : {false, true}) {
+            auto camera = fisheye ? make_narrow_fisheye_camera(16, 16) : make_camera(16, 16);
+            auto bg = Tensor::full({3}, 0.2f, Device::CUDA);
+            for (int active_degree = 0; active_degree <= layout_degree; ++active_degree) {
+                for (const int iteration : {999, 1000, 1001}) {
+                    SCOPED_TRACE(::testing::Message() << layout_degree << '/' << active_degree
+                                                      << " fisheye=" << fisheye << " iteration=" << iteration);
+                    Tensor reference_image, reference_alpha, reference_grad, reference_moments, reference_bounds;
+                    for (int arm = 0; arm < 2; ++arm) {
+                        auto model = arm ? seed.clone() : decoded.clone();
+                        model.set_active_sh_degree(active_degree);
+                        AdamConfig cfg;
+                        cfg.initial_capacity = n + 256;
+                        AdamOptimizer opt(model, cfg);
+                        opt.allocate_gradients();
+                        auto result = gsplat_rasterize_forward(
+                            camera, model, bg, 0, 0, 0, 0, 1.f, false, GsplatRenderMode::RGB, true);
+                        ASSERT_TRUE(result.has_value()) << result.error();
+                        ASSERT_GT(result->second.n_isects, 0);
+                        EXPECT_GT(result->first.alpha.max().item<float>(), 0.f);
+                        if (!arm) {
+                            reference_image = result->first.image.clone();
+                            reference_alpha = result->first.alpha.clone();
+                        } else {
+                            EXPECT_EQ(gut_tensor_bytes(result->first.image), gut_tensor_bytes(reference_image));
+                            EXPECT_EQ(gut_tensor_bytes(result->first.alpha), gut_tensor_bytes(reference_alpha));
+                            EXPECT_EQ(result->second.shN.data_ptr(), model.shN().data_ptr());
+                            EXPECT_EQ(result->second.shN.dtype(), DataType::Float16);
+                        }
+                        auto grad_image = Tensor::full(result->first.image.shape(), 0.7f, Device::CUDA);
+                        auto grad_alpha = Tensor::full(result->first.alpha.shape(), 0.3f, Device::CUDA);
+                        gsplat_rasterize_backward(result->second, grad_image, grad_alpha, model, opt, Tensor{});
+                        auto& grad = opt.get_grad(ParamType::ShN);
+                        if (!arm) {
+                            reference_grad = grad.clone();
+                        } else {
+                            // Color gradients are summed with atomics across warps, so the
+                            // arms differ only in rounding; step both from one gradient.
+                            const float scale = reference_grad.abs().max().item<float>();
+                            EXPECT_LE((grad - reference_grad).abs().max().item<float>(), 1e-5f * scale);
+                            grad.copy_from(reference_grad);
+                        }
+                        const auto params_before = gut_tensor_bytes(model.shN());
+                        opt.step(iteration);
+                        const auto* state = opt.get_state(ParamType::ShN);
+                        ASSERT_NE(state, nullptr);
+                        EXPECT_EQ(state->step_count, active_degree > 0 && iteration > 1000 ? 1 : 0);
+                        if (iteration <= 1000 || active_degree == 0)
+                            EXPECT_EQ(gut_tensor_bytes(model.shN()), params_before);
+                        if (!arm) {
+                            reference_moments = state->exp_avg.clone();
+                            reference_bounds = state->joint_bounds.clone();
+                        } else {
+                            EXPECT_EQ(gut_tensor_bytes(state->exp_avg), gut_tensor_bytes(reference_moments));
+                            EXPECT_EQ(gut_tensor_bytes(state->joint_bounds), gut_tensor_bytes(reference_bounds));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+TEST(GsplatRasterizerQuantTest, ShBackwardWithoutDirectionGradNeedsNoCoefficientStorage) {
+    GutQuantGuard guard;
+    constexpr size_t n = 257;
+    auto model = make_sh_storage_fixture(n, 3);
+    ASSERT_TRUE(sh_value::apply_shN_value_quant(model));
+    auto reference = decoded_sh_reference(model);
+    auto dirs = Tensor::full({n, 3}, 0.3f, Device::CUDA);
+    auto v_colors = Tensor::full({n, 3}, 0.7f, Device::CUDA);
+    for (uint32_t degree = 0; degree <= 3; ++degree) {
+        auto expected = Tensor::zeros({n, 16, 3}, Device::CUDA);
+        auto actual = Tensor::zeros_like(expected);
+        auto without_values = Tensor::zeros_like(expected);
+        auto expected_dirs = Tensor::zeros({n, 3}, Device::CUDA);
+        auto actual_dirs = Tensor::zeros_like(expected_dirs);
+        gsplat_lfs::spherical_harmonics_swizzled_bwd(
+            16, degree, 3, dirs.ptr<float>(), reference.sh0().ptr<float>(), reference.shN().ptr<float>(),
+            nullptr, v_colors.ptr<float>(), n, true, expected.ptr<float>(), expected_dirs.ptr<float>());
+        gsplat_lfs::spherical_harmonics_swizzled_bwd(
+            16, degree, 3, dirs.ptr<float>(), model.sh0().ptr<float>(),
+            reinterpret_cast<const float*>(model.shN().data_ptr()), nullptr, v_colors.ptr<float>(), n,
+            true, actual.ptr<float>(), actual_dirs.ptr<float>(), 3, nullptr, model.shN_value_bounds().ptr<float>());
+        gsplat_lfs::spherical_harmonics_swizzled_bwd(
+            16, degree, 3, dirs.ptr<float>(), nullptr, nullptr, nullptr, v_colors.ptr<float>(), n,
+            false, without_values.ptr<float>(), nullptr);
+        EXPECT_EQ(gut_tensor_bytes(actual), gut_tensor_bytes(expected));
+        EXPECT_EQ(gut_tensor_bytes(without_values), gut_tensor_bytes(expected));
+        EXPECT_LT(max_abs_diff_tensors(actual_dirs, expected_dirs), 1e-6f);
+    }
+}
+
+// The training backward adds SH gradients straight into the optimizer's sh0
+// and swizzled shN gradients; it must match the canonical [N, K, 3] output.
+TEST(GsplatRasterizerQuantTest, ShBackwardAddsIntoSwizzledGradients) {
+    GutQuantGuard guard;
+    constexpr size_t n = 257;
+    constexpr float kPrior = 0.25f;
+    auto model = make_sh_storage_fixture(n, 3);
+    ASSERT_TRUE(sh_value::apply_shN_value_quant(model));
+    const auto reference = decoded_sh_reference(model);
+    auto dirs = Tensor::full({n, 3}, 0.3f, Device::CUDA);
+    auto v_colors = Tensor::full({n, 3}, 0.7f, Device::CUDA);
+    for (uint32_t degree = 0; degree <= 3; ++degree) {
+        SCOPED_TRACE(degree);
+        auto canonical = Tensor::zeros({n, 16, 3}, Device::CUDA);
+        gsplat_lfs::spherical_harmonics_swizzled_bwd(
+            16, degree, 3, dirs.ptr<float>(), reference.sh0().ptr<float>(), reference.shN().ptr<float>(),
+            nullptr, v_colors.ptr<float>(), n, false, canonical.ptr<float>(), nullptr);
+
+        auto sh0_grad = Tensor::full({n, 1, 3}, kPrior, Device::CUDA);
+        auto shN_grad = Tensor::full({sh_swizzled_float_count(n, kShMaxCoeffsRest)}, kPrior, Device::CUDA);
+        const gsplat_lfs::ShGradientTarget target{
+            .sh0 = sh0_grad.ptr<float>(),
+            .shN = shN_grad.ptr<float>(),
+            .shN_slots = sh_float4_slots_for_rest(kShMaxCoeffsRest),
+        };
+        gsplat_lfs::spherical_harmonics_swizzled_bwd(
+            16, degree, 3, dirs.ptr<float>(), model.sh0().ptr<float>(),
+            reinterpret_cast<const float*>(model.shN().data_ptr()), nullptr, v_colors.ptr<float>(), n,
+            false, nullptr, nullptr, 3, nullptr, model.shN_value_bounds().ptr<float>(), target);
+
+        const auto expected = canonical.cpu().to_vector();
+        const auto sh0 = sh0_grad.cpu().to_vector();
+        const auto shN = shN_grad.cpu().to_vector();
+        for (uint32_t i = 0; i < n; ++i) {
+            for (uint32_t c = 0; c < 3; ++c) {
+                ASSERT_FLOAT_EQ(sh0[i * 3 + c], kPrior + expected[i * 48 + c]);
+                for (uint32_t k = 1; k < 16; ++k) {
+                    const uint32_t offset = (k - 1) * 3 + c;
+                    const size_t at = size_t{sh_swizzled_index(i, offset / 4)} * 4 + offset % 4;
+                    ASSERT_FLOAT_EQ(shN[at], kPrior + expected[i * 48 + k * 3 + c]) << "i=" << i << " k=" << k;
+                }
+            }
+        }
+    }
+}
+
+TEST(GsplatRasterizerQuantTest, FirstQ16AndSteadyForwardsAllocateNoDecodedShTensor) {
+    GutQuantGuard guard;
+    ASSERT_TRUE(release_gsplat_rasterizer_thread_local_caches());
+    auto model = make_sh_storage_fixture(4097, 3);
+    ASSERT_TRUE(sh_value::apply_shN_value_quant(model));
+    auto reference = decoded_sh_reference(model);
+    model.set_active_sh_degree(3);
+    reference.set_active_sh_degree(3);
+    auto camera = make_camera(16, 16);
+    auto bg = Tensor::zeros({3}, Device::CUDA);
+    for (int i = 0; i < 5; ++i) {
+        auto result = gsplat_rasterize_forward(
+            camera, reference, bg, 0, 0, 0, 0, 1.f, false, GsplatRenderMode::RGB, true);
+        ASSERT_TRUE(result.has_value()) << result.error();
+        release_ctx_arena(result->second);
+    }
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    Tensor::trim_memory_pool();
+    for (int i = 0; i < 30; ++i) {
+        const auto before = alloc_counter::snapshot();
+        auto result = gsplat_rasterize_forward(
+            camera, model, bg, 0, 0, 0, 0, 1.f, false, GsplatRenderMode::RGB, true);
+        ASSERT_TRUE(result.has_value()) << result.error();
+        ASSERT_GT(result->second.n_isects, 0);
+        EXPECT_EQ(result->second.shN.data_ptr(), model.shN().data_ptr());
+        EXPECT_EQ(result->second.shN.dtype(), DataType::Float16);
+        release_ctx_arena(result->second);
+        ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+        EXPECT_EQ(alloc_counter::delta_since(before), 0u) << "q16 forward " << i;
     }
 }

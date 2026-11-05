@@ -6,7 +6,9 @@
 
 #include "core/alloc_counter.hpp"
 #include "core/camera.hpp"
+#include "core/image_sharpen.hpp"
 #include "core/logger.hpp"
+#include "core/path_utils.hpp"
 #include "core/tensor.hpp"
 #include "io/pipelined_image_loader.hpp"
 #include <algorithm>
@@ -229,9 +231,22 @@ namespace lfs::training {
         int resize_factor = 1;
         int max_width = 0;
         int test_every = 8;
+        lfs::core::SharpenParams sharpen;
     };
 
     /// Camera dataset - loads images from cameras
+    /// Fraction of cameras whose image is not a JPEG (0.0 = all JPEG, 1.0 = none).
+    [[nodiscard]] inline float non_jpeg_ratio(const std::vector<std::shared_ptr<lfs::core::Camera>>& cameras) {
+        if (cameras.empty())
+            return 0.0f;
+        const auto count = std::count_if(cameras.begin(), cameras.end(), [](const auto& cam) {
+            auto ext = lfs::core::path_to_utf8(cam->image_path().extension());
+            std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+            return ext != ".jpg" && ext != ".jpeg";
+        });
+        return static_cast<float>(count) / static_cast<float>(cameras.size());
+    }
+
     class CameraDataset {
     public:
         enum class Split {
@@ -281,8 +296,6 @@ namespace lfs::training {
                     }
                 }
             }
-
-            LOG_INFO("Dataset created with {} images (split: {})", indices_.size(), static_cast<int>(split_));
         }
 
         lfs::core::Camera* get_camera(size_t index) const {
@@ -359,18 +372,10 @@ namespace lfs::training {
 
         int get_resize_factor() const { return config_.resize_factor; }
         int get_max_width() const { return config_.max_width; }
+        const lfs::core::SharpenParams& get_sharpen() const { return config_.sharpen; }
 
         /// Returns fraction of non-JPEG images (0.0 = all JPEG, 1.0 = none)
-        [[nodiscard]] float get_non_jpeg_ratio() const {
-            if (cameras_.empty())
-                return 0.0f;
-            const auto count = std::count_if(cameras_.begin(), cameras_.end(), [](const auto& cam) {
-                auto ext = cam->image_path().extension().string();
-                std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
-                return ext != ".jpg" && ext != ".jpeg";
-            });
-            return static_cast<float>(count) / static_cast<float>(cameras_.size());
-        }
+        [[nodiscard]] float get_non_jpeg_ratio() const { return non_jpeg_ratio(cameras_); }
 
     private:
         std::vector<std::shared_ptr<lfs::core::Camera>> cameras_;
@@ -390,9 +395,12 @@ namespace lfs::training {
         // Prior-world -> reconstruction-world rotation (row-major), identity unless resolved otherwise
         std::array<float, 9> normal_world_rotation{1.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 1.f};
         std::vector<std::array<float, 9>> normal_world_to_camera_by_source;
-        bool invert_masks = false;      // Invert mask values (1.0 - mask)
-        float mask_threshold = 0.0f;    // If > 0, values >= threshold become 1.0
+        bool invert_masks = false;   // Invert mask values (1.0 - mask)
+        float mask_threshold = 0.0f; // If > 0, values >= threshold become 1.0
+        bool alpha_is_transparency = false;
         bool use_alpha_as_mask = false; // Extract alpha channel from RGBA as mask
+        bool fill_masked_rgb = false;
+        bool mask_keep_high_band = false;
     };
 
     // Pipelined DataLoader with GPU batch JPEG decoding
@@ -502,6 +510,15 @@ namespace lfs::training {
             prefetch_next_batch();
         }
 
+        // Restarts sampling from `sampler`. Queued requests are dropped, but the
+        // loader and its decoded image cache stay warm.
+        void restart(Sampler sampler) {
+            loader_->clear();
+            sampler_ = std::move(sampler);
+            sequence_to_camera_.clear();
+            prefetch_next_batch();
+        }
+
         void shutdown() {
             if (shutdown_)
                 return;
@@ -530,6 +547,7 @@ namespace lfs::training {
             request.params.resize_factor = dataset_->get_resize_factor();
             request.params.max_width = dataset_->get_max_width();
             request.params.output_uint8 = !config_.use_16bit_color;
+            request.params.sharpen = dataset_->get_sharpen();
             if (!cam->image_size_loaded() ||
                 (dataset_->get_max_width() > 0 &&
                  (cam->image_height() > dataset_->get_max_width() ||
@@ -543,12 +561,19 @@ namespace lfs::training {
                 request.params.undistort = request.undistort;
             }
 
-            if (aux_config_.load_masks && cam->has_mask()) {
+            request.fill_masked_rgb = aux_config_.fill_masked_rgb;
+            request.mask_keep_high_band = aux_config_.mask_keep_high_band;
+            if (aux_config_.load_masks && cam->has_in_memory_mask()) {
+                request.rgb_mask = cam->raw_mask_tensor();
+                request.rgb_mask_revision = cam->mask_revision();
+                request.mask_params = {.invert = aux_config_.invert_masks, .threshold = aux_config_.mask_threshold};
+            } else if (aux_config_.load_masks && cam->has_mask()) {
                 request.mask_path = cam->mask_path();
                 request.mask_params.invert = aux_config_.invert_masks;
                 request.mask_params.threshold = aux_config_.mask_threshold;
             } else if (aux_config_.use_alpha_as_mask && cam->has_alpha()) {
                 request.extract_alpha_as_mask = true;
+                request.alpha_is_transparency = aux_config_.alpha_is_transparency;
                 request.alpha_mask_params.invert = aux_config_.invert_masks;
                 request.alpha_mask_params.threshold = aux_config_.mask_threshold;
             }

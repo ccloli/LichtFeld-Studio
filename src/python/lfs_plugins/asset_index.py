@@ -3,6 +3,7 @@
 """Minimal, UUID-based persistence for Asset Manager .licht projects."""
 
 from __future__ import annotations
+from _lfs_path_io import bounded_sibling_path, native_path, temporary_prefix
 
 import json
 import logging
@@ -16,7 +17,7 @@ from contextlib import contextmanager
 from copy import copy
 from dataclasses import dataclass, field
 from functools import wraps
-from pathlib import Path
+from _lfs_path_io import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, TypeVar
 
 from .asset_storage import prune_previews
@@ -163,7 +164,7 @@ def _stat_identity_from_stat(stat: os.stat_result) -> Dict[str, int]:
 
 def _stat_identity(path: str) -> Optional[Dict[str, int]]:
     try:
-        return _stat_identity_from_stat(os.stat(path))
+        return _stat_identity_from_stat(os.stat(native_path(path)))
     except OSError:
         return None
 
@@ -186,7 +187,7 @@ def _filesystem_is_case_sensitive(path: str) -> bool:
     probe: Optional[Path] = None
     try:
         with tempfile.NamedTemporaryFile(
-            prefix=".lfsCaseProbe", dir=str(directory), delete=False
+            prefix=".lfsCaseProbe", dir=native_path(str(directory)), delete=False
         ) as handle:
             probe = Path(handle.name)
         result = not probe.with_name(probe.name.swapcase()).exists()
@@ -750,7 +751,9 @@ class AssetIndex:
                 self._projects[project_id].extra["display_name"] = title
         return False
 
-    def _apply_inspection(self, project: Project, inspection: Any) -> None:
+    def _apply_inspection(
+        self, project: Project, inspection: Any, *, fallback_resolved: bool = True
+    ) -> None:
         if self._projects.get(project.id) is project:
             self._remember_identity(project.path, project.project_uuid)
         project.file_uuid = str(inspection.file_uuid)
@@ -762,17 +765,20 @@ class AssetIndex:
         project.role = _enum_name(inspection.role)
         project.open_state = _enum_name(inspection.open_state)
         project.has_preview = bool(inspection.has_preview)
-        project.preview_width = int(getattr(inspection, "preview_width", 0) or 0)
-        project.preview_height = int(getattr(inspection, "preview_height", 0) or 0)
+        # An inspection that skipped the dataset image lookup knows nothing about the fallback thumbnail.
+        keeps_fallback = not fallback_resolved and not project.has_preview
+        if not keeps_fallback:
+            project.preview_width = int(getattr(inspection, "preview_width", 0) or 0)
+            project.preview_height = int(getattr(inspection, "preview_height", 0) or 0)
+            project.fallback_preview_path = str(
+                getattr(inspection, "fallback_preview_path", "") or ""
+            )
         iteration = getattr(inspection, "iteration", None)
         if iteration is not None:
             try:
                 project.iteration = int(iteration)
             except (TypeError, ValueError):
                 pass
-        project.fallback_preview_path = str(
-            getattr(inspection, "fallback_preview_path", "") or ""
-        )
         self._set_inspection_runtime_state(project)
         project.inspection_verified = True
         project.inspection_restored = False
@@ -933,10 +939,12 @@ class AssetIndex:
             return "UNSUPPORTED", "Not a master project container"
         return "AVAILABLE", inspection
 
-    def _apply_runtime_result(self, project: Project, kind: str, payload: Any) -> None:
+    def _apply_runtime_result(
+        self, project: Project, kind: str, payload: Any, *, fallback_resolved: bool = True
+    ) -> None:
         if kind == "AVAILABLE":
             project.relocation_candidate = ""
-            self._apply_inspection(project, payload)
+            self._apply_inspection(project, payload, fallback_resolved=fallback_resolved)
             return
         if kind == "IDENTITY_MISMATCH":
             self._clear_runtime(
@@ -991,8 +999,9 @@ class AssetIndex:
         for path, (identity, expected) in self._write_checks.items():
             identity.validate()
             if expected is not None:
-                inspection = self._inspect_path(path)
-                if str(inspection.project_uuid) != expected:
+                head = self._cheap_head_identity(path)
+                project_uuid = head[0] if head is not None else str(self._inspect_path(path).project_uuid)
+                if project_uuid != expected:
                     raise ValueError(f"The project identity changed at {path}. Refresh Projects and try again.")
                 identity.validate()
 
@@ -1674,14 +1683,14 @@ class AssetIndex:
             if not obsolete.exists():
                 continue
             try:
-                shutil.rmtree(obsolete)
+                shutil.rmtree(native_path(obsolete, force_extended=True))
                 _log.info("Removed obsolete Asset Manager storage: %s", obsolete)
             except OSError as exc:
                 _log.warning("Could not remove obsolete Asset Manager storage %s: %s", obsolete, exc)
 
     @contextmanager
     def _catalog_write_lock(self):
-        lock_path = self._library_path.with_name(self._library_path.name + ".lock")
+        lock_path = bounded_sibling_path(self._library_path, ".lock")
         handle = None
         try:
             lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1696,25 +1705,25 @@ class AssetIndex:
                 handle.close()
 
     def _preserve_legacy_backup(self, source_path: Path) -> None:
-        backup = self._library_path.with_name(self._library_path.name + ".legacy.bak")
-        backup_temp = backup.with_suffix(backup.suffix + ".tmp")
+        backup = bounded_sibling_path(self._library_path, ".legacy.bak")
+        backup_temp = bounded_sibling_path(backup, ".tmp")
         try:
             self._library_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source_path, backup_temp)
-            os.replace(backup_temp, backup)
+            shutil.copy2(native_path(source_path), native_path(backup_temp))
+            os.replace(native_path(backup_temp), native_path(backup))
         finally:
             backup_temp.unlink(missing_ok=True)
 
     def _preserve_v5_backup(self, source_path: Path) -> None:
         """Keep the exact v5 input once; the rolling .bak is not a migration backup."""
-        backup = self._library_path.with_name(self._library_path.name + ".v5.bak")
+        backup = bounded_sibling_path(self._library_path, ".v5.bak")
         if backup.exists():
             return
-        backup_temp = backup.with_suffix(backup.suffix + ".tmp")
+        backup_temp = bounded_sibling_path(backup, ".tmp")
         try:
             self._library_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source_path, backup_temp)
-            os.replace(backup_temp, backup)
+            shutil.copy2(native_path(source_path), native_path(backup_temp))
+            os.replace(native_path(backup_temp), native_path(backup))
         finally:
             backup_temp.unlink(missing_ok=True)
 
@@ -1768,11 +1777,6 @@ class AssetIndex:
                     return False
                 self._cleanup_obsolete_storage()
                 _log.info("Migrated Asset Manager catalog to schema v%d", SCHEMA_VERSION)
-            _log.info(
-                "Loaded Asset Manager library with %d folders and %d projects",
-                len(self._folders),
-                len(self._projects),
-            )
             self._touch_catalog()
             return True
         except (OSError, json.JSONDecodeError, ValueError, TypeError) as exc:
@@ -1799,9 +1803,9 @@ class AssetIndex:
             with self._catalog_write_lock():
                 self._library_path.parent.mkdir(parents=True, exist_ok=True)
                 fd, temp_name = tempfile.mkstemp(
-                    prefix=f"{self._library_path.stem}.",
+                    prefix=temporary_prefix(self._library_path),
                     suffix=".tmp",
-                    dir=str(self._library_path.parent),
+                    dir=native_path(str(self._library_path.parent)),
                 )
                 temp_path = Path(temp_name)
                 with os.fdopen(fd, "w", encoding="utf-8") as stream:
@@ -1811,15 +1815,15 @@ class AssetIndex:
                     os.fsync(stream.fileno())
 
                 if self._library_path.exists():
-                    backup = self._library_path.with_suffix(".json.bak")
-                    backup_temp = backup.with_suffix(backup.suffix + ".tmp")
+                    backup = bounded_sibling_path(self._library_path.with_suffix(".json"), ".bak")
+                    backup_temp = bounded_sibling_path(backup, ".tmp")
                     try:
-                        shutil.copy2(self._library_path, backup_temp)
-                        os.replace(backup_temp, backup)
+                        shutil.copy2(native_path(self._library_path), native_path(backup_temp))
+                        os.replace(native_path(backup_temp), native_path(backup))
                     finally:
                         backup_temp.unlink(missing_ok=True)
                 self._check_write_identities()
-                os.replace(temp_path, self._library_path)
+                os.replace(native_path(temp_path), native_path(self._library_path))
             self._write_checks.clear()
             self.last_error = ""
             self._touch_catalog()
@@ -2087,9 +2091,10 @@ class AssetIndex:
                 else None
             )
             target_folder_id = self._folder_id_for_path(path)
-            if target_folder_id is None and not pin:
-                target_folder_id = self._add_folder_record(str(Path(path).parent)).id
+            # A file outside every folder is added on its own. Watching its
+            # directory would import every other project there on the next scan.
             if target_folder_id is None:
+                pin = True
                 target_folder_id = DEFAULT_FOLDER_ID
 
             project = self._projects.get(current_id) if current_id else None
@@ -2222,11 +2227,8 @@ class AssetIndex:
             self._projects.pop(conflicting.id, None)
         folder_id = self._folder_id_for_path(path)
         if folder_id is None:
-            folder_id = (
-                DEFAULT_FOLDER_ID
-                if project.pinned
-                else self._add_folder_record(str(Path(path).parent)).id
-            )
+            project.pinned = True
+            folder_id = DEFAULT_FOLDER_ID
         self._project_by_path.pop(self._path_key(project.path), None)
         project.path = path
         project.folder_id = folder_id
@@ -2239,7 +2241,21 @@ class AssetIndex:
         self._restore_state(previous_state)
         return False
 
-    def verify_projects_batch(self, asset_ids: List[str]) -> int:
+    @staticmethod
+    def _inspected_file_identity(project: Project) -> Optional[Dict[str, Any]]:
+        # Reopening every project on a refresh is slow on some systems and blocks the folder scan
+        # queued behind it; a file still matching its last inspection needs only a stat.
+        if (
+            project.status != "AVAILABLE"
+            or not project.stat_identity
+            or not {"has_checkpoint", "has_dataset"}.issubset(project.inspection)
+        ):
+            return None
+        return {**project.stat_identity, "commit_uuid": project.commit_uuid}
+
+    def verify_projects_batch(
+        self, asset_ids: List[str], *, cancel_event: Optional[threading.Event] = None
+    ) -> int:
         with self._lock:
             work = []
             for asset_id in dict.fromkeys(asset_ids):
@@ -2251,10 +2267,13 @@ class AssetIndex:
                             project.path,
                             project.project_uuid,
                             ProjectPathIdentity.capture(project.path),
+                            self._inspected_file_identity(project),
                         )
                     )
         results = []
-        for asset_id, path, expected_uuid, path_identity in work:
+        for asset_id, path, expected_uuid, path_identity, known_identity in work:
+            if cancel_event is not None and cancel_event.is_set():
+                break
             results.append(
                 (
                     asset_id,
@@ -2262,7 +2281,7 @@ class AssetIndex:
                     expected_uuid,
                     path_identity,
                     self._read_project_runtime(
-                        path, expected_uuid
+                        path, expected_uuid, known_metadata=known_identity
                     ),
                 )
             )
@@ -2283,7 +2302,7 @@ class AssetIndex:
                     project.inspection_restored = False
                 else:
                     self._write_checks[path] = (path_identity, expected_uuid if kind == "AVAILABLE" else None)
-                    self._apply_runtime_result(project, kind, payload)
+                    self._apply_runtime_result(project, kind, payload, fallback_resolved=False)
                     changed = True
                 verified += 1
             if changed and not self.save():
@@ -2410,8 +2429,10 @@ class LibraryService:
     def list_projects(self) -> List[Project]:
         return self._call("list_projects")
 
-    def verify_projects_batch(self, asset_ids: List[str]) -> int:
-        return self._call("verify_projects_batch", asset_ids)
+    def verify_projects_batch(
+        self, asset_ids: List[str], *, cancel_event: Optional[threading.Event] = None
+    ) -> int:
+        return self._call("verify_projects_batch", asset_ids, cancel_event=cancel_event)
 
     def relink(self, *args: Any, **kwargs: Any) -> Any:
         return self._call("relink_asset", *args, **kwargs)

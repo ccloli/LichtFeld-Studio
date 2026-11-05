@@ -11,7 +11,7 @@ from __future__ import annotations
 from .definition import ToolDef, SubmodeDef, PivotModeDef
 
 
-_CROP_VOLUME_TYPES = {"CROPBOX", "ELLIPSOID"}
+_CROP_VOLUME_TYPES = {"CROPBOX", "ELLIPSOID", "CROP_POLYGON"}
 _CROPBOX_TARGET_TYPES = {"SPLAT", "POINTCLOUD"} | _CROP_VOLUME_TYPES
 
 
@@ -117,20 +117,20 @@ def _poll_has_gaussians(context) -> bool:
     )
 
 
-def _poll_can_select(context) -> bool:
-    return _poll_has_gaussians(context) and not _selection_is_crop_volume()
-
-
 def _poll_can_transform(context) -> bool:
-    return bool(getattr(context, "can_transform", False)) and not _selection_is_crop_volume()
+    return bool(getattr(context, "can_transform", False))
 
 
 def _poll_can_mirror(_context) -> bool:
-    return _poll_builtin_tool_available("builtin.mirror") and not _selection_is_crop_volume()
+    return _poll_builtin_tool_available("builtin.mirror")
 
 
 def _poll_can_align(_context) -> bool:
-    return _poll_builtin_tool_available("builtin.align") and not _selection_is_crop_volume()
+    return _poll_builtin_tool_available("builtin.align")
+
+
+def _poll_can_scale_distance(_context) -> bool:
+    return _poll_builtin_tool_available("builtin.scale_distance")
 
 
 def _poll_can_cropbox(context) -> bool:
@@ -163,7 +163,7 @@ BUILTIN_TOOLS: tuple[ToolDef, ...] = (
             SubmodeDef("box", "Box", "box"),
             SubmodeDef("sphere", "Sphere", "sphere"),
         ),
-        poll=_poll_can_select,
+        poll=_poll_has_gaussians,
     ),
     ToolDef(
         id="builtin.translate",
@@ -262,6 +262,17 @@ BUILTIN_TOOLS: tuple[ToolDef, ...] = (
         description="Align to world axes",
         shortcut="6",
         poll=_poll_can_align,
+    ),
+    ToolDef(
+        id="builtin.scale_distance",
+        label="Scale Distance",
+        label_key="tool_defs.scale_distance",
+        icon="bounds",
+        group="utility",
+        order=90,
+        description="Scale scene by measured distance",
+        shortcut="7",
+        poll=_poll_can_scale_distance,
     ),
 )
 

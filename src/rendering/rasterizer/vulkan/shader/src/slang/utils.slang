@@ -14,6 +14,7 @@
 
 #include "config.slang"
 #include "overlay_flags.inc"
+#include "equirect_projection.inc"
 
 #define LFS_PORTAL_INLINE
 #define LFS_PORTAL_VEC3 float3
@@ -174,11 +175,12 @@ float3 project_point_equirect(float3 point, Camera cam) {
         return {0, 0, -1};
 
     float3 dir = view_point / len;
-    float azimuth = atan2(dir.x, dir.z);
-    float elevation = asin(clamp(dir.y, -1.0f, 1.0f));
+    // Rasterizer camera space is +Y down and +Z forward (see the pinhole projection);
+    // the shared panorama frame is +Y up and -Z forward.
+    float2 uv = lfs_equirect_uv(float3(dir.x, -dir.y, -dir.z));
     return {
-        (azimuth / (2.0f * M_PI) + 0.5f) * float(cam.W),
-        (elevation / M_PI + 0.5f) * float(cam.H),
+        uv.x * float(cam.W),
+        uv.y * float(cam.H),
         len
     };
 }
@@ -504,13 +506,11 @@ WorldRay pixel_to_world_ray(float2 pixel, Camera cam) {
     float3x3 view_to_world_rotation = float3x3(world_view_t);
     float3 camera_origin = -mul(view_to_world_rotation, world_view_t[3]);
     if (cam.model == int(CameraModel::EQUIRECTANGULAR)) {
-        float azimuth = 2.0f * M_PI * (pixel.x / float(cam.W) - 0.5f);
-        float elevation = M_PI * (pixel.y / float(cam.H) - 0.5f);
-        float cos_elevation = cos(elevation);
-        float3 ray_camera = safe_normalize(float3(
-            sin(azimuth) * cos_elevation,
-            sin(elevation),
-            cos(azimuth) * cos_elevation));
+        // Inverse of project_point_equirect. Shared equirect is +Y up at uv.y = 0
+        // and -Z forward; the rasterizer camera is +Y down and +Z forward.
+        float2 equirect_uv = float2(pixel.x / float(cam.W), pixel.y / float(cam.H));
+        float3 shared_dir = lfs_equirect_direction(equirect_uv);
+        float3 ray_camera = float3(shared_dir.x, -shared_dir.y, -shared_dir.z);
         float3 direction = safe_normalize(mul(view_to_world_rotation, ray_camera));
         return { camera_origin, direction, isfinite(dot(camera_origin, camera_origin)) && isfinite(dot(direction, direction)) };
     }
@@ -775,35 +775,88 @@ Splat_2D_AlphaBlend load_splat_alphablend(
     return { g_inv_cov_opac, g_xy_vs, g_rgb };
 }
 
+// Inverse scale times transposed rotation: maps an offset from a splat's
+// center into its unit-sphere frame.
 [ForceInline]
-Splat_3D_GUT_AlphaBlend load_splat_gut_alphablend(
-    int32_t g_idx,
-    StructuredBuffer<float> xyz_ws,
-    StructuredBuffer<float4> rotations,
-    StructuredBuffer<float> scaling_raw,
-    StructuredBuffer<float> opacity_raw,
-    StructuredBuffer<float> rgb,
-    uint splat_render_profile
-) {
-    float3 g_xyz_ws = read_t3_float3(g_idx, xyz_ws);
-    float4 g_rotation = rotations[g_idx];
-    float3 g_scale = exp(read_t3_float3(g_idx, scaling_raw));
-    float g_opacity = sigmoid_activation(opacity_raw[g_idx]);
-    float3 g_rgb = read_t3_float3(g_idx, rgb);
-    if (splat_render_profile == 1u) {
-        g_rotation = lfsPortalCompactRotation(g_rotation);
-        g_scale = lfsPortalCompactScales(g_scale);
-        g_opacity = lfsPortalCompactOpacity(g_opacity);
-    }
-    float3x3 rotation = quat_to_rotmat(normalize(g_rotation));
+float3x3 gut_inverse_scale_rotation(float4 g_rotation, float3 g_scale) {
+    float3x3 rotation = quat_to_rotmat(safe_quat_normalize(g_rotation));
     float3 safe_scale = max(g_scale, float3(1e-8f));
     float3x3 inv_scale = float3x3(
         1.0f / safe_scale.x, 0.0f, 0.0f,
         0.0f, 1.0f / safe_scale.y, 0.0f,
         0.0f, 0.0f, 1.0f / safe_scale.z
     );
-    float3x3 iscl_rot = mul(inv_scale, transpose(rotation));
-    return { g_xyz_ws, iscl_rot, g_opacity, g_rgb };
+    return mul(inv_scale, transpose(rotation));
+}
+
+[ForceInline]
+bool inverse_3x3(float3x3 m, out float3x3 inv_m)
+{
+    float3 r0 = float3(m[0][0], m[0][1], m[0][2]);
+    float3 r1 = float3(m[1][0], m[1][1], m[1][2]);
+    float3 r2 = float3(m[2][0], m[2][1], m[2][2]);
+    float3 c0 = cross(r1, r2);
+    float3 c1 = cross(r2, r0);
+    float3 c2 = cross(r0, r1);
+    float det = dot(r0, c0);
+    if (abs(det) <= 1.0e-8f) {
+        inv_m = float3x3(1.0f, 0.0f, 0.0f,
+                         0.0f, 1.0f, 0.0f,
+                         0.0f, 0.0f, 1.0f);
+        return false;
+    }
+
+    float inv_det = 1.0f / det;
+    inv_m = float3x3(c0.x * inv_det, c1.x * inv_det, c2.x * inv_det,
+                     c0.y * inv_det, c1.y * inv_det, c2.y * inv_det,
+                     c0.z * inv_det, c1.z * inv_det, c2.z * inv_det);
+    return true;
+}
+
+[ForceInline]
+Splat_3D_GUT_AlphaBlend load_splat_gut_alphablend(
+    uint g_idx,
+    uint rgb_idx,
+    StructuredBuffer<float> xyz_ws,
+    ByteAddressBuffer rotations,
+    ByteAddressBuffer scaling_raw,
+    ByteAddressBuffer opacity_raw,
+    StructuredBuffer<float> rgb,
+    uint lod_flags,
+    bool quantized_pool,
+    uint splat_render_profile
+) {
+    float3 g_xyz_ws = read_t3_float3(g_idx, xyz_ws);
+    float4 g_rotation;
+    float3 raw_scale;
+    float raw_opacity;
+    // Match the canonical RAD pool layout used by load_gaussian_split_quant.
+    if (quantized_pool) {
+        uint2 rq = rotations.Load2(g_idx * 8u);
+        g_rotation = float4(f16tof32(rq.x & 0xffffu), f16tof32(rq.x >> 16),
+                            f16tof32(rq.y & 0xffffu), f16tof32(rq.y >> 16));
+        uint2 sq = scaling_raw.Load2(g_idx * 8u);
+        raw_scale = float3(f16tof32(sq.x & 0xffffu), f16tof32(sq.x >> 16),
+                           f16tof32(sq.y & 0xffffu));
+        uint word = opacity_raw.Load((g_idx >> 1u) * 4u);
+        raw_opacity = f16tof32((g_idx & 1u) != 0u ? word >> 16 : word & 0xffffu);
+    } else {
+        g_rotation = asfloat(rotations.Load4(g_idx * 16u));
+        raw_scale = asfloat(scaling_raw.Load3(g_idx * 12u));
+        raw_opacity = asfloat(opacity_raw.Load(g_idx * 4u));
+    }
+    float3 g_scale = exp(min(raw_scale, float3(MAX_RAW_SCALE)));
+    const bool spark_rad_opacity = (lod_flags & 4u) != 0u;
+    float g_opacity = spark_rad_opacity ? max(raw_opacity, 0.0f) : sigmoid_activation(raw_opacity);
+    if (spark_rad_opacity && g_opacity > 1.0f)
+        g_opacity = min(g_opacity * 4.0f - 3.0f, 5.0f);
+    float3 g_rgb = read_t3_float3(rgb_idx, rgb);
+    if (splat_render_profile == 1u) {
+        g_rotation = lfsPortalCompactRotation(g_rotation);
+        g_scale = lfsPortalCompactScales(g_scale);
+        g_opacity = lfsPortalCompactOpacity(g_opacity);
+    }
+    return { g_xyz_ws, gut_inverse_scale_rotation(g_rotation, g_scale), g_opacity, g_rgb };
 }
 
 
@@ -920,6 +973,28 @@ float evaluate_splat_alpha(
 
     float alpha = clipOpacity(g_opacity * val);
     return float(alpha);
+}
+
+[ForceInline]
+float4 evaluate_gut_splat_lod(Splat_3D_GUT_AlphaBlend g, float3 ray_origin, float3 ray_direction,
+                              bool spark_rad, uint profile) {
+    float3 gro = mul(g.iscl_rot, ray_origin - g.xyz_ws);
+    float3 grd = safe_normalize(mul(g.iscl_rot, ray_direction));
+    float3 distance = cross(grd, gro);
+    float sigma_over_2 = 0.5f * dot(distance, distance);
+    float value = exp(-sigma_over_2);
+    float alpha;
+    // Spark RAD leaves (opacity <= 1) blend like ordinary splats; only high-density LOD parents
+    // need the Spark kernel, so the ordinary path keeps its cost.
+    if (spark_rad && g.opacity > 1.0f) {
+        alpha = spark_rad_alpha_from_value(
+            g.opacity, sigma_over_2 > power_threshold_for_spark_rad_opacity(g.opacity) ? 0.0f : value);
+    } else {
+        alpha = clipOpacity(g.opacity * value);
+        if (!spark_rad && profile == 1u && alpha < (1.0f / 255.0f))
+            alpha = 0.0f;
+    }
+    return float4(clamp(g.rgb, float3(0.0f), float3(MAX_BLEND_COLOR)) * alpha, alpha);
 }
 
 [ForceInline]
@@ -1169,7 +1244,7 @@ struct Uniforms {
     // 0 = median depth; > 0 = alpha-weighted (expected) depth, far bound = value.
     float expected_far;
     // Explicit padding to keep dist_coeffs 16-byte aligned; mirrors the C++
-    // struct exactly (208 bytes total). shN_address occupies the former
+    // struct exactly (224 bytes total). shN_address occupies the former
     // uniforms_pad1/pad2 (offset 104, 8-byte aligned).
     uint depth_wave;
     uint64_t shN_address;
@@ -1179,10 +1254,15 @@ struct Uniforms {
     uint color_tonemapping;
     uint splat_render_profile;
     float rasterization_scale;
+    // Distance the orthographic eye was moved back; subtracted from every depth output.
+    float depth_offset;
+    uint stochastic_frame;
+    uint stochastic_mode;
+    uint stochastic_history_valid;
 }
 
-// mip_filter packs MIP filtering (bit 0), exact depth replay (bit 1), and
-// full-frame binning for banded exports (bit 2).
+// mip_filter packs MIP filtering (bit 0), exact depth replay (bit 1),
+// full-frame binning for banded exports (bit 2), and a depth sample mask (bit 3).
 #ifndef LFS_BANDED_EXPORT_RENDER
 #define LFS_BANDED_EXPORT_RENDER 0
 #endif
@@ -1200,8 +1280,12 @@ rectangle clip_to_render_grid(rectangle rect, Uniforms uniforms) {
     const uint2 lo = uint2(uniforms.render_origin_x / TILE_WIDTH,
                           uniforms.render_origin_y / TILE_HEIGHT);
     const uint2 hi = lo + uint2(uniforms.grid_width, uniforms.grid_height);
-    rect.min_x = uint16_t(clamp(uint(rect.min_x), lo.x, hi.x));
-    rect.max_x = uint16_t(clamp(uint(rect.max_x), lo.x, hi.x));
+    // Full-width panorama bands retain the wrapped interval across the seam.
+    // The tile pass reduces these x coordinates modulo the full-width grid.
+    if (base_camera_model(uniforms.camera_model) != uint(CameraModel::EQUIRECTANGULAR)) {
+        rect.min_x = uint16_t(clamp(uint(rect.min_x), lo.x, hi.x));
+        rect.max_x = uint16_t(clamp(uint(rect.max_x), lo.x, hi.x));
+    }
     rect.min_y = uint16_t(clamp(uint(rect.min_y), lo.y, hi.y));
     rect.max_y = uint16_t(clamp(uint(rect.max_y), lo.y, hi.y));
     return rect;
@@ -1219,9 +1303,18 @@ uint higs_macro_grid_height(uint grid_height) {
     return (grid_height + HIGS_MACRO_T16_H - 1u) / HIGS_MACRO_T16_H;
 }
 
+// The active-mask buffer starts with one word per possible macro batch.
+// Exact-depth replay ballots follow that header and reuse the partials pool
+// across raster waves. Use the logical grid here, not its allocation bucket.
+[ForceInline]
+uint higs_replay_mask_base(Uniforms uniforms) {
+    return (uniforms.sort_capacity + RASTER_BATCH_SIZE - 1u) / RASTER_BATCH_SIZE +
+           higs_macro_grid_width(uniforms.grid_width) * higs_macro_grid_height(uniforms.grid_height);
+}
+
 static const uint OVERLAY_FLAG_DIM = 1;
 static const uint OVERLAY_FLAG_NONSELECTABLE = 2;
-static const uint OVERLAY_FLAG_FLASH = 4;
+static const uint OVERLAY_FLAG_OUTLINE_SELECTED = 4;
 
 static const uint SELECTION_PREVIEW_FLAG = 0x80;
 static const uint SELECTION_GROUP_MASK = 0x7F;
@@ -1253,7 +1346,27 @@ static const uint OVERLAY_PARAM_CROP_EXTRA_COUNT = 15;
 static const uint OVERLAY_PARAM_ELLIPSOID_EXTRA_BASE = OVERLAY_PARAM_CROP_EXTRA_BASE + OVERLAY_PARAM_CROP_STRIDE * OVERLAY_PARAM_CROP_EXTRA_COUNT;
 static const uint OVERLAY_PARAM_ELLIPSOID_STRIDE = 5;
 static const uint OVERLAY_PARAM_ELLIPSOID_EXTRA_COUNT = 15;
-static const uint OVERLAY_PARAM_COUNT = OVERLAY_PARAM_ELLIPSOID_EXTRA_BASE + OVERLAY_PARAM_ELLIPSOID_STRIDE * OVERLAY_PARAM_ELLIPSOID_EXTRA_COUNT;
+// Polygon slots: flags, (half_depth, vertex_count), world->local rows, then two
+// vertices per float4. Mirrors vksplat_overlay_params.hpp.
+static const uint OVERLAY_PARAM_CROP_POLYGON_BASE = OVERLAY_PARAM_ELLIPSOID_EXTRA_BASE + OVERLAY_PARAM_ELLIPSOID_STRIDE * OVERLAY_PARAM_ELLIPSOID_EXTRA_COUNT;
+static const uint OVERLAY_PARAM_CROP_POLYGON_PARAMS = 1;
+static const uint OVERLAY_PARAM_CROP_POLYGON_TRANSFORM = 2;
+static const uint OVERLAY_PARAM_CROP_POLYGON_VERTICES = 6;
+static const uint OVERLAY_PARAM_CROP_POLYGON_MAX_VERTICES = 64;
+static const uint OVERLAY_PARAM_CROP_POLYGON_STRIDE = OVERLAY_PARAM_CROP_POLYGON_VERTICES + OVERLAY_PARAM_CROP_POLYGON_MAX_VERTICES / 2;
+static const uint OVERLAY_PARAM_CROP_POLYGON_COUNT = 16;
+static const uint OVERLAY_PARAM_REVEAL = OVERLAY_PARAM_CROP_POLYGON_BASE + OVERLAY_PARAM_CROP_POLYGON_STRIDE * OVERLAY_PARAM_CROP_POLYGON_COUNT;
+static const uint OVERLAY_PARAM_REVEAL_EFFECT_BOUNDS = OVERLAY_PARAM_REVEAL + 1;
+static const uint OVERLAY_PARAM_COUNT = OVERLAY_PARAM_REVEAL_EFFECT_BOUNDS + 1;
+
+#ifndef LFS_CUSTOM_EFFECT
+#define LFS_CUSTOM_EFFECT 0
+#endif
+#if LFS_CUSTOM_EFFECT
+__exported import lfs_reveal;
+#else
+#include "reveal_effects.inc"
+#endif
 
 [ForceInline]
 bool overlay_enabled(float value)
@@ -1311,7 +1424,6 @@ struct OverlayUniformState {
     bool preview_mask_enabled;
     bool add_mode;
     int focused_gaussian_id;
-    float flash_intensity;
 };
 
 [ForceInline]
@@ -1321,7 +1433,6 @@ OverlayUniformState load_overlay_uniform_state(StructuredBuffer<float4> overlay_
     float4 marker_flags = overlay_params[OVERLAY_PARAM_MARKER_FLAGS];
     float4 selection_cursor = overlay_params[OVERLAY_PARAM_SELECTION_CURSOR];
     float4 selection_flags = overlay_params[OVERLAY_PARAM_SELECTION_FLAGS];
-    float4 emphasis_flags = overlay_params[OVERLAY_PARAM_EMPHASIS_FLAGS];
 
     OverlayUniformState state;
     state.cursor_enabled = overlay_enabled(cursor_flags.x);
@@ -1337,7 +1448,6 @@ OverlayUniformState load_overlay_uniform_state(StructuredBuffer<float4> overlay_
     state.preview_mask_enabled = overlay_enabled(selection_flags.y);
     state.add_mode = overlay_enabled(selection_flags.z);
     state.focused_gaussian_id = overlay_int(selection_flags.w);
-    state.flash_intensity = emphasis_flags.w;
     return state;
 }
 
@@ -1536,24 +1646,6 @@ float4 apply_selection_overlay(
     } else if (group_id > 0u) {
         color = lerp(color, selection_colors[group_id].xyz, SELECTION_COMMITTED_BLEND);
     }
-    return replace_unpremultiplied_color(gauss_rgba, color);
-}
-
-[ForceInline]
-float4 apply_flash_overlay(
-    float4 gauss_rgba,
-    uint flags,
-    float flash_intensity)
-{
-    if ((flags & OVERLAY_FLAG_FLASH) == 0u) {
-        return gauss_rgba;
-    }
-    if (flash_intensity <= 0.0f) {
-        return gauss_rgba;
-    }
-    float3 color = unpremultiplied_color(gauss_rgba);
-    const float3 flash_color = float3(1.0f, 0.95f, 0.6f);
-    color = lerp(color, flash_color, flash_intensity * 0.5f);
     return replace_unpremultiplied_color(gauss_rgba, color);
 }
 

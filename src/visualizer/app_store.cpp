@@ -18,15 +18,14 @@ namespace lfs::vis {
           eval_ssim(store_, Field::EvalSsim, "eval_ssim", std::optional<float>{}),
           eval_lpips(store_, Field::EvalLpips, "eval_lpips", std::optional<float>{}),
           scene_generation(store_, Field::SceneGeneration, "scene_generation", 0),
+          stored_session_generation(store_, Field::StoredSessionGeneration, "stored_session_generation", 0),
           selection_generation(store_, Field::SelectionGeneration, "selection_generation", 0),
-          fps(store_, Field::Fps, "fps", 0.0f),
           mode_text(store_, Field::ModeText, "mode_text", std::string{}),
           camera_metrics(store_, Field::CameraMetricsValue, "camera_metrics", std::optional<CameraMetrics>{}),
           gt_metrics_overlay_config(store_,
                                     Field::GTMetricsOverlayConfigValue,
                                     "gt_metrics_overlay_config",
                                     GTMetricsOverlayConfig{}),
-          vram_hud(store_, Field::VramHudValue, "vram_hud", VramHud{}),
           perf_hud(store_, Field::PerfHudValue, "perf_hud", PerfHud{}),
           active_tool(store_, Field::ActiveTool, "active_tool", std::string{}),
           active_submode(store_, Field::ActiveSubmode, "active_submode", std::string{}),
@@ -49,14 +48,31 @@ namespace lfs::vis {
                                Field::SplatSimplifyStateValue,
                                "splat_simplify_state",
                                TaskProgressState{}),
+          camera_selection_state(store_,
+                                 Field::CameraSelectionStateValue,
+                                 "camera_selection_state",
+                                 TaskProgressState{}),
           scripts_generation(store_, Field::ScriptsGeneration, "scripts_generation", 0),
           language_generation(store_, Field::LanguageGeneration, "language_generation", 0),
           render_settings_generation(store_, Field::RenderSettingsGeneration, "render_settings_generation", 0),
-          viewport_toolbar_generation(store_, Field::ViewportToolbarGeneration, "viewport_toolbar_generation", 0) {}
+          viewport_toolbar_generation(store_, Field::ViewportToolbarGeneration, "viewport_toolbar_generation", 0),
+          align_state_generation(store_, Field::AlignStateGeneration, "align_state_generation", 0),
+          scale_distance_state_generation(store_, Field::ScaleDistanceStateGeneration, "scale_distance_state_generation", 0),
+          vr_state(store_, Field::VrStateValue, "vr_state", VrState{}) {}
 
     AppStore& app_store() {
         static AppStore instance;
         return instance;
+    }
+
+    void publish_align_state_generation() {
+        auto& signal = app_store().align_state_generation;
+        signal.set(signal.get() + 1);
+    }
+
+    void publish_scale_distance_state_generation() {
+        auto& signal = app_store().scale_distance_state_generation;
+        signal.set(signal.get() + 1);
     }
 
     void publish_language_generation() {

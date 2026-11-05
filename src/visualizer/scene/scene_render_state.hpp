@@ -8,6 +8,7 @@
 #include "core/point_cloud.hpp"
 #include "core/scene.hpp"
 #include "core/tensor.hpp"
+#include "rendering/rendering.hpp"
 #include <glm/glm.hpp>
 #include <memory>
 #include <string>
@@ -21,10 +22,15 @@ namespace lfs::vis {
     // split view cannot hide a second full-scene GPU copy behind GUI work.
     struct SceneRenderStateOptions {
         bool metadata_only = false;
+        // Captures wait for an in-flight combined-model rebuild instead of drawing the previous scene.
+        bool current_geometry = false;
     };
 
     struct SceneRenderState {
         const lfs::core::SplatData* combined_model = nullptr;
+        // UI/selection queries can replace the aggregate before this snapshot is drawn.
+        // Keep its buffers alive alongside their matching transform/selection metadata.
+        std::shared_ptr<const lfs::core::SplatData> owned_combined_model;
         const lfs::core::PointCloud* point_cloud = nullptr;             // For pre-training point cloud rendering
         std::shared_ptr<const lfs::core::PointCloud> owned_point_cloud; // Keeps merged point clouds alive
         glm::mat4 point_cloud_transform{1.0f};
@@ -39,9 +45,12 @@ namespace lfs::vis {
         std::string selected_node_name;
         std::vector<core::Scene::RenderableCropBox> cropboxes;
         std::vector<core::Scene::RenderableEllipsoid> ellipsoids;
+        std::vector<core::Scene::RenderableCropPolygon> crop_polygons;
         int selected_cropbox_index = -1;
         bool has_selection = false;
         size_t visible_splat_count = 0;
+        std::optional<lfs::rendering::GaussianRevealState> reveal;
+        std::optional<lfs::rendering::GaussianCustomEffectState> custom_effect;
     };
 
 } // namespace lfs::vis

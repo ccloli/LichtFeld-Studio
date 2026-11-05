@@ -2,6 +2,7 @@
  *
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
+#include "combined_model_worker_fixture.hpp"
 #include "core/alloc_counter.hpp"
 #include "core/cuda/sh_layout.cuh"
 #include "core/error.hpp"
@@ -14,6 +15,7 @@
 #include "core/splat_data_transform.hpp"
 #include "core/tensor.hpp"
 #include "core/tensor/internal/cuda_stream_context.hpp"
+#include "core/tensor/internal/memory_pool.hpp"
 #include "core/uuid.hpp"
 #include "io/formats/ply.hpp"
 #include "io/splat_chapter.hpp"
@@ -326,6 +328,33 @@ TEST_F(SceneConsolidationExtractTest, WorkerBuildMatchesSynchronousCombinedModel
     expect_shN_q16(worker_build->model->shN_canonical().to_vector(), expected->shN_canonical().to_vector());
 }
 
+// Catches captures drawing the previous combined model while the worker rebuilds it: an export
+// right after showing a model left that model out.
+TEST_F(SceneConsolidationExtractTest, CurrentCombinedModelNeverServesThePreviousScene) {
+    const size_t n = static_cast<size_t>(bike_.size());
+    const size_t visible_copies = 1'000'000 / n + 2;
+    Scene scene;
+    std::vector<lfs::core::NodeId> ids;
+    for (size_t i = 0; i <= visible_copies; ++i) {
+        ids.push_back(scene.addSplat("copy_" + std::to_string(i), std::make_unique<SplatData>(bike_.clone())));
+        ASSERT_NE(ids.back(), lfs::core::NULL_NODE);
+    }
+    scene.setNodeVisibility(ids.back(), false);
+    const auto* before = scene.getCurrentCombinedModel();
+    ASSERT_NE(before, nullptr);
+    ASSERT_EQ(static_cast<size_t>(before->size()), visible_copies * n);
+
+    scene.setNodeVisibility(ids.back(), true);
+    const auto* interactive = scene.getCombinedModel();
+    ASSERT_NE(interactive, nullptr);
+    ASSERT_EQ(static_cast<size_t>(interactive->size()), visible_copies * n)
+        << "the interactive path keeps the previous scene while the worker rebuilds";
+
+    const auto* current = scene.getCurrentCombinedModel();
+    ASSERT_NE(current, nullptr);
+    EXPECT_EQ(static_cast<size_t>(current->size()), (visible_copies + 1) * n);
+}
+
 TEST_F(SceneConsolidationExtractTest, SceneDestructionJoinsCombinedModelWorker) {
     std::mutex gate_mutex;
     std::condition_variable gate_changed;
@@ -462,9 +491,10 @@ TEST_F(SceneConsolidationExtractTest, ReplacingNodeModelRetiresPreviousUntilWork
 
     // Leave one node so the post-poll cache rebuild is synchronous and avoids
     // starting another worker while checking that the stale result was
-    // rejected.
+    // rejected. The alias is installed without waiting for the worker.
     scene.removeNodeById(second_id);
     EXPECT_EQ(scene.getCombinedModel(), replaced->model.get());
+    EXPECT_EQ(lfs::test::combined_model::settledCombinedModel(scene), replaced->model.get());
     EXPECT_FALSE(scene.combinedModelBuildPending());
 }
 
@@ -834,6 +864,7 @@ TEST(SceneCombinedEncode, CpuDecodeMatchesFrozenMasterForEveryCode) {
                                SplatData::ShNLayout::Swizzled);
             checkFrozenMaster("decode_" + std::to_string(i), expanded.shN_canonical_cpu(), sizeof(float));
         }
+        lfs::core::CudaMemoryPool::instance().release_stream(stream);
         ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
     }
 }
@@ -940,9 +971,93 @@ TEST(SceneCombinedEncode, QuantizedBandsMatchMasterEncodedBytesAndBounds) {
             }
         }
     }
-    for (auto stream : producers)
+    for (auto stream : producers) {
+        lfs::core::CudaMemoryPool::instance().release_stream(stream);
         EXPECT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+    }
+    lfs::core::CudaMemoryPool::instance().release_stream(build_stream);
     EXPECT_EQ(cudaStreamDestroy(build_stream), cudaSuccess);
+}
+
+TEST(SceneCombinedBuild, AllNodeCacheKeepsVisibilityAndSlotMetadataWithoutRebuilding) {
+    for (bool use_worker : {false, true}) {
+        SCOPED_TRACE(use_worker);
+        Scene scene;
+        const auto group = scene.addGroup("group");
+        std::vector<lfs::core::NodeId> ids;
+        for (int i = 0; i < 3; ++i) {
+            auto model = make_alias_test_model(static_cast<float>(i));
+            model->set_active_sh_degree(i % 2);
+            ids.push_back(scene.addSplat(std::to_string(i), std::move(model)));
+            scene.setNodeTransform(std::to_string(i), glm::translate(glm::mat4(1), glm::vec3(i, 0, 0)));
+        }
+        ASSERT_TRUE(scene.reparent(ids[0], group));
+        scene.setNodeVisibility(group, false);
+        std::atomic<int> allocations{0};
+        scene.setCombinedModelAllocator([&](lfs::core::TensorShape shape, size_t, lfs::core::DataType dtype, std::string_view) {
+            ++allocations;
+            return Tensor::empty(std::move(shape), Device::CUDA, dtype);
+        });
+        if (use_worker) {
+            scene.requestCombinedModelBuild(true);
+            while (scene.combinedModelBuildPending()) {
+                (void)scene.combinedModelBuildError();
+                std::this_thread::yield();
+            }
+        } else {
+            auto inputs = scene.captureCombinedModelBuild(true);
+            auto built = Scene::buildCombinedModelCache(std::move(inputs.inputs), inputs.full_selection_count,
+                                                        inputs.allocator, inputs.generation, true);
+            ASSERT_TRUE(scene.installCombinedModelCache(std::move(built)));
+        }
+        const auto* combined = scene.getCombinedModel();
+        ASSERT_NE(combined, nullptr);
+        ASSERT_EQ(combined->size(), 6u);
+        const auto indices = scene.getTransformIndices();
+        const auto selection_indices = scene.getVisibleSelectionIndices();
+        const int initial_allocations = allocations.load();
+        EXPECT_FALSE(scene.isConsolidated());
+        for (bool shown : {false, true, false, true}) {
+            scene.setNodeVisibility(group, shown);
+            EXPECT_EQ(scene.getCombinedModel(), combined);
+            EXPECT_FALSE(scene.combinedModelBuildPending());
+            EXPECT_EQ(allocations.load(), initial_allocations);
+            EXPECT_EQ(scene.getTransformIndices(), indices);
+            EXPECT_EQ(scene.getVisibleSelectionIndices(), selection_indices);
+            EXPECT_EQ(scene.getNodeVisibilityMask(), (std::vector<bool>{shown, true, true}));
+            EXPECT_EQ(scene.getVisibleNodeActiveShDegrees(), (std::vector<int>{0, 1, 0}));
+            const auto transforms = scene.getVisibleNodeTransforms();
+            ASSERT_EQ(transforms.size(), 3u);
+            for (int i = 0; i < 3; ++i) {
+                EXPECT_EQ(transforms[i][3].x, i);
+                EXPECT_NE(scene.getNodeById(ids[i])->model, nullptr);
+            }
+            const auto slots = scene.getVisibleSplatNodeSlots();
+            ASSERT_EQ(slots.size(), shown ? 3u : 2u);
+            EXPECT_EQ(slots.back().slot_index, 2u);
+            EXPECT_EQ(scene.getVisibleNodeIndex(ids[2]), 2);
+            EXPECT_EQ(scene.getVisibleNodeIndex("2"), 2);
+            EXPECT_EQ(scene.getVisibleNodeIndex(ids[0]), shown ? 0 : -1);
+            EXPECT_EQ(scene.getSelectedNodeMask(std::string("2")), (std::vector<bool>{false, false, true}));
+            EXPECT_EQ(scene.getSelectedNodeMask(std::vector<std::string>{"group", "2"}), (std::vector<bool>{true, false, true}));
+            EXPECT_EQ(scene.getSelectedNodeMask(std::string{}), (std::vector<bool>{false, false, false}));
+        }
+        // A pending replacement must not omit newly added source payloads from exports.
+        std::atomic<bool> release_worker{false};
+        scene.setCombinedModelAllocator([&](lfs::core::TensorShape shape, size_t, lfs::core::DataType dtype, std::string_view) {
+            while (!release_worker.load())
+                std::this_thread::yield();
+            return Tensor::empty(std::move(shape), Device::CUDA, dtype);
+        });
+        scene.addSplat("new", make_alias_test_model(3.0f));
+        scene.requestCombinedModelBuild(true);
+        EXPECT_EQ(scene.getVisibleSplatNodeSlots().size(), 4u);
+        release_worker.store(true);
+        while (scene.combinedModelBuildPending()) {
+            (void)scene.combinedModelBuildError();
+            std::this_thread::yield();
+        }
+    }
 }
 
 TEST(SceneCombinedImport, FailedBuildReportsOnceAndAllowsExplicitRetry) {
@@ -1025,6 +1140,28 @@ TEST(SceneCombinedImport, OrdinaryBuildFailuresKeepAutomaticRetry) {
     EXPECT_EQ(scene.getCombinedModel()->size(), 4u);
 }
 
+// Catches a worker that stays silent outside imports: a large multi-node edit such as
+// deleting a node left the viewport without splats until the next input event.
+TEST(SceneCombinedBuild, WorkerCompletionOutsideImportAnnouncesReadyModel) {
+    Scene scene;
+    scene.addSplat("first", make_alias_test_model(0.0f));
+    scene.addSplat("second", make_alias_test_model(1.0f));
+    std::atomic<int> ready{0};
+    lfs::event::ScopedHandler handler;
+    handler.subscribe<lfs::core::events::state::CombinedModelBuildReady>([&](const auto& event) {
+        if (event.scene == &scene)
+            ++ready;
+    });
+    scene.requestCombinedModelBuild(true);
+    while (scene.combinedModelBuildPending()) {
+        (void)scene.combinedModelBuildError();
+        std::this_thread::yield();
+    }
+    EXPECT_EQ(ready.load(), 1);
+    ASSERT_NE(scene.getCombinedModel(), nullptr);
+    EXPECT_EQ(scene.getCombinedModel()->size(), 4);
+}
+
 TEST(SceneCombinedEncode, QuantizedStorageCoversReservedModelCapacity) {
     using lfs::core::DataType;
     using lfs::core::TensorShape;
@@ -1075,4 +1212,60 @@ TEST(SceneCombinedEncode, QuantizedStorageCoversReservedModelCapacity) {
         const auto expected_bounds = reference.model->shN_value_bounds().cpu();
         EXPECT_EQ(std::memcmp(bounds.data_ptr(), expected_bounds.data_ptr(), bounds.numel() * sizeof(float)), 0);
     }
+}
+
+namespace {
+    [[nodiscard]] std::unique_ptr<SplatData> make_rows_model(const size_t rows) {
+        return std::make_unique<SplatData>(
+            1, Tensor::zeros({rows, 3}, Device::CUDA),
+            Tensor::zeros({rows, 1, 3}, Device::CUDA),
+            Tensor::zeros({rows, 3, 3}, Device::CUDA),
+            Tensor::zeros({rows, 3}, Device::CUDA),
+            Tensor::ones({rows, 4}, Device::CUDA),
+            Tensor::zeros({rows, 1}, Device::CUDA), 1.f);
+    }
+} // namespace
+
+// Catches the render thread joining a stale combined-model worker: hiding one of two large models
+// right after an import blocked the viewport until the whole background build had finished.
+TEST(SceneCombinedBuild, HidingANodeNeverWaitsForTheRunningWorker) {
+    namespace combined = lfs::test::combined_model;
+    constexpr size_t rows = 600'000; // two visible nodes exceed the worker threshold
+    Scene scene;
+    const auto first = scene.addSplat("first", make_rows_model(rows));
+    const auto second = scene.addSplat("second", make_rows_model(rows));
+    combined::HeldWorker worker;
+    scene.setCombinedModelAllocator(worker.allocator());
+    EXPECT_EQ(scene.getCombinedModel(), nullptr);
+    ASSERT_TRUE(worker.waitEntered());
+    const auto* first_model = scene.getNodeById(first)->model.get();
+
+    scene.setNodeVisibility(second, false);
+    const auto hidden = combined::combinedModelWithin(scene, worker);
+    EXPECT_TRUE(hidden.prompt) << "getCombinedModel waited " << hidden.elapsed.count() << " ms for the worker";
+    EXPECT_EQ(hidden.model, first_model);
+    EXPECT_TRUE(scene.combinedModelBuildPending()) << "the stale worker is still held";
+    EXPECT_EQ(scene.getVisibleNodeTransforms().size(), 1u);
+    EXPECT_EQ(scene.getTransformIndices()->numel(), rows);
+
+    // Shown again before the stale result lands: the alias stays until the next build,
+    // which starts once the stale result has been dropped.
+    scene.setNodeVisibility(second, true);
+    const auto shown = combined::combinedModelWithin(scene, worker);
+    EXPECT_TRUE(shown.prompt) << "getCombinedModel waited " << shown.elapsed.count() << " ms for the worker";
+    EXPECT_EQ(shown.model, first_model);
+    EXPECT_EQ(scene.getVisibleNodeTransforms().size(), 1u);
+
+    worker.release();
+    const auto* both = combined::settledCombinedModel(scene);
+    ASSERT_NE(both, nullptr);
+    EXPECT_FALSE(scene.combinedModelBuildPending());
+    EXPECT_EQ(static_cast<size_t>(both->size()), 2 * rows);
+    EXPECT_EQ(scene.getVisibleNodeTransforms().size(), 2u);
+    EXPECT_EQ(scene.getTransformIndices()->numel(), 2 * rows);
+
+    scene.setNodeVisibility(second, false);
+    EXPECT_EQ(combined::settledCombinedModel(scene), first_model);
+    EXPECT_EQ(scene.getTransformIndices()->numel(), rows);
+    EXPECT_EQ(scene.getVisibleSelectionIndices()->numel(), rows);
 }

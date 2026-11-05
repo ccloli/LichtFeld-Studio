@@ -6,7 +6,9 @@
 #include "core/error.hpp"
 #include "core/image_io.hpp"
 #include "core/logger.hpp"
+#include "core/native_fs.hpp"
 #include "core/path_utils.hpp"
+#include "core/stb_file.hpp"
 #include "diagnostics/vram_profiler.hpp"
 #include "gui/rmlui/vulkan/rmlui_shaders_spv.hpp"
 #include "internal/resource_paths.hpp"
@@ -87,10 +89,24 @@ namespace {
         int width = 0;
         int height = 0;
         bool embedded_project_preview = false;
+        bool mask_overlay = false;
     };
 
     bool IsPreviewTextureSource(std::string_view source) {
         return source.rfind("preview://", 0) == 0;
+    }
+
+    void PremultiplyImagePixels(unsigned char* pixels, const std::size_t count, const bool grayscale_coverage) {
+        for (std::size_t i = 0; i < count; ++i) {
+            auto* pixel = pixels + i * 4;
+            if (grayscale_coverage) {
+                pixel[1] = pixel[2] = pixel[3] = pixel[0];
+            } else {
+                const unsigned int alpha = pixel[3];
+                for (int c = 0; c < 3; ++c)
+                    pixel[c] = static_cast<unsigned char>((pixel[c] * alpha + 127) / 255);
+            }
+        }
     }
 
     bool IsLfsVkTextureSource(std::string_view source) {
@@ -210,6 +226,8 @@ namespace {
                     request.path = lfs::core::utf8_to_path(PercentDecode(value));
                 } else if (key == "kind") {
                     request.embedded_project_preview = value == "licht";
+                } else if (key == "mode") {
+                    request.mask_overlay = value == "mask";
                 } else if (key == "thumb") {
                     thumb_size = ParseIntParam(value);
                 } else if (key == "pmw") {
@@ -260,10 +278,8 @@ namespace {
 
 } // namespace
 
-RenderInterface_VK::RenderInterface_VK() : m_is_transform_enabled{false},
-                                           m_is_apply_to_regular_geometry_stencil{false},
+RenderInterface_VK::RenderInterface_VK() : m_is_apply_to_regular_geometry_stencil{false},
                                            m_is_clip_mask_enabled{false},
-                                           m_is_transformed_scissor_enabled{false},
                                            m_is_use_scissor_specified{false},
                                            m_is_use_stencil_pipeline{false},
                                            m_width{},
@@ -369,26 +385,34 @@ Rml::CompiledGeometryHandle RenderInterface_VK::CompileGeometry(Rml::Span<const 
                        "you can't have here an invalid pointer of VkDescriptorSet. Two reason might be. 1. - you didn't allocate it "
                        "at all or 2. - Somehing is wrong with allocation and somehow it was corrupted by something.");
 
-    auto* p_geometry_handle = new geometry_handle_t{};
+    auto geometry_handle = std::make_unique<geometry_handle_t>();
+    auto* p_geometry_handle = geometry_handle.get();
 
     uint32_t* pCopyDataToBuffer = nullptr;
     const void* pData = reinterpret_cast<const void*>(vertices.data());
 
     bool status = m_memory_pool.Alloc_VertexBuffer((uint32_t)vertices.size(), sizeof(Rml::Vertex), reinterpret_cast<void**>(&pCopyDataToBuffer),
                                                    &p_geometry_handle->m_p_vertex, &p_geometry_handle->m_p_vertex_allocation);
-    RMLUI_VK_ASSERTMSG(status, "failed to AllocVertexBuffer");
+    if (!status) {
+        Rml::Log::Message(Rml::Log::LT_ERROR, "RmlUi vertex buffer allocation failed");
+        return {};
+    }
 
     memcpy(pCopyDataToBuffer, pData, sizeof(Rml::Vertex) * vertices.size());
 
     status = m_memory_pool.Alloc_IndexBuffer((uint32_t)indices.size(), sizeof(int), reinterpret_cast<void**>(&pCopyDataToBuffer),
                                              &p_geometry_handle->m_p_index, &p_geometry_handle->m_p_index_allocation);
-    RMLUI_VK_ASSERTMSG(status, "failed to AllocIndexBuffer");
+    if (!status) {
+        m_memory_pool.Free_Allocation(p_geometry_handle->m_p_vertex_allocation);
+        Rml::Log::Message(Rml::Log::LT_ERROR, "RmlUi index buffer allocation failed");
+        return {};
+    }
 
     memcpy(pCopyDataToBuffer, indices.data(), sizeof(int) * indices.size());
 
     p_geometry_handle->m_num_indices = (int)indices.size();
 
-    return Rml::CompiledGeometryHandle(p_geometry_handle);
+    return Rml::CompiledGeometryHandle(geometry_handle.release());
 }
 
 void RenderInterface_VK::RenderGeometry(Rml::CompiledGeometryHandle geometry, Rml::Vector2f translation, Rml::TextureHandle texture) {
@@ -438,12 +462,30 @@ void RenderInterface_VK::RenderGeometry(Rml::CompiledGeometryHandle geometry, Rm
 
     shader_vertex_user_data_t* p_data = nullptr;
     VkDescriptorBufferInfo shader_buffer = {};
-    VmaVirtualAllocation shader_allocation = {};
+    pool_allocation_t shader_allocation = {};
     // Dynamic uniform offsets are consumed when the recorded command buffer executes, so keep
     // per-draw transform data alive until the owning frame slot's fence has completed.
     bool status = m_memory_pool.Alloc_GeneralBuffer(sizeof(m_user_data_for_vertex_shader), reinterpret_cast<void**>(&p_data),
                                                     &shader_buffer, &shader_allocation);
-    RMLUI_VK_ASSERTMSG(status, "failed to allocate VkDescriptorBufferInfo for uniform data to shaders");
+    if (!status) {
+        Rml::Log::Message(Rml::Log::LT_ERROR, "RmlUi uniform buffer allocation failed; skipping draw");
+        return;
+    }
+    // Each page keeps its own descriptor: previously recorded draws may still use
+    // an older page, so neither its buffer nor descriptor may be replaced.
+    auto& shader_pool = *shader_allocation.owner;
+    if (!shader_pool.m_shader_descriptor_set) {
+        if (!m_manager_descriptors.Alloc_Descriptor(m_p_device, &m_p_descriptor_set_layout_vertex_transform,
+                                                    &shader_pool.m_shader_descriptor_set)) {
+            m_memory_pool.Free_Allocation(shader_allocation);
+            Rml::Log::Message(Rml::Log::LT_ERROR, "RmlUi uniform descriptor allocation failed; skipping draw");
+            return;
+        }
+        shader_pool.SetDescriptorSet(1, sizeof(shader_vertex_user_data_t), VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
+                                     shader_pool.m_shader_descriptor_set);
+        m_overflow_shader_descriptor_sets.push_back(shader_pool.m_shader_descriptor_set);
+    }
+    p_current_descriptor_set = shader_pool.m_shader_descriptor_set;
     m_transient_shader_allocations_by_frame[ActiveResourceSlot()].push_back(shader_allocation);
 
     if (p_data) {
@@ -514,124 +556,76 @@ void RenderInterface_VK::EnableScissorRegion(bool enable) {
     m_is_use_scissor_specified = enable;
 
     if (m_is_use_scissor_specified == false) {
-        m_is_transformed_scissor_enabled = false;
-        m_is_apply_to_regular_geometry_stencil = m_is_clip_mask_enabled;
         m_scissor = ClampToCacheCaptureArea(ContextClipScissor());
         vkCmdSetScissor(m_p_current_command_buffer, 0, 1, &m_scissor);
     }
 }
 
+void RenderInterface_VK::ComputeScissorForRegion(const Rml::Rectanglei region) {
+    const float left_f = static_cast<float>(region.Left()) + m_context_offset.x;
+    const float top_f = static_cast<float>(region.Top()) + m_context_offset.y;
+    const float right_f = left_f + static_cast<float>(region.Width());
+    const float bottom_f = top_f + static_cast<float>(region.Height());
+    const int requested_left = static_cast<int>(std::floor(left_f));
+    const int requested_top = static_cast<int>(std::floor(top_f));
+    const int requested_right = static_cast<int>(std::ceil(right_f));
+    const int requested_bottom = static_cast<int>(std::ceil(bottom_f));
+    m_scissor_requested.offset = {requested_left, requested_top};
+    m_scissor_requested.extent = {
+        static_cast<uint32_t>(std::max(0, requested_right - requested_left)),
+        static_cast<uint32_t>(std::max(0, requested_bottom - requested_top)),
+    };
+
+    // Enclose the translated rect; fractional panel offsets otherwise clip text edges.
+    const int left = Rml::Math::Clamp(requested_left, 0, m_width);
+    const int top = Rml::Math::Clamp(requested_top, 0, m_height);
+    const int right = Rml::Math::Clamp(requested_right, 0, m_width);
+    const int bottom = Rml::Math::Clamp(requested_bottom, 0, m_height);
+    m_scissor.offset.x = left;
+    m_scissor.offset.y = top;
+    m_scissor.extent.width = static_cast<uint32_t>(std::max(0, right - left));
+    m_scissor.extent.height = static_cast<uint32_t>(std::max(0, bottom - top));
+    m_scissor = ClampToCacheCaptureArea(IntersectContextClip(m_scissor));
+}
+
 void RenderInterface_VK::SetScissorRegion(Rml::Rectanglei region) {
+    m_scissor_region = region;
     if (m_is_use_scissor_specified) {
-        const float left_f = static_cast<float>(region.Left()) + m_context_offset.x;
-        const float top_f = static_cast<float>(region.Top()) + m_context_offset.y;
-        const float right_f = left_f + static_cast<float>(region.Width());
-        const float bottom_f = top_f + static_cast<float>(region.Height());
-        const int requested_left = static_cast<int>(std::floor(left_f));
-        const int requested_top = static_cast<int>(std::floor(top_f));
-        const int requested_right = static_cast<int>(std::ceil(right_f));
-        const int requested_bottom = static_cast<int>(std::ceil(bottom_f));
-        m_scissor_requested.offset = {requested_left, requested_top};
-        m_scissor_requested.extent = {
-            static_cast<uint32_t>(std::max(0, requested_right - requested_left)),
-            static_cast<uint32_t>(std::max(0, requested_bottom - requested_top)),
-        };
-
-        if (m_is_transform_enabled) {
-            Rml::Vertex vertices[4];
-
-            vertices[0].position = Rml::Vector2f(region.TopLeft());
-            vertices[1].position = Rml::Vector2f(region.TopRight());
-            vertices[2].position = Rml::Vector2f(region.BottomRight());
-            vertices[3].position = Rml::Vector2f(region.BottomLeft());
-
-            int indices[6] = {0, 2, 1, 0, 3, 2};
-
-            m_is_use_stencil_pipeline = true;
-            m_scissor = ClampToCacheCaptureArea(ContextClipScissor());
-            vkCmdSetScissor(m_p_current_command_buffer, 0, 1, &m_scissor);
+        ComputeScissorForRegion(region);
 
 #ifdef RMLUI_VK_DEBUG
-            VkDebugUtilsLabelEXT info{};
-            info.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT;
-            info.color[0] = 1.0f;
-            info.color[1] = 1.0f;
-            info.color[2] = 0.0f;
-            info.color[3] = 1.0f;
-            info.pLabelName = "SetScissorRegion (generated region)";
+        VkDebugUtilsLabelEXT info{};
+        info.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT;
+        info.color[0] = 1.0f;
+        info.color[1] = 0.0f;
+        info.color[2] = 0.0f;
+        info.color[3] = 1.0f;
+        info.pLabelName = "SetScissorRegion (offset)";
 
-            InsertDebugUtilsLabel(m_p_device, m_p_current_command_buffer, info);
+        InsertDebugUtilsLabel(m_p_device, m_p_current_command_buffer, info);
 #endif
 
-            VkClearDepthStencilValue info_clear_color{};
-
-            info_clear_color.depth = 1.0f;
-            info_clear_color.stencil = 0;
-
-            VkClearAttachment clear_attachment = {};
-            clear_attachment.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
-            clear_attachment.clearValue.depthStencil = info_clear_color;
-            clear_attachment.colorAttachment = 1;
-
-            VkClearRect clear_rect = {};
-            clear_rect.layerCount = 1;
-            clear_rect.rect = ClampToCacheCaptureArea(VkRect2D{
-                {0, 0},
-                {static_cast<uint32_t>(m_width), static_cast<uint32_t>(m_height)},
-            });
-
-            vkCmdClearAttachments(m_p_current_command_buffer, 1, &clear_attachment, 1, &clear_rect);
-
-            if (Rml::CompiledGeometryHandle handle = CompileGeometry({vertices, 4}, {indices, 6})) {
-                RenderGeometry(handle, {}, {});
-                ReleaseGeometry(handle);
-            }
-
-            m_is_use_stencil_pipeline = false;
-
-            m_is_transformed_scissor_enabled = true;
-            m_is_apply_to_regular_geometry_stencil = true;
-            m_scissor = ClampToCacheCaptureArea(ContextClipScissor());
-            vkCmdSetScissor(m_p_current_command_buffer, 0, 1, &m_scissor);
-        } else {
-            m_is_transformed_scissor_enabled = false;
-            m_is_apply_to_regular_geometry_stencil = m_is_clip_mask_enabled;
-            // Enclose the translated rect; fractional panel offsets otherwise clip text edges.
-            const int left = Rml::Math::Clamp(requested_left, 0, m_width);
-            const int top = Rml::Math::Clamp(requested_top, 0, m_height);
-            const int right = Rml::Math::Clamp(requested_right, 0, m_width);
-            const int bottom = Rml::Math::Clamp(requested_bottom, 0, m_height);
-            m_scissor.offset.x = left;
-            m_scissor.offset.y = top;
-            m_scissor.extent.width = static_cast<uint32_t>(std::max(0, right - left));
-            m_scissor.extent.height = static_cast<uint32_t>(std::max(0, bottom - top));
-            m_scissor = ClampToCacheCaptureArea(IntersectContextClip(m_scissor));
-
-#ifdef RMLUI_VK_DEBUG
-            VkDebugUtilsLabelEXT info{};
-            info.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT;
-            info.color[0] = 1.0f;
-            info.color[1] = 0.0f;
-            info.color[2] = 0.0f;
-            info.color[3] = 1.0f;
-            info.pLabelName = "SetScissorRegion (offset)";
-
-            InsertDebugUtilsLabel(m_p_device, m_p_current_command_buffer, info);
-#endif
-
-            vkCmdSetScissor(m_p_current_command_buffer, 0, 1, &m_scissor);
-        }
+        vkCmdSetScissor(m_p_current_command_buffer, 0, 1, &m_scissor);
     }
 }
 
 void RenderInterface_VK::EnableClipMask(bool enable) {
     m_is_clip_mask_enabled = enable;
-    m_is_apply_to_regular_geometry_stencil = m_is_clip_mask_enabled || m_is_transformed_scissor_enabled;
+    m_is_apply_to_regular_geometry_stencil = m_is_clip_mask_enabled;
 }
 
 void RenderInterface_VK::RenderToClipMask(Rml::ClipMaskOperation operation, Rml::CompiledGeometryHandle geometry, Rml::Vector2f translation) {
     if (m_p_current_command_buffer == nullptr || !geometry)
         return;
+
+    // The mask is the stencil shape. RmlUi does not reapply an unchanged mask, so this clear
+    // uses the context clip. A 20px row scissor would otherwise hide every later row.
+    // The effective content scissor (as in ResetDynamicRenderState) is restored for the
+    // caller's own draw. m_scissor alone is stale while no scissor region is specified.
+    const VkRect2D content_scissor = ClampToCacheCaptureArea(
+        IntersectContextClip(m_is_use_scissor_specified ? m_scissor : ContextClipScissor()));
+    const VkRect2D mask_scissor = ClampToCacheCaptureArea(ContextClipScissor());
+    vkCmdSetScissor(m_p_current_command_buffer, 0, 1, &mask_scissor);
 
     VkClearDepthStencilValue clear_depth_stencil{};
     clear_depth_stencil.depth = 1.0f;
@@ -665,16 +659,29 @@ void RenderInterface_VK::RenderToClipMask(Rml::ClipMaskOperation operation, Rml:
     m_is_use_stencil_pipeline = false;
     m_is_clip_mask_enabled = true;
     m_is_apply_to_regular_geometry_stencil = true;
+    vkCmdSetScissor(m_p_current_command_buffer, 0, 1, &content_scissor);
 }
 
 Rml::LayerHandle RenderInterface_VK::PushLayer() {
+    return PushLayerInFrame(true);
+}
+
+Rml::LayerHandle RenderInterface_VK::PushContextLayer() {
+    return PushLayerInFrame(false);
+}
+
+Rml::LayerHandle RenderInterface_VK::PushLayerInFrame(const bool neutral_frame) {
     if (m_p_current_command_buffer == nullptr || m_width <= 0 || m_height <= 0)
         return {};
 
     const Rml::LayerHandle layer_handle = static_cast<Rml::LayerHandle>(m_render_layer_stack_size + 1);
     EnsureRenderLayer(layer_handle);
+    if (render_layer_t* layer = GetRenderLayer(layer_handle))
+        layer->saved_frame = CaptureFrameState();
 
     EndActiveRendering();
+    if (neutral_frame)
+        EnterLayerFrame();
     BeginLayerRendering(layer_handle, true);
 
     m_render_layer_stack_size += 1;
@@ -713,17 +720,24 @@ void RenderInterface_VK::CompositeLayers(Rml::LayerHandle source, Rml::LayerHand
         return;
     }
 
+    // The source was drawn in the frame it was pushed from. Compose it with that frame's offset,
+    // clip and scissor, then restore the current frame for the rest of the rendering.
+    const frame_state_t current_frame = CaptureFrameState();
+    const frame_state_t source_frame = source_layer->saved_frame;
+
     EndActiveRendering();
     TransitionImageLayout(source_layer->m_color.m_p_vk_image, source_layer->m_color.m_barrier_generation, VK_IMAGE_ASPECT_COLOR_BIT, source_layer->m_color_layout,
                           VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     source_layer->m_color_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
+    RestoreFrameState(source_frame);
     if (destination == 0)
         BeginSwapchainRendering(VK_ATTACHMENT_LOAD_OP_LOAD, VK_ATTACHMENT_LOAD_OP_LOAD);
     else
         BeginLayerRendering(destination, false);
 
     RenderFullscreenTexture(source_layer->m_color, blend_mode);
+    RestoreFrameState(current_frame);
 
     const Rml::LayerHandle top_layer = m_render_layer_stack_size > 0 ? static_cast<Rml::LayerHandle>(m_render_layer_stack_size) : Rml::LayerHandle{};
     if (top_layer != 0 && destination != top_layer) {
@@ -737,6 +751,8 @@ void RenderInterface_VK::PopLayer() {
         return;
 
     EndActiveRendering();
+    if (render_layer_t* layer = GetRenderLayer(static_cast<Rml::LayerHandle>(m_render_layer_stack_size)))
+        RestoreFrameState(layer->saved_frame);
     m_render_layer_stack_size -= 1;
     m_active_layer = {};
 
@@ -980,7 +996,7 @@ Rml::TextureHandle RenderInterface_VK::LoadTexture(Rml::Vector2i& texture_dimens
         int width = 0;
         int height = 0;
         int channels = 0;
-        unsigned char* data = stbi_load(path.c_str(), &width, &height, &channels, 4);
+        unsigned char* data = lfs::core::stb_file::stb_load(lfs::core::utf8_to_path(path), &width, &height, &channels, 4);
         if (!data)
             return 0;
 
@@ -994,32 +1010,10 @@ Rml::TextureHandle RenderInterface_VK::LoadTexture(Rml::Vector2i& texture_dimens
         // tint paints only the foreground.
         int probe_w = 0, probe_h = 0, probe_channels = 0;
         const bool is_single_channel =
-            stbi_info(path.c_str(), &probe_w, &probe_h, &probe_channels) &&
+            lfs::core::stb_file::stb_info(lfs::core::utf8_to_path(path), &probe_w, &probe_h, &probe_channels) &&
             probe_channels == 1;
 
-        const int pixel_count = width * height;
-        if (is_single_channel) {
-            // Mask: the gray value becomes the alpha. RGB is set to the same value so
-            // the texture is premultiplied (matching the non-mask branch below and the
-            // backend's premultiplied-alpha blend), which keeps alpha==0 pixels fully
-            // transparent instead of adding their color over the image.
-            for (int i = 0; i < pixel_count; ++i) {
-                unsigned char* p = data + i * 4;
-                const unsigned char gray = p[0];
-                p[0] = gray;
-                p[1] = gray;
-                p[2] = gray;
-                p[3] = gray;
-            }
-        } else {
-            for (int i = 0; i < pixel_count; ++i) {
-                unsigned char* p = data + i * 4;
-                const unsigned int alpha = p[3];
-                p[0] = static_cast<unsigned char>((p[0] * alpha + 127) / 255);
-                p[1] = static_cast<unsigned char>((p[1] * alpha + 127) / 255);
-                p[2] = static_cast<unsigned char>((p[2] * alpha + 127) / 255);
-            }
-        }
+        PremultiplyImagePixels(data, static_cast<std::size_t>(width) * height, is_single_channel);
 
         const size_t image_size = static_cast<size_t>(width) * static_cast<size_t>(height) * 4;
         const Rml::TextureHandle handle = CreateTexture({data, image_size}, texture_dimensions, path);
@@ -1040,7 +1034,7 @@ Rml::TextureHandle RenderInterface_VK::LoadTexture(Rml::Vector2i& texture_dimens
 
         try {
             const auto path = lfs::vis::getAssetPath(asset_name);
-            if (std::filesystem::exists(path))
+            if (lfs::core::native_fs::exists(path))
                 return load_with_stbi(lfs::core::path_to_utf8(path));
         } catch (...) {
         }
@@ -1069,7 +1063,7 @@ Rml::TextureHandle RenderInterface_VK::LoadTexture(Rml::Vector2i& texture_dimens
 #ifndef _WIN32
     if (!source.empty() && source[0] != '/' && source.find("://") == Rml::String::npos) {
         const std::string absolute_source = "/" + source;
-        if (std::filesystem::exists(absolute_source)) {
+        if (lfs::core::native_fs::exists(absolute_source)) {
             if (const Rml::TextureHandle handle = load_with_stbi(absolute_source); handle)
                 return handle;
         }
@@ -1165,6 +1159,9 @@ Rml::TextureHandle RenderInterface_VK::LoadAsyncPreviewTexture(Rml::Vector2i& te
     if (!texture)
         return 0;
     texture->m_is_async_preview = true;
+    texture->m_preview_source = source;
+    texture->m_preview_status = PreviewTextureStatus::Pending;
+    m_preview_textures_by_source[source] = texture;
 
     auto state = std::make_shared<async_preview_state_t>();
     state->texture = texture;
@@ -1174,14 +1171,20 @@ Rml::TextureHandle RenderInterface_VK::LoadAsyncPreviewTexture(Rml::Vector2i& te
     try {
         EnsurePreviewWorkerPool();
         EnqueuePreviewWork(preview_work_t{
-            state, request->path, request->max_size, request->embedded_project_preview});
+            state, request->path, request->max_size, request->embedded_project_preview, request->mask_overlay});
     } catch (const std::exception& e) {
         LOG_WARN("Failed to queue async preview texture worker for '{}': {}",
                  lfs::core::path_to_utf8(request->path), e.what());
         DropAsyncPreviewTexture(texture);
+        texture->m_preview_status = PreviewTextureStatus::Error;
     }
 
     return handle;
+}
+
+RenderInterface_VK::PreviewTextureStatus RenderInterface_VK::previewTextureStatus(const std::string& source) const {
+    const auto it = m_preview_textures_by_source.find(source);
+    return it == m_preview_textures_by_source.end() ? PreviewTextureStatus::Unknown : it->second->m_preview_status;
 }
 
 void RenderInterface_VK::EnsurePreviewWorkerPool() {
@@ -1207,7 +1210,7 @@ void RenderInterface_VK::EnsurePreviewWorkerPool() {
                 if (!work.state || work.state->cancelled.load(std::memory_order_acquire))
                     continue;
                 auto result = DecodePreviewTexture(
-                    std::move(work.path), work.max_size, work.embedded_project_preview);
+                    std::move(work.path), work.max_size, work.embedded_project_preview, work.mask_overlay);
                 if (work.state->cancelled.load(std::memory_order_acquire))
                     continue;
                 {
@@ -1248,20 +1251,24 @@ void RenderInterface_VK::StopPreviewWorkerPool() noexcept {
 RenderInterface_VK::async_preview_result_t RenderInterface_VK::DecodePreviewTexture(
     std::filesystem::path path,
     const int max_size,
-    const bool embedded_project_preview) {
+    const bool embedded_project_preview,
+    const bool mask_overlay) {
     async_preview_result_t result;
     unsigned char* data = nullptr;
     try {
         int width = 0;
         int height = 0;
         int channels = 0;
+        bool premultiplied_alpha = false;
         unsigned char* pixels = nullptr;
         if (embedded_project_preview) {
             auto reader = lfs::io::project::ProjectReader::open(path);
             if (!reader) {
-                LOG_WARN("Failed to inspect embedded project preview '{}': {}",
-                         lfs::core::path_to_utf8(path),
-                         lfs::format_for_developer(reader.error()));
+                // A catalog entry can outlive its file until the catalog marks it missing.
+                if (reader.error().code() != lfs::ErrorCode::NotFound)
+                    LOG_WARN("Failed to inspect embedded project preview '{}': {}",
+                             lfs::core::path_to_utf8(path),
+                             lfs::format_for_developer(reader.error()));
                 return result;
             }
             auto preview = reader->read_preview();
@@ -1274,6 +1281,16 @@ RenderInterface_VK::async_preview_result_t RenderInterface_VK::DecodePreviewText
             const auto* bytes = reinterpret_cast<const std::uint8_t*>(preview->data());
             std::tie(pixels, width, height, channels) =
                 lfs::core::load_image_from_memory(bytes, preview->size());
+        } else if (mask_overlay) {
+            int source_channels = 0;
+            pixels = lfs::core::stb_file::stb_load(path, &width, &height, &source_channels, 4);
+            channels = 4;
+            if (pixels) {
+                // Match ordinary mask textures and interpolate premultiplied
+                // colors, so transparent pixels do not bleed when downscaled.
+                PremultiplyImagePixels(pixels, static_cast<std::size_t>(width) * height, source_channels == 1);
+                premultiplied_alpha = true;
+            }
         } else {
             std::tie(pixels, width, height, channels) =
                 lfs::core::load_image_thumbnail(path, max_size);
@@ -1282,7 +1299,7 @@ RenderInterface_VK::async_preview_result_t RenderInterface_VK::DecodePreviewText
         if (pixels && width > 0 && height > 0 && channels > 0) {
             int output_width = width;
             int output_height = height;
-            if (embedded_project_preview && max_size > 0 &&
+            if ((embedded_project_preview || mask_overlay) && max_size > 0 &&
                 std::max(width, height) > max_size) {
                 const double scale = static_cast<double>(max_size) /
                                      static_cast<double>(std::max(width, height));
@@ -1322,11 +1339,11 @@ RenderInterface_VK::async_preview_result_t RenderInterface_VK::DecodePreviewText
                                       static_cast<std::size_t>(x)) *
                                          4u;
                     dst[0] = static_cast<Rml::byte>(
-                        (static_cast<unsigned int>(r) * a + 127u) / 255u);
+                        premultiplied_alpha ? r : (static_cast<unsigned int>(r) * a + 127u) / 255u);
                     dst[1] = static_cast<Rml::byte>(
-                        (static_cast<unsigned int>(g) * a + 127u) / 255u);
+                        premultiplied_alpha ? g : (static_cast<unsigned int>(g) * a + 127u) / 255u);
                     dst[2] = static_cast<Rml::byte>(
-                        (static_cast<unsigned int>(b) * a + 127u) / 255u);
+                        premultiplied_alpha ? b : (static_cast<unsigned int>(b) * a + 127u) / 255u);
                     dst[3] = static_cast<Rml::byte>(a);
                 }
             }
@@ -1399,13 +1416,19 @@ void RenderInterface_VK::ProcessAsyncPreviewUploads() {
             auto* replacement = reinterpret_cast<texture_data_t*>(replacement_handle);
             if (replacement) {
                 replacement->m_is_async_preview = true;
+                replacement->m_preview_source = state->source;
+                replacement->m_preview_status = PreviewTextureStatus::Ready;
                 QueueTextureForDeferredDeletion(new texture_data_t(*state->texture));
                 *state->texture = *replacement;
                 UnregisterLiveTexture(replacement);
                 delete replacement;
                 --uploads_remaining;
                 uploaded_any = true;
+            } else {
+                state->texture->m_preview_status = PreviewTextureStatus::Error;
             }
+        } else {
+            state->texture->m_preview_status = PreviewTextureStatus::Error;
         }
 
         it = m_async_preview_textures.erase(it);
@@ -1650,7 +1673,6 @@ void RenderInterface_VK::ReleaseTexture(Rml::TextureHandle texture_handle) {
 }
 
 void RenderInterface_VK::SetTransform(const Rml::Matrix4f* transform) {
-    m_is_transform_enabled = (transform != nullptr);
     m_rml_transform = transform ? *transform : Rml::Matrix4f::Identity();
     ApplyTransformState();
 }
@@ -1754,7 +1776,6 @@ void RenderInterface_VK::RenderTextureQuad(Rml::TextureHandle texture, const flo
         m_texture_quad_h = h;
     }
 
-    const bool transform_enabled = m_is_transform_enabled;
     const shader_vertex_user_data_t user_data = m_user_data_for_vertex_shader;
     const Rml::Matrix4f rml_transform = m_rml_transform;
     const Rml::Matrix4f context_transform = m_context_transform;
@@ -1763,7 +1784,6 @@ void RenderInterface_VK::RenderTextureQuad(Rml::TextureHandle texture, const flo
     if (m_texture_quad_geometry) {
         RenderGeometry(m_texture_quad_geometry, {}, texture);
     }
-    m_is_transform_enabled = transform_enabled;
     m_user_data_for_vertex_shader = user_data;
     m_rml_transform = rml_transform;
     m_context_transform = context_transform;
@@ -1950,7 +1970,6 @@ void RenderInterface_VK::RenderFrostedGlassQuad(texture_data_t& texture) {
         m_frosted_glass_quad_height = m_height;
     }
 
-    const bool transform_enabled = m_is_transform_enabled;
     const shader_vertex_user_data_t user_data = m_user_data_for_vertex_shader;
     const Rml::Matrix4f rml_transform = m_rml_transform;
     const Rml::Matrix4f context_transform = m_context_transform;
@@ -1960,7 +1979,6 @@ void RenderInterface_VK::RenderFrostedGlassQuad(texture_data_t& texture) {
         RenderGeometry(m_frosted_glass_quad_geometry,
                        {}, reinterpret_cast<Rml::TextureHandle>(&texture));
     }
-    m_is_transform_enabled = transform_enabled;
     m_user_data_for_vertex_shader = user_data;
     m_rml_transform = rml_transform;
     m_context_transform = context_transform;
@@ -2082,7 +2100,7 @@ void RenderInterface_VK::ShutdownExternal() {
         return;
 
     if (m_p_device)
-        vkDeviceWaitIdle(m_p_device);
+        lfs::rendering::vk_device_wait_idle_synced(m_p_device);
 
     StopPreviewWorkerPool();
     m_async_preview_textures.clear();
@@ -2142,7 +2160,6 @@ void RenderInterface_VK::BeginExternalFrame(const VkCommandBuffer command_buffer
     m_active_layer = {};
     m_render_layer_stack_size = 0;
     m_is_clip_mask_enabled = false;
-    m_is_transformed_scissor_enabled = false;
     m_is_use_scissor_specified = false;
     m_is_use_stencil_pipeline = false;
     m_is_apply_to_regular_geometry_stencil = false;
@@ -2173,7 +2190,6 @@ void RenderInterface_VK::ResetContextRenderState() {
         return;
 
     m_is_clip_mask_enabled = false;
-    m_is_transformed_scissor_enabled = false;
     m_is_use_scissor_specified = false;
     m_is_use_stencil_pipeline = false;
     m_is_apply_to_regular_geometry_stencil = false;
@@ -2232,6 +2248,10 @@ void RenderInterface_VK::Destroy_Resources() noexcept {
     if (m_p_descriptor_set) {
         m_manager_descriptors.Free_Descriptors(m_p_device, &m_p_descriptor_set);
     }
+
+    for (auto& descriptor : m_overflow_shader_descriptor_sets)
+        m_manager_descriptors.Free_Descriptors(m_p_device, &descriptor);
+    m_overflow_shader_descriptor_sets.clear();
 
     vkDestroyDescriptorSetLayout(m_p_device, m_p_descriptor_set_layout_vertex_transform, nullptr);
     vkDestroyDescriptorSetLayout(m_p_device, m_p_descriptor_set_layout_texture, nullptr);
@@ -2350,6 +2370,7 @@ void RenderInterface_VK::CreateDescriptorSets() noexcept {
 
     m_manager_descriptors.Alloc_Descriptor(m_p_device, &m_p_descriptor_set_layout_vertex_transform, &m_p_descriptor_set);
     m_memory_pool.SetDescriptorSet(1, sizeof(shader_vertex_user_data_t), VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, m_p_descriptor_set);
+    m_memory_pool.m_shader_descriptor_set = m_p_descriptor_set;
 }
 
 void RenderInterface_VK::CreateSamplers() noexcept {
@@ -2686,6 +2707,7 @@ void RenderInterface_VK::Destroy_Textures() noexcept {
 void RenderInterface_VK::Destroy_LiveTextures() noexcept {
     auto live_textures = std::move(m_live_textures);
     m_live_textures.clear();
+    m_preview_textures_by_source.clear();
 
     for (texture_data_t* texture : live_textures) {
         if (!texture)
@@ -2701,8 +2723,12 @@ void RenderInterface_VK::RegisterLiveTexture(texture_data_t* texture) {
 }
 
 void RenderInterface_VK::UnregisterLiveTexture(texture_data_t* texture) {
-    if (texture)
+    if (texture) {
+        const auto it = m_preview_textures_by_source.find(texture->m_preview_source);
+        if (it != m_preview_textures_by_source.end() && it->second == texture)
+            m_preview_textures_by_source.erase(it);
         m_live_textures.erase(texture);
+    }
 }
 
 uint32_t RenderInterface_VK::ActiveResourceSlot() const noexcept {
@@ -2711,7 +2737,7 @@ uint32_t RenderInterface_VK::ActiveResourceSlot() const noexcept {
 
 void RenderInterface_VK::FreeTransientShaderAllocations(const uint32_t resource_slot) noexcept {
     auto& allocations = m_transient_shader_allocations_by_frame[resource_slot % kSwapchainBackBufferCount];
-    for (VmaVirtualAllocation allocation : allocations)
+    for (auto allocation : allocations)
         m_memory_pool.Free_Allocation(allocation);
     allocations.clear();
 }
@@ -3067,11 +3093,52 @@ void RenderInterface_VK::TransitionImageLayout(VkImage image, std::uint64_t gene
     m_image_barriers.transitionImage(m_p_current_command_buffer, image, generation, aspect_mask, new_layout);
 }
 
+RenderInterface_VK::frame_state_t RenderInterface_VK::CaptureFrameState() const {
+    frame_state_t state;
+    state.context_offset = m_context_offset;
+    state.context_transform = m_context_transform;
+    state.context_clip_enabled = m_context_clip_enabled;
+    state.context_clip_scissor = m_context_clip_scissor;
+    state.cache_capture_active = m_cache_capture_active;
+    state.cache_capture_render_area = m_cache_capture_render_area;
+    state.scissor_specified = m_is_use_scissor_specified;
+    state.scissor_region = m_scissor_region;
+    state.scissor = m_scissor;
+    state.scissor_requested = m_scissor_requested;
+    return state;
+}
+
+void RenderInterface_VK::RestoreFrameState(const frame_state_t& state) {
+    m_context_offset = state.context_offset;
+    m_context_transform = state.context_transform;
+    m_context_clip_enabled = state.context_clip_enabled;
+    m_context_clip_scissor = state.context_clip_scissor;
+    m_cache_capture_active = state.cache_capture_active;
+    m_cache_capture_render_area = state.cache_capture_render_area;
+    m_is_use_scissor_specified = state.scissor_specified;
+    m_scissor_region = state.scissor_region;
+    m_scissor = state.scissor;
+    m_scissor_requested = state.scissor_requested;
+    ApplyTransformState();
+}
+
+void RenderInterface_VK::EnterLayerFrame() {
+    m_context_offset = Rml::Vector2f(0.0f, 0.0f);
+    m_context_transform = Rml::Matrix4f::Identity();
+    m_context_clip_enabled = false;
+    m_context_clip_scissor = {};
+    m_cache_capture_active = false;
+    m_cache_capture_render_area = {};
+    if (m_is_use_scissor_specified)
+        ComputeScissorForRegion(m_scissor_region);
+    ApplyTransformState();
+}
+
 void RenderInterface_VK::ResetDynamicRenderState() {
     if (!m_p_current_command_buffer)
         return;
     vkCmdSetViewport(m_p_current_command_buffer, 0, 1, &m_viewport);
-    VkRect2D scissor = (m_is_use_scissor_specified && !m_is_transformed_scissor_enabled) ? m_scissor : ContextClipScissor();
+    VkRect2D scissor = m_is_use_scissor_specified ? m_scissor : ContextClipScissor();
     scissor = ClampToCacheCaptureArea(IntersectContextClip(scissor));
     vkCmdSetScissor(m_p_current_command_buffer, 0, 1, &scissor);
     vkCmdSetStencilReference(m_p_current_command_buffer, VK_STENCIL_FACE_FRONT_AND_BACK, 1);
@@ -3273,14 +3340,12 @@ void RenderInterface_VK::RenderFullscreenTexture(texture_data_t& texture, Rml::B
 
     int indices[6] = {0, 1, 2, 0, 2, 3};
 
-    const bool transform_enabled = m_is_transform_enabled;
     const Rml::Matrix4f transform = m_user_data_for_vertex_shader.m_transform;
     SetTransform(nullptr);
     if (Rml::CompiledGeometryHandle handle = CompileGeometry({vertices, 4}, {indices, 6})) {
         RenderGeometry(handle, {}, reinterpret_cast<Rml::TextureHandle>(&texture));
         ReleaseGeometry(handle);
     }
-    m_is_transform_enabled = transform_enabled;
     m_user_data_for_vertex_shader.m_transform = transform;
 }
 
@@ -3332,7 +3397,7 @@ RenderInterface_VK::MemoryPool::MemoryPool() : m_memory_total_size{},
 
 RenderInterface_VK::MemoryPool::~MemoryPool() {}
 
-void RenderInterface_VK::MemoryPool::Initialize(VkDeviceSize byte_size, VkDeviceSize device_min_uniform_alignment, VmaAllocator p_allocator,
+bool RenderInterface_VK::MemoryPool::Initialize(VkDeviceSize byte_size, VkDeviceSize device_min_uniform_alignment, VmaAllocator p_allocator,
                                                 VkDevice p_device) noexcept {
     RMLUI_VK_ASSERTMSG(byte_size > 0, "size must be valid");
     RMLUI_VK_ASSERTMSG(device_min_uniform_alignment > 0, "uniform alignment must be valid");
@@ -3366,13 +3431,14 @@ void RenderInterface_VK::MemoryPool::Initialize(VkDeviceSize byte_size, VkDevice
 
     auto status = vmaCreateBuffer(m_p_vk_allocator, &info, &info_alloc, &m_p_buffer, &m_p_buffer_alloc, &info_stats);
 
-    RMLUI_VK_ASSERTMSG(status == VkResult::VK_SUCCESS, "failed to vmaCreateBuffer");
-    if (status == VkResult::VK_SUCCESS && m_p_buffer_alloc != VK_NULL_HANDLE) {
+    if (status != VK_SUCCESS)
+        return false;
+    if (m_p_buffer_alloc != VK_NULL_HANDLE) {
         vmaSetAllocationName(m_p_vk_allocator,
                              m_p_buffer_alloc,
                              "RmlUi geometry memory pool");
         RecordRmlUiVram("vulkan.rmlui.geometry_pool",
-                        "vertex_index_uniform",
+                        std::format("vertex_index_uniform@{}", static_cast<const void*>(this)),
                         info_stats.size);
     }
 
@@ -3381,7 +3447,10 @@ void RenderInterface_VK::MemoryPool::Initialize(VkDeviceSize byte_size, VkDevice
 
     status = vmaCreateVirtualBlock(&info_virtual_block, &m_p_block);
 
-    RMLUI_VK_ASSERTMSG(status == VkResult::VK_SUCCESS, "failed to vmaCreateVirtualBlock");
+    if (status != VK_SUCCESS) {
+        Shutdown();
+        return false;
+    }
 
 #ifdef RMLUI_VK_DEBUG
     Rml::Log::Message(Rml::Log::LT_DEBUG, "[Vulkan][Debug] Allocated memory pool [%s]", FormatByteSize(info_stats.size).c_str());
@@ -3389,7 +3458,11 @@ void RenderInterface_VK::MemoryPool::Initialize(VkDeviceSize byte_size, VkDevice
 
     status = vmaMapMemory(m_p_vk_allocator, m_p_buffer_alloc, (void**)&m_p_data);
 
-    RMLUI_VK_ASSERTMSG(status == VkResult::VK_SUCCESS, "failed to vmaMapMemory");
+    if (status != VK_SUCCESS) {
+        Shutdown();
+        return false;
+    }
+    return true;
 }
 
 void RenderInterface_VK::MemoryPool::Shutdown() noexcept {
@@ -3401,18 +3474,30 @@ void RenderInterface_VK::MemoryPool::Shutdown() noexcept {
     Rml::Log::Message(Rml::Log::LT_DEBUG, "[Vulkan][Debug] Destroyed memory pool [%s]", FormatByteSize(m_memory_total_size).c_str());
 #endif
 
-    vmaUnmapMemory(m_p_vk_allocator, m_p_buffer_alloc);
-    vmaDestroyVirtualBlock(m_p_block);
-    RecordRmlUiVram("vulkan.rmlui.geometry_pool", "vertex_index_uniform", 0);
-    vmaDestroyBuffer(m_p_vk_allocator, m_p_buffer, m_p_buffer_alloc);
+    if (m_overflow) {
+        m_overflow->Shutdown();
+        m_overflow.reset();
+    }
+    if (m_p_data)
+        vmaUnmapMemory(m_p_vk_allocator, m_p_buffer_alloc);
+    if (m_p_block)
+        vmaDestroyVirtualBlock(m_p_block);
+    RecordRmlUiVram("vulkan.rmlui.geometry_pool", std::format("vertex_index_uniform@{}", static_cast<const void*>(this)), 0);
+    if (m_p_buffer)
+        vmaDestroyBuffer(m_p_vk_allocator, m_p_buffer, m_p_buffer_alloc);
+    m_p_data = nullptr;
+    m_p_block = VK_NULL_HANDLE;
+    m_p_buffer = VK_NULL_HANDLE;
+    m_p_buffer_alloc = VK_NULL_HANDLE;
+    m_shader_descriptor_set = VK_NULL_HANDLE;
 }
 
 bool RenderInterface_VK::MemoryPool::Alloc_GeneralBuffer(VkDeviceSize size, void** p_data, VkDescriptorBufferInfo* p_out,
-                                                         VmaVirtualAllocation* p_alloc) noexcept {
+                                                         pool_allocation_t* p_alloc) noexcept {
     RMLUI_VK_ASSERTMSG(p_out, "you must pass a valid pointer");
     RMLUI_VK_ASSERTMSG(m_p_buffer, "you must have a valid VkBuffer");
 
-    RMLUI_VK_ASSERTMSG(*p_alloc == nullptr,
+    RMLUI_VK_ASSERTMSG(!*p_alloc,
                        "you can't pass a VALID object, because it is for initialization. So it means you passed the already allocated "
                        "VmaVirtualAllocation and it means you did something wrong, like you wanted to allocate into the same object...");
 
@@ -3424,9 +3509,23 @@ bool RenderInterface_VK::MemoryPool::Alloc_GeneralBuffer(VkDeviceSize size, void
     info.size = size;
     info.alignment = m_device_min_uniform_alignment;
 
-    auto status = vmaVirtualAllocate(m_p_block, &info, p_alloc, &offset_memory);
-
-    RMLUI_VK_ASSERTMSG(status == VkResult::VK_SUCCESS, "failed to vmaVirtualAllocate");
+    *p_data = nullptr;
+    *p_out = {};
+    VmaVirtualAllocation allocation{};
+    const auto status = vmaVirtualAllocate(m_p_block, &info, &allocation, &offset_memory);
+    if (status != VK_SUCCESS) {
+        // Keep all live pages stable, including geometry referenced by frames in
+        // flight. Reuse their free ranges before growing; never copy the pool.
+        if (!m_overflow) {
+            auto overflow = std::make_unique<MemoryPool>();
+            if (!overflow->Initialize(std::max(m_memory_total_size, size), m_device_min_uniform_alignment,
+                                      m_p_vk_allocator, m_p_device))
+                return false;
+            m_overflow = std::move(overflow);
+        }
+        return m_overflow->Alloc_GeneralBuffer(size, p_data, p_out, p_alloc);
+    }
+    *p_alloc = {this, allocation};
 
     *p_data = (void*)(m_p_data + offset_memory);
 
@@ -3438,13 +3537,13 @@ bool RenderInterface_VK::MemoryPool::Alloc_GeneralBuffer(VkDeviceSize size, void
 }
 
 bool RenderInterface_VK::MemoryPool::Alloc_VertexBuffer(uint32_t number_of_elements, uint32_t stride_in_bytes, void** p_data,
-                                                        VkDescriptorBufferInfo* p_out, VmaVirtualAllocation* p_alloc) noexcept {
-    return Alloc_GeneralBuffer(number_of_elements * stride_in_bytes, p_data, p_out, p_alloc);
+                                                        VkDescriptorBufferInfo* p_out, pool_allocation_t* p_alloc) noexcept {
+    return Alloc_GeneralBuffer(VkDeviceSize{number_of_elements} * stride_in_bytes, p_data, p_out, p_alloc);
 }
 
 bool RenderInterface_VK::MemoryPool::Alloc_IndexBuffer(uint32_t number_of_elements, uint32_t stride_in_bytes, void** p_data,
-                                                       VkDescriptorBufferInfo* p_out, VmaVirtualAllocation* p_alloc) noexcept {
-    return Alloc_GeneralBuffer(number_of_elements * stride_in_bytes, p_data, p_out, p_alloc);
+                                                       VkDescriptorBufferInfo* p_out, pool_allocation_t* p_alloc) noexcept {
+    return Alloc_GeneralBuffer(VkDeviceSize{number_of_elements} * stride_in_bytes, p_data, p_out, p_alloc);
 }
 
 void RenderInterface_VK::MemoryPool::SetDescriptorSet(uint32_t binding_index, uint32_t size, VkDescriptorType descriptor_type,
@@ -3522,9 +3621,9 @@ void RenderInterface_VK::MemoryPool::SetDescriptorSet(uint32_t binding_index, Vk
     vkUpdateDescriptorSets(m_p_device, 1, &info_write, 0, nullptr);
 }
 
-void RenderInterface_VK::MemoryPool::Free_Allocation(VmaVirtualAllocation allocation) noexcept {
+void RenderInterface_VK::MemoryPool::Free_Allocation(pool_allocation_t allocation) noexcept {
     if (allocation)
-        vmaVirtualFree(m_p_block, allocation);
+        vmaVirtualFree(allocation.owner->m_p_block, allocation.handle);
 }
 
 void RenderInterface_VK::MemoryPool::Free_GeometryHandle(geometry_handle_t* p_valid_geometry_handle) noexcept {
@@ -3546,9 +3645,9 @@ void RenderInterface_VK::MemoryPool::Free_GeometryHandle(geometry_handle_t* p_va
     Free_Allocation(p_valid_geometry_handle->m_p_index_allocation);
     Free_Allocation(p_valid_geometry_handle->m_p_shader_allocation);
 
-    p_valid_geometry_handle->m_p_vertex_allocation = nullptr;
-    p_valid_geometry_handle->m_p_shader_allocation = nullptr;
-    p_valid_geometry_handle->m_p_index_allocation = nullptr;
+    p_valid_geometry_handle->m_p_vertex_allocation = {};
+    p_valid_geometry_handle->m_p_shader_allocation = {};
+    p_valid_geometry_handle->m_p_index_allocation = {};
     p_valid_geometry_handle->m_num_indices = 0;
 }
 
@@ -3562,7 +3661,7 @@ void RenderInterface_VK::MemoryPool::Free_GeometryHandle_ShaderDataOnly(geometry
     RMLUI_VK_ASSERTMSG(m_p_block, "you have to allocate the virtual block before do this operation...");
 
     Free_Allocation(p_valid_geometry_handle->m_p_shader_allocation);
-    p_valid_geometry_handle->m_p_shader_allocation = nullptr;
+    p_valid_geometry_handle->m_p_shader_allocation = {};
 }
 
 #include <vk_mem_alloc.h>

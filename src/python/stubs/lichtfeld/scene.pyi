@@ -112,6 +112,21 @@ class SplatData:
         Reserve capacity for Gaussians (for densification). Raises if the model is renderer-backed.
         """
 
+    def shN_rows(self, rows: lichtfeld.Tensor, degree: int) -> lichtfeld.Tensor:
+        """
+        Copy selected SH-rest rows and bands to owned canonical Float32 CPU storage. Rows must be a rank-1 CPU Int32 or Int64 tensor; call at a model read boundary.
+        """
+
+def generate_collision(voxel_size: float = 0.05000000074505806, opacity: float = 0.10000000149011612, auto_resolution: bool = False, cleanup: bool = True, max_gaussian_area: float = 0.0) -> None: ...
+
+def export_collision(uuid: str, path: str) -> None: ...
+
+def cancel_collision() -> None: ...
+
+def get_collision_state() -> dict: ...
+
+def set_walk_settings(height: float, radius: float, step: float, speed: float) -> None: ...
+
 class SceneSplatSnapshot:
     @property
     def transform(self) -> tuple: ...
@@ -149,9 +164,13 @@ class NodeType(enum.Enum):
 
     MESH = 10
 
+    COLLISION = 15
+
     KEYFRAME_GROUP = 11
 
     KEYFRAME = 12
+
+    CROP_POLYGON = 14
 
 class MeshInfo:
     @property
@@ -248,7 +267,40 @@ class Ellipsoid:
     def __dir__(self) -> list:
         """List available attributes"""
 
+class CropPolygon:
+    @property
+    def __property_group__(self) -> str:
+        """Property group name for introspection"""
+
+    @property
+    def vertices(self) -> list[tuple[float, float]]:
+        """Outline vertices (x, y) in the node's local XY plane"""
+
+    def get(self, name: str) -> object:
+        """Get property value by name"""
+
+    def set(self, name: str, value: object) -> None:
+        """Set property value by name"""
+
+    def prop_info(self, name: str) -> dict:
+        """Get metadata for a property"""
+
+    def __getattr__(self, arg: str, /) -> object: ...
+
+    def __setattr__(self, arg0: str, arg1: object, /) -> None: ...
+
+    def __dir__(self) -> list:
+        """List available attributes"""
+
 class PointCloud:
+    """
+    Point-cloud data owned by a load result or referenced by scene node identity.
+
+    Loaded data remains usable after its LoadResult is released. Scene-backed
+    handles raise RuntimeError while their source node is absent; undo restoring
+    the same node makes the handle usable again.
+    """
+
     @property
     def means(self) -> lichtfeld.Tensor:
         """Position tensor [N, 3]"""
@@ -351,7 +403,7 @@ class SceneNode:
     def world_transform(self) -> tuple:
         """World-space transform as 4x4 row-major tuple"""
 
-    def set_local_transform(self, arg: Annotated[NDArray[numpy.float32], dict(shape=(4, 4))], /) -> None:
+    def set_local_transform(self, arg: Annotated[NDArray[numpy.float32], dict(shape=(4, 4), device='cpu')], /) -> None:
         """Set local transform from a [4, 4] ndarray"""
 
     @property
@@ -376,6 +428,9 @@ class SceneNode:
 
     def ellipsoid(self) -> Ellipsoid | None:
         """Get Ellipsoid for ELLIPSOID nodes (None otherwise)"""
+
+    def crop_polygon(self) -> CropPolygon | None:
+        """Get CropPolygon for CROP_POLYGON nodes (None otherwise)"""
 
     def keyframe_data(self) -> KeyframeData | None:
         """Get KeyframeData for KEYFRAME nodes (None otherwise)"""
@@ -407,6 +462,12 @@ class SceneNode:
     @property
     def has_depth(self) -> bool:
         """Whether this camera node has a depth map file"""
+
+    @property
+    def has_distortion(self) -> bool:
+        """
+        Whether this camera node has lens distortion or non-pinhole camera model
+        """
 
     def load_mask(self, resize_factor: int = 1, max_width: int = 0, invert: bool = False, threshold: float = 0.5) -> lichtfeld.Tensor | None:
         """
@@ -480,7 +541,7 @@ class Scene:
     def add_group(self, name: str, parent: int = -1) -> int:
         """Add an empty group node, returns node ID"""
 
-    def add_splat(self, name: str, means: lichtfeld.Tensor, sh0: lichtfeld.Tensor, shN: lichtfeld.Tensor, scaling: lichtfeld.Tensor, rotation: lichtfeld.Tensor, opacity: lichtfeld.Tensor, sh_degree: int = 0, scene_scale: float = 1.0, parent: int = -1) -> int:
+    def add_splat(self, name: str, means: lichtfeld.Tensor, sh0: lichtfeld.Tensor, shN: lichtfeld.Tensor, scaling: lichtfeld.Tensor, rotation: lichtfeld.Tensor, opacity: lichtfeld.Tensor, sh_degree: int = 0, scene_scale: float = 1.0, parent: int = -1, transient: bool = False) -> int:
         """
         Add a new splat node from tensor data.
 
@@ -495,17 +556,20 @@ class Scene:
             sh_degree: SH degree (0 for RGB only)
             scene_scale: Scene scale factor
             parent: Parent node ID (-1 for root)
+            transient: Show the node but leave it out of project saves and undo history
 
         Returns:
             Node ID of created splat
         """
 
     def add_point_cloud(self, name: str, points: lichtfeld.Tensor, colors: lichtfeld.Tensor, parent: int = -1) -> int:
-        """Add a point cloud node from tensor data [N,3] positions and colors"""
+        """
+        Add a point cloud node from [N,3] positions and uint8 or float32 colors; other color dtypes raise ValueError
+        """
 
     def add_mesh(self, name: str, vertices: lichtfeld.Tensor, indices: lichtfeld.Tensor, colors: lichtfeld.Tensor | None = None, normals: lichtfeld.Tensor | None = None, parent: int = -1) -> int:
         """
-        Add a mesh node from [V,3] vertices, [F,3] face indices, optional [V,4] colors and [V,3] normals
+        Add a mesh node from [V,3] vertices, [F,3] face indices, optional [V,4] colors and [V,3] normals; invalid color shapes raise ValueError
         """
 
     def add_camera_group(self, name: str, parent: int, camera_count: int) -> int:
@@ -580,25 +644,37 @@ class Scene:
         """Get world-space transform as 4x4 row-major tuple"""
 
     @overload
-    def set_node_transform(self, name: str, transform: Annotated[NDArray[numpy.float32], dict(shape=(4, 4))]) -> None:
-        """Set node local transform from a [4, 4] ndarray"""
-
-    @overload
     def set_node_transform(self, name: str, transform: lichtfeld.Tensor) -> None:
         """Set node local transform from a [4, 4] Tensor"""
 
+    @overload
+    def set_node_transform(self, name: str, transform: Annotated[NDArray[numpy.float32], dict(shape=(4, 4), device='cpu')]) -> None:
+        """Set node local transform from a [4, 4] ndarray"""
+
     def combined_model(self) -> SplatData | None:
         """Get the merged SplatData for all visible splats (None if empty)"""
+
+    def apply_crop_filter(self, mask: lichtfeld.Tensor) -> None:
+        """
+        Filter a combined-model CUDA bool mask in place by enabled render crop boxes, ellipsoids and polygons. Scene selection is unchanged.
+        """
 
     def training_model(self) -> SplatData | None:
         """Get the SplatData used for training (None if unavailable)"""
 
     def set_training_model_node(self, name: str) -> None:
-        """Set which node provides the training model"""
+        """
+        Set which node provides the training model. A transient node may not replace a saved training model (RuntimeError)
+        """
 
     @property
     def training_model_node_name(self) -> str:
         """Name of the node providing the training model"""
+
+    def set_node_transient(self, name: str, transient: bool) -> bool:
+        """
+        Show a node in the viewer but leave it and everything under it out of project saves; False if there is no such node. Raises RuntimeError if the node holds the training model
+        """
 
     @overload
     def get_node_bounds(self, id: int) -> tuple[tuple[float, float, float], tuple[float, float, float]] | None:
@@ -701,6 +777,16 @@ class Scene:
 
     def get_active_cameras(self) -> list[SceneNode]:
         """Get camera nodes enabled for training"""
+
+    def has_active_distorted_cameras(self) -> bool:
+        """
+        Check if any active camera enabled for training has distortion or non-pinhole model
+        """
+
+    def can_undistort_active_cameras(self) -> bool:
+        """
+        Check if all active cameras needing distortion handling can be undistorted
+        """
 
     def has_training_data(self) -> bool:
         """Check if training dataset is loaded"""

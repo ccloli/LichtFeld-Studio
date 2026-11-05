@@ -83,7 +83,8 @@ namespace lfs::io::project {
         bool is_payload_class_chunk(const ChunkInfo& row) noexcept {
             return (row.flags & TENSOR_PAYLOAD) != 0 ||
                    row.key.fourcc == FOURCC_CKPT ||
-                   row.key.fourcc == FOURCC_PPIS;
+                   row.key.fourcc == FOURCC_PPIS ||
+                   row.key.fourcc == FOURCC_SFMO;
         }
 
         std::optional<std::uint64_t> payload_materialized_bytes_override;
@@ -376,6 +377,7 @@ namespace lfs::io::project {
             SuperblockInfo superblock;
             ParsedHead selected;
             std::vector<HeadInfo> published_heads;
+            std::array<std::array<std::byte, HEAD_SLOT_BYTES>, 2> head_bytes{};
             std::vector<std::string> warnings;
             OpenState open_state = OpenState::Open;
             ReaderOptions options;
@@ -2018,6 +2020,11 @@ namespace lfs::io::project {
                 derived_capabilities.set(CHUNK_BYTESHUFFLE_ZSTD_V1);
             }
             if (std::any_of(rows.begin(), rows.end(), [](const ChunkInfo& row) {
+                    return row.row_kind != RowKind::Tombstone && row.key.fourcc == FOURCC_COLV;
+                })) {
+                derived_capabilities.set(COLLISION_VOLUMES_V1);
+            }
+            if (std::any_of(rows.begin(), rows.end(), [](const ChunkInfo& row) {
                     return row.block_crc_table.has_value();
                 })) {
                 derived_capabilities.set(BLOCK_CRC32C_V1);
@@ -2417,6 +2424,7 @@ namespace lfs::io::project {
             }
 
             std::array<HeadAttempt, 2> attempts;
+            std::array<std::array<std::byte, HEAD_SLOT_BYTES>, 2> head_bytes{};
             CommitRecordCache commit_cache;
             for (std::uint32_t slot_id = 0; slot_id < attempts.size(); ++slot_id) {
                 HeadAttempt& attempt = attempts[slot_id];
@@ -2428,6 +2436,7 @@ namespace lfs::io::project {
                     attempt.error = std::move(raw).error();
                     continue;
                 }
+                head_bytes[slot_id] = *raw;
                 if (all_zero(byte_span(*raw))) {
                     attempt.blank = true;
                     continue;
@@ -2625,6 +2634,7 @@ namespace lfs::io::project {
             state->physical_size = physical_size;
             state->superblock = *superblock;
             state->selected = selected;
+            state->head_bytes = head_bytes;
             for (const auto& attempt : attempts) {
                 if (attempt.head.has_value()) {
                     state->published_heads.push_back(attempt.head->info);
@@ -2739,8 +2749,19 @@ namespace lfs::io::project {
 
     CapabilitySet supported_reader_capabilities() {
         CapabilitySet result;
-        for (std::uint8_t bit = INDEX_ZSTD_V1;
-             bit <= ENCODED_SCENE_ASSETS; ++bit) {
+        // List implemented capabilities explicitly: not every assigned bit is
+        // implemented in every build.
+        for (const auto bit : {INDEX_ZSTD_V1,
+                               CHUNK_ZSTD_V1,
+                               BLOCK_CRC32C_V1,
+                               INDEX_TOMBSTONES_V1,
+                               SIDECAR_OVERLAY_V1,
+                               OPAQUE_CHUNK_PRESERVATION,
+                               RETAINED_JSON_FIELDS,
+                               CLEAN_PROOF_REUSE,
+                               CHUNK_BYTESHUFFLE_ZSTD_V1,
+                               ENCODED_SCENE_ASSETS,
+                               COLLISION_VOLUMES_V1, USER_SHADERS_V1}) {
             result.set(bit);
         }
         return result;
@@ -2834,6 +2855,83 @@ namespace lfs::io::project {
                       .commit_crc32c_echo = found->info.crc32c,
                   };
         return ProjectReader(std::make_shared<Impl>(std::move(state)));
+    }
+
+    lfs::Result<ProjectHeadIdentity>
+    ProjectReader::read_head_identity(const std::filesystem::path& path) {
+        auto file_result = detail::NativeFile::open_read(path);
+        if (!file_result) {
+            return std::move(file_result).error();
+        }
+        const auto file = *file_result;
+        auto size_result = file->size();
+        if (!size_result) {
+            return std::move(size_result).error();
+        }
+        const std::uint64_t physical_size = *size_result;
+        auto superblock = parse_superblock(*file, physical_size);
+        if (!superblock) {
+            return std::move(superblock).error();
+        }
+        std::optional<ProjectHeadIdentity> newest;
+        std::uint64_t newest_sequence = 0;
+        for (std::uint32_t slot_id = 0; slot_id < HEAD_SLOT_OFFSETS.size(); ++slot_id) {
+            auto raw = read_fixed<HEAD_SLOT_BYTES>(
+                *file, HEAD_SLOT_OFFSETS[slot_id], physical_size, physical_size,
+                std::format("head[{}]", slot_id));
+            if (!raw) {
+                continue;
+            }
+            const auto bytes = byte_span(*raw);
+            if (!bytes_equal(bytes, 0, HEAD_MAGIC) ||
+                read_u32(bytes, 4092) != crc32c(0, raw->data(), 4092) ||
+                read_uuid(bytes, 32) != superblock->project_uuid) {
+                continue;
+            }
+            const std::uint64_t sequence = read_u64(bytes, 16);
+            if (newest && sequence <= newest_sequence) {
+                continue;
+            }
+            newest_sequence = sequence;
+            newest = ProjectHeadIdentity{
+                .project_uuid = superblock->project_uuid,
+                .commit_uuid = read_uuid(bytes, 64),
+                .generation = read_u64(bytes, 24),
+            };
+        }
+        if (!newest) {
+            return detail::project_error(lfs::ErrorCode::DataLoss,
+                                         "The project container is corrupt.",
+                                         "no head slot has a valid checksum", path);
+        }
+        return *newest;
+    }
+
+    lfs::Result<void> ProjectReader::validate_source_identity() const {
+        auto current = detail::NativeFile::open_read(path());
+        if (!current)
+            return lfs::Result<void>::failure(std::move(current).error());
+        auto same = impl_->state->file->same_file(**current);
+        if (!same)
+            return lfs::Result<void>::failure(std::move(same).error());
+        auto size = (*current)->size();
+        if (!size)
+            return lfs::Result<void>::failure(std::move(size).error());
+        auto block = parse_superblock(**current, *size);
+        if (!block)
+            return lfs::Result<void>::failure(std::move(block).error());
+        bool unchanged = *same && *size >= commit().committed_file_end && block->crc32c == superblock().crc32c;
+        for (std::size_t slot = 0; slot < HEAD_SLOT_OFFSETS.size(); ++slot) {
+            auto raw = read_fixed<HEAD_SLOT_BYTES>(**current, HEAD_SLOT_OFFSETS[slot], *size, *size, "head.identity");
+            if (!raw)
+                return lfs::Result<void>::failure(std::move(raw).error());
+            unchanged &= *raw == impl_->state->head_bytes[slot];
+        }
+        if (!unchanged)
+            return lfs::Result<void>::failure(detail::project_error(lfs::ErrorCode::FailedPrecondition,
+                                                                    "The project file changed while opening. Open it again.",
+                                                                    std::format("The destination is not the validated file and exact commit: size={}, required_extent={}", *size, commit().committed_file_end), path()));
+        return {};
     }
 
     OpenClassification
@@ -4999,6 +5097,8 @@ namespace lfs::io::project {
         }
 
         std::atomic<std::uint64_t> g_framed_record_decode_calls{0};
+        std::atomic<std::uint64_t> g_framed_record_stored_cache_view_bytes{0};
+        std::atomic<std::uint64_t> g_framed_record_stored_cache_nonalias_bytes{0};
 
         // Logical (decoded / unshuffled) view of a framed payload. Resident
         // decoded records are capped: ZstdFramed keeps current + one
@@ -5407,7 +5507,8 @@ namespace lfs::io::project {
                     if (!stored_cache_[index].empty()) {
                         continue;
                     }
-                    if (!read_record_stored(index, stored_cache_[index])) {
+                    std::span<const std::byte> stored;
+                    if (!read_record_stored(index, stored_cache_[index], stored)) {
                         stored_cache_[index].clear();
                         break;
                     }
@@ -5416,18 +5517,25 @@ namespace lfs::io::project {
             }
 
             bool read_record_stored(const std::size_t index,
-                                    std::vector<std::byte>& stored) {
+                                    std::vector<std::byte>& scratch,
+                                    std::span<const std::byte>& stored) {
                 if (index >= records_.size()) {
                     return false;
                 }
                 if (index < stored_cache_.size() &&
                     !stored_cache_[index].empty()) {
                     stored = stored_cache_[index];
+                    g_framed_record_stored_cache_view_bytes.fetch_add(
+                        stored.size(), std::memory_order_relaxed);
+                    if (stored.data() != stored_cache_[index].data()) {
+                        g_framed_record_stored_cache_nonalias_bytes.fetch_add(
+                            stored.size(), std::memory_order_relaxed);
+                    }
                     return true;
                 }
                 const FramedRecord& record = records_[index];
                 try {
-                    stored.resize(static_cast<std::size_t>(record.sb));
+                    scratch.resize(static_cast<std::size_t>(record.sb));
                 } catch (const std::bad_alloc&) {
                     return false;
                 } catch (const std::length_error&) {
@@ -5437,12 +5545,16 @@ namespace lfs::io::project {
                 if (!ensure_blocks_locked(record.so, record.sb)) {
                     return false;
                 }
-                return read_stored_locked(
-                    record.so, std::span<std::byte>(stored.data(), stored.size()));
+                if (!read_stored_locked(
+                        record.so, std::span<std::byte>(scratch.data(), scratch.size()))) {
+                    return false;
+                }
+                stored = scratch;
+                return true;
             }
 
             bool decompress_record(const FramedRecord& record,
-                                   const std::vector<std::byte>& stored, void* dest,
+                                   const std::span<const std::byte> stored, void* dest,
                                    const std::size_t dest_bytes) const {
                 if (dest == nullptr || dest_bytes != record.ub) {
                     return false;
@@ -5462,8 +5574,9 @@ namespace lfs::io::project {
                 if (index >= records_.size()) {
                     return false;
                 }
-                std::vector<std::byte> stored;
-                if (!read_record_stored(index, stored)) {
+                std::vector<std::byte> scratch;
+                std::span<const std::byte> stored;
+                if (!read_record_stored(index, scratch, stored)) {
                     return false;
                 }
                 try {
@@ -5482,8 +5595,9 @@ namespace lfs::io::project {
                 if (index >= records_.size()) {
                     return false;
                 }
-                std::vector<std::byte> stored;
-                if (!read_record_stored(index, stored)) {
+                std::vector<std::byte> scratch;
+                std::span<const std::byte> stored;
+                if (!read_record_stored(index, scratch, stored)) {
                     return false;
                 }
                 return decompress_record(records_[index], stored, dest, dest_bytes);
@@ -6168,6 +6282,26 @@ namespace lfs::io::project {
 
         std::uint64_t framed_record_decode_calls_for_testing() {
             return g_framed_record_decode_calls.load(std::memory_order_relaxed);
+        }
+
+        void reset_framed_record_stored_cache_view_bytes_for_testing() {
+            g_framed_record_stored_cache_view_bytes.store(
+                0, std::memory_order_relaxed);
+        }
+
+        std::uint64_t framed_record_stored_cache_view_bytes_for_testing() {
+            return g_framed_record_stored_cache_view_bytes.load(
+                std::memory_order_relaxed);
+        }
+
+        void reset_framed_record_stored_cache_nonalias_bytes_for_testing() {
+            g_framed_record_stored_cache_nonalias_bytes.store(
+                0, std::memory_order_relaxed);
+        }
+
+        std::uint64_t framed_record_stored_cache_nonalias_bytes_for_testing() {
+            return g_framed_record_stored_cache_nonalias_bytes.load(
+                std::memory_order_relaxed);
         }
     } // namespace detail
 

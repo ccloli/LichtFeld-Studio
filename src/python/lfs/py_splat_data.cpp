@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "py_splat_data.hpp"
+#include "core/scene.hpp"
 #include <nanobind/stl/optional.h>
 #include <stdexcept>
 #include <string_view>
@@ -95,12 +96,26 @@ namespace lfs::python {
 
     void PySplatData::set_colors_rgb(const PyTensor& colors) {
         const auto& rgb = colors.tensor();
-        assert(rgb.shape().rank() == 2 && rgb.shape()[1] == 3);
-        assert(rgb.shape()[0] == static_cast<int64_t>(data_->size()));
+        if (rgb.shape().rank() != 2 || rgb.shape()[1] != 3) {
+            throw std::invalid_argument("RGB colors must have shape [N, 3]");
+        }
+        if (rgb.shape()[0] != static_cast<int64_t>(data_->size())) {
+            throw std::invalid_argument("RGB colors must have one row per splat");
+        }
+        const auto invalid = (rgb < 0.0f) || (rgb > 1.0f) || !rgb.isfinite();
+        if (invalid.any_scalar()) {
+            throw std::invalid_argument("RGB colors must be finite and within [0, 1]");
+        }
         auto sh0_values = (rgb - SH_DC_OFFSET) / SH_C0;
         auto sh0 = data_->sh0_raw();
         const int n = static_cast<int>(rgb.shape()[0]);
         sh0.copy_(sh0_values.reshape({n, 1, 3}));
+        notify_changed();
+    }
+
+    void PySplatData::notify_changed() const {
+        if (scene_)
+            scene_->notifyMutation(core::Scene::MutationType::MODEL_CHANGED);
     }
 
     // Soft deletion
@@ -113,11 +128,13 @@ namespace lfs::python {
 
     PyTensor PySplatData::soft_delete(const PyTensor& mask) {
         core::Tensor newly_deleted = data_->soft_delete(mask.tensor());
+        notify_changed();
         return PyTensor(std::move(newly_deleted), true);
     }
 
     void PySplatData::undelete(const PyTensor& mask) {
         data_->undelete(mask.tensor());
+        notify_changed();
     }
 
     void PySplatData::reserve_capacity(const size_t capacity) {
@@ -202,7 +219,9 @@ namespace lfs::python {
             // Capacity
             .def("reserve_capacity", &PySplatData::reserve_capacity, nb::arg("capacity"),
                  "Reserve capacity for Gaussians (for densification). "
-                 "Raises if the model is renderer-backed.");
+                 "Raises if the model is renderer-backed.")
+            .def("shN_rows", [](const PySplatData& self, const PyTensor& rows, int degree) { return PyTensor(self.data()->shN_canonical_cpu_rows(rows.tensor(), degree), true); }, nb::arg("rows"), nb::arg("degree"), nb::call_guard<nb::gil_scoped_release>(), "Copy selected SH-rest rows and bands to owned canonical Float32 CPU storage. "
+                                                                                                                                                                                                                                                                 "Rows must be a rank-1 CPU Int32 or Int64 tensor; call at a model read boundary.");
     }
 
 } // namespace lfs::python

@@ -7,9 +7,11 @@
 #include <cstdlib>
 
 #include <RmlUi/Core.h>
+#include <RmlUi/Core/Elements/ElementFormControlSelect.h>
 #include <RmlUi/Core/EventListener.h>
 
 #include <functional>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 
@@ -50,6 +52,71 @@ namespace lfs::vis::gui::rml_input {
         return element && element->GetTagName() != "body";
     }
 
+    inline bool isDisplayedElement(Rml::Element* element) {
+        return element && element->GetDisplay() != Rml::Style::Display::None && element->IsVisible();
+    }
+
+    inline bool isKeyboardPopupElement(Rml::Element* element) {
+        if (!element)
+            return false;
+
+        const auto& tag = element->GetTagName();
+        if (tag == "select")
+            if (auto* select = dynamic_cast<Rml::ElementFormControlSelect*>(element); select && select->IsSelectBoxVisible())
+                return true;
+
+        const auto string_attribute = [element](const char* name) -> std::string_view {
+            const auto* attribute = element->GetAttribute(name);
+            return attribute && attribute->GetType() == Rml::Variant::STRING
+                       ? std::string_view(attribute->GetReference<Rml::String>())
+                       : std::string_view{};
+        };
+        const auto role = string_attribute("role");
+        const auto aria_modal = string_attribute("aria-modal");
+        if (tag == "dialog" || role == "dialog" || aria_modal == "true")
+            return true;
+
+        const auto classes = string_attribute("class");
+        std::size_t start = 0;
+        while (start < classes.size()) {
+            const auto end = classes.find_first_of(" \t\r\n", start);
+            const auto token = classes.substr(start, end == std::string_view::npos ? end : end - start);
+            if (token.find("popup") != std::string_view::npos || token == "context-menu")
+                return true;
+            if (end == std::string_view::npos)
+                break;
+            start = end + 1;
+        }
+        return false;
+    }
+
+    inline bool hasOpenKeyboardPopup(Rml::Context* context) {
+        if (!context)
+            return false;
+
+        auto visit = [](auto&& self, Rml::Element* element) -> bool {
+            if (!isDisplayedElement(element))
+                return false;
+            if (isKeyboardPopupElement(element))
+                return true;
+            for (int i = 0; i < element->GetNumChildren(); ++i) {
+                if (self(self, element->GetChild(i)))
+                    return true;
+            }
+            return false;
+        };
+
+        for (int i = 0; i < context->GetNumDocuments(); ++i) {
+            if (visit(visit, context->GetDocument(i)))
+                return true;
+        }
+        return false;
+    }
+
+    inline bool wantsKeyboardCapture(Rml::Element* focused, Rml::Context* context) {
+        return hasFocusedKeyboardTarget(focused) || hasOpenKeyboardPopup(context);
+    }
+
     inline bool isCustomTextInputElement(Rml::Element* element) {
         return element && element->GetAttribute<Rml::String>("data-text-input", "") == "true";
     }
@@ -62,13 +129,35 @@ namespace lfs::vis::gui::rml_input {
         return element && element->GetTagName() == "input" && isTextEditableElement(element);
     }
 
-    inline bool isSelectRelatedElement(Rml::Element* element) {
-        for (auto* current = element; current; current = current->GetParentNode()) {
+    inline bool isSelectRelatedElement(const Rml::Element* element) {
+        for (const auto* current = element; current; current = current->GetParentNode()) {
             const auto tag = current->GetTagName();
             if (tag == "select" || tag == "selectbox")
                 return true;
         }
         return false;
+    }
+
+    // Blur closes a dropdown only when the select itself is focused. A viewport
+    // click often is not, so hide every open list in the context that was clicked.
+    inline bool hideOpenSelectBoxes(Rml::Context& context) {
+        bool hidden = false;
+        const auto visit = [&](auto&& self, Rml::Element* element) -> void {
+            if (!element)
+                return;
+            if (auto* const select = dynamic_cast<Rml::ElementFormControlSelect*>(element);
+                select && select->IsSelectBoxVisible()) {
+                select->HideSelectBox();
+                hidden = true;
+            }
+            const int child_count = element->GetNumChildren();
+            for (int i = 0; i < child_count; ++i)
+                self(self, element->GetChild(i));
+        };
+        const int document_count = context.GetNumDocuments();
+        for (int i = 0; i < document_count; ++i)
+            visit(visit, context.GetDocument(i));
+        return hidden;
     }
 
     inline bool shouldCancelOnEscape(Rml::Element* element, const bool composing) {
@@ -81,9 +170,11 @@ namespace lfs::vis::gui::rml_input {
             return false;
 
         if (isTextEditableElement(focused)) {
+            const auto alive = focused->GetObserverPtr();
             Rml::Dictionary params;
             focused->DispatchEvent("escapecancel", params);
-            focused->Blur();
+            if (alive)
+                focused->Blur();
             return true;
         }
 
@@ -136,6 +227,13 @@ namespace lfs::vis::gui::rml_input {
             return value;
         };
         auto* focused = context.GetFocusElement();
+        // A control can become locked after it acquired focus. RmlUi retains that
+        // focus, so release it before dispatching queued text or key events.
+        if (focused && focused->GetComputedValues().focus() == Rml::Style::Focus::None) {
+            if (auto* document = focused->GetOwnerDocument())
+                document->Focus();
+            return consumed(true);
+        }
         const bool editable = isTextEditableElement(focused);
         if (event.kind == FrameInputEventKind::TextEditing) {
             return consumed(editable && handler && handler->handleTextEditing(event.text, event.editing_start, event.editing_length));
@@ -157,7 +255,9 @@ namespace lfs::vis::gui::rml_input {
         if (wantsTextInput(focused) &&
             ((sc >= SDL_SCANCODE_KP_1 && sc <= SDL_SCANCODE_KP_0) || sc == SDL_SCANCODE_KP_PERIOD))
             return false;
-        const auto key = sdlScancodeToRml(sc);
+        const auto key = editable
+                             ? sdlTextShortcutToRml(sc, event.keycode, event.modifiers)
+                             : sdlScancodeToRml(sc);
         if (key == Rml::Input::KI_UNKNOWN)
             return false;
         const int mods = sdlModsToRml(event.modifiers & SDL_KMOD_CTRL,
@@ -232,10 +332,14 @@ namespace lfs::vis::gui::rml_input {
             if (type != "escapecancel")
                 return;
 
-            element->SetAttribute("value", it->second.snapshot);
-            if (it->second.restore_callback)
-                it->second.restore_callback(*element);
             event.StopPropagation();
+            const auto snapshot = it->second.snapshot;
+            const bool changed = element->GetAttribute<Rml::String>("value", "") != snapshot;
+            // Restoring may replace the form and clear this binding during the callback.
+            auto callback = it->second.restore_callback;
+            element->SetAttribute("value", snapshot);
+            if (changed && callback)
+                callback(*element);
         }
 
     private:

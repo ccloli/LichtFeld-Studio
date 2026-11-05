@@ -18,18 +18,11 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
-#ifdef _WIN32
-#ifdef LFS_PYTHON_RUNTIME_EXPORTS
-#define LFS_PYTHON_RUNTIME_API __declspec(dllexport)
-#else
-#define LFS_PYTHON_RUNTIME_API __declspec(dllimport)
-#endif
-#else
-#define LFS_PYTHON_RUNTIME_API
-#endif
+#include "python_runtime_api.hpp"
 
 namespace lfs::core {
     class IOperatorCallbacks;
@@ -321,6 +314,9 @@ namespace lfs::python {
         void (*draw_modals)() = nullptr;
         bool (*has_modals)() = nullptr;
 
+        // Panels: unloads the plugin that registered a panel; false if no plugin owns it.
+        bool (*unload_panel_plugin)(const char* panel_id) = nullptr;
+
         // Toolbar
 
         // Lifecycle
@@ -346,6 +342,7 @@ namespace lfs::python {
 
     LFS_PYTHON_RUNTIME_API void set_visualizer(vis::Visualizer* viewer);
     LFS_PYTHON_RUNTIME_API vis::Visualizer* get_visualizer();
+    LFS_PYTHON_RUNTIME_API void markProjectSessionChapterCommitted(std::string_view chapter);
 
     LFS_PYTHON_RUNTIME_API void set_parameter_manager(vis::ParameterManager* pm);
     LFS_PYTHON_RUNTIME_API vis::ParameterManager* get_parameter_manager();
@@ -405,6 +402,12 @@ namespace lfs::python {
     LFS_PYTHON_RUNTIME_API int get_selected_camera_uid();
     LFS_PYTHON_RUNTIME_API bool get_invert_masks();
 
+    // Transient Scene Graph request consumed by the built-in camera-selection panel.
+    LFS_PYTHON_RUNTIME_API void set_camera_selection_operation(std::string operation);
+    LFS_PYTHON_RUNTIME_API std::string get_camera_selection_operation();
+    LFS_PYTHON_RUNTIME_API void set_camera_selection_group_id(uint64_t group_id);
+    LFS_PYTHON_RUNTIME_API uint64_t get_camera_selection_group_id();
+
     // Sequencer visibility
     using IsSequencerVisibleCallback = bool (*)();
     using SetSequencerVisibleCallback = void (*)(bool);
@@ -423,6 +426,7 @@ namespace lfs::python {
         std::string format;
         std::string path;
         std::string error;
+        std::string warning;
     };
 
     struct OverlayImportState {
@@ -518,7 +522,7 @@ namespace lfs::python {
     LFS_PYTHON_RUNTIME_API void toggle_system_console();
 
     // Sequencer UI state access (for Python modification)
-    // Must match layout of vis::gui::panels::SequencerUIState
+    // Mirrored explicitly by VisualizerImpl; this is not a layout alias.
     struct SequencerUIStateData {
         bool show_camera_path = true;
         bool snap_to_grid = false;
@@ -536,6 +540,10 @@ namespace lfs::python {
         int framerate = 30;
         int quality = 18;
         int selected_keyframe = -1;
+        int camera_width = 16;
+        int camera_height = 9;
+        int framerate_denominator = 1;
+        int export_fit = 0;
     };
 
     using GetSequencerUIStateCallback = std::function<SequencerUIStateData*()>;
@@ -712,6 +720,11 @@ namespace lfs::python {
         void* (*get_context)(void* host);
         void (*set_foreground)(void* host, bool fg);
         void (*set_floating)(void* host, bool floating);
+        void* (*native_window)(void* host);
+        void* (*native_graphics)(void* host);
+        bool (*external_allowed)(void* host);
+        bool (*restored_external_bounds)(void* host, float* bounds);
+        bool (*configure_external)(void* host, float x, float y, float w, float h, bool desktop_coordinates);
         void (*mark_content_dirty)(void* host);
         void (*set_input_clip_y)(void* host, float y_min, float y_max);
         void (*set_input)(void* host, const void* input);
@@ -788,6 +801,15 @@ namespace lfs::python {
     LFS_PYTHON_RUNTIME_API void update_scene(bool has_scene, const char* path);
     LFS_PYTHON_RUNTIME_API void update_selection(bool has_selection, int count);
     LFS_PYTHON_RUNTIME_API void flush_signals();
+
+    // UIList lookup crosses the extension/native layout boundary. Caller holds
+    // the GIL; the returned Python instance is a new reference, or nullptr.
+    using GetUIListInstanceCallback = void* (*)(const char* id);
+    using WrapUIListLayoutCallback = void* (*)(void* layout);
+    LFS_PYTHON_RUNTIME_API void set_uilist_callbacks(GetUIListInstanceCallback get_instance,
+                                                     WrapUIListLayoutCallback wrap_layout);
+    LFS_PYTHON_RUNTIME_API void* get_uilist_instance(const char* id);
+    LFS_PYTHON_RUNTIME_API void* wrap_uilist_layout(void* layout);
 
     // Viewport draw overlay - bridge from visualizer to Python draw handlers
     // view_matrix/proj_matrix: column-major 4x4, others: float arrays

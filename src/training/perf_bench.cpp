@@ -2,11 +2,14 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "lfs/training/perf_bench.hpp"
+#include "core/native_fs.hpp"
+#include "core/path_utils.hpp"
 
 #include "core/alloc_counter.hpp"
 #include "core/logger.hpp"
 #include "core/pinned_memory_allocator.hpp"
 #include "diagnostics/vram_ledger_model.hpp"
+#include "strategies/strategy_utils.hpp"
 
 #include <cuda_runtime.h>
 
@@ -70,11 +73,13 @@ namespace lfs::training {
             std::uint64_t u = 0;
             std::uint64_t r = 0;
             if (cudaMemPoolGetAttribute(pool, cudaMemPoolAttrUsedMemHigh, &u) == cudaSuccess) {
-                used_high = static_cast<std::size_t>(u);
+                // Frame probes restart the pool's mark; fold their peaks in.
+                used_high = std::max(static_cast<std::size_t>(u), tensor_pool_used_high_bytes());
             }
             if (cudaMemPoolGetAttribute(pool, cudaMemPoolAttrReservedMemHigh, &r) ==
                 cudaSuccess) {
-                reserved_high = static_cast<std::size_t>(r);
+                // Refine windows restart the pool's mark; fold their peaks in.
+                reserved_high = std::max(static_cast<std::size_t>(r), tensor_pool_reserved_high_bytes());
             }
             u = r = 0;
             if (cudaMemPoolGetAttribute(pool, cudaMemPoolAttrUsedMemCurrent, &u) ==
@@ -263,9 +268,7 @@ namespace lfs::training {
         if (!enable) {
             phase_active_iter_ = 0;
         }
-        if (warmup > 0) {
-            g_perf_bench_warmup.store(warmup, std::memory_order_relaxed);
-        }
+        g_perf_bench_warmup.store(warmup, std::memory_order_relaxed);
         // Prefer main.cpp's early device baseline (post primary-context, pre-model).
         // Fall back to a configure-time sample when the profiler baseline is unset
         // (unit tests / non-main entry points).
@@ -843,11 +846,11 @@ namespace lfs::training {
         phase_current_index_ = -1;
 
         std::error_code ec;
-        std::filesystem::create_directories(path.parent_path(), ec);
+        lfs::core::native_fs::create_directories(path.parent_path(), ec);
 
-        std::ofstream out(path, std::ios::binary);
+        std::ofstream out(lfs::core::native_fs::native_path(path), std::ios::binary);
         if (!out) {
-            LOG_ERROR("PerfBench: failed to write {}", path.string());
+            LOG_ERROR("PerfBench: failed to write {}", lfs::core::path_to_utf8(path));
             return;
         }
 
@@ -1102,7 +1105,7 @@ namespace lfs::training {
                  "ex_cache {:.1f} MiB / net {:.1f} MiB "
                  "(excess {:.1f} vs baseline, signed residual {:+.1f} justified-minus-excess), "
                  "sort_allocated {:.1f} MiB, {:.1f} B/splat)",
-                 path.string(),
+                 lfs::core::path_to_utf8(path),
                  steady_ms_iter,
                  steady_dataloader_wait_ms_per_iter,
                  steady_allocs_iter,

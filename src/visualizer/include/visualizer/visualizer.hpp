@@ -17,6 +17,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace lfs::core {
@@ -43,6 +44,8 @@ namespace lfs::vis {
     enum class ProjectOpenOutcome {
         Opened,
         RecoveryPromptPending,
+        // The destination is validated; collision completion will resume the switch.
+        Deferred,
     };
 
     enum class RuntimeServicePhase : std::uint8_t {
@@ -81,11 +84,14 @@ namespace lfs::vis {
     struct RuntimeServiceControls {
         std::function<bool()> toggle_mcp_enabled;
         std::function<bool()> toggle_mcp_binding;
+        std::optional<int> mcp_port_override;
     };
 
     LFS_VIS_API void setRuntimeServiceControls(RuntimeServiceControls controls);
     LFS_VIS_API bool toggleMcpRuntimeEnabled();
     LFS_VIS_API bool toggleMcpRuntimeBinding();
+    // Port from the command line; it wins over the saved preference for this session.
+    [[nodiscard]] LFS_VIS_API std::optional<int> mcpPortOverride();
     [[nodiscard]] LFS_VIS_API std::uint64_t runtimeServiceRevision();
 
     struct LFS_VIS_API ProjectPayloadInfo {
@@ -113,6 +119,16 @@ namespace lfs::vis {
         std::optional<std::filesystem::path> path;
         std::string error;
         std::optional<lfs::ErrorCode> error_code;
+    };
+
+    // The Training panel's pending parameters and the loaded dataset's
+    // folder: This is what lfs::io::project::write_training_project needs to write
+    // an untrained copy of the session as .licht
+    struct LFS_VIS_API ProjectTrainingSource {
+        lfs::io::project::ParameterManagerSnapshot parameters;
+        std::filesystem::path dataset_root;
+        // Set when the trainer starts from an init file, as a save records it.
+        std::optional<lfs::io::project::TrainingProjectInitialization> initialization;
     };
 
     // Lightweight snapshot for persistent application chrome. Unlike
@@ -249,6 +265,12 @@ namespace lfs::vis {
         projectHasPath() = 0;
         virtual lfs::Result<ProjectInfo>
         projectGetInfo() = 0;
+        virtual void projectMarkSessionChapterCommitted(std::string_view chapter) {
+            static_cast<void>(chapter);
+        }
+        [[nodiscard]] virtual bool projectSessionRestoreInProgress() const {
+            return false;
+        }
         virtual ProjectDisplayInfo projectGetDisplayInfo() { return {}; }
         virtual lfs::Result<std::optional<lfs::io::project::ProjectLicense>>
         projectGetLicense() = 0;
@@ -270,6 +292,15 @@ namespace lfs::vis {
         projectPollWrite() {
             return ProjectWritePoll{};
         }
+        virtual lfs::Result<ProjectTrainingSource>
+        projectTrainingSource() {
+            return lfs::make_error(lfs::ErrorInit{
+                .code = lfs::ErrorCode::Unsupported,
+                .domain = lfs::ErrorDomain::App,
+                .user_message = "This viewer cannot write training projects.",
+                .detection = LFS_SOURCE_SITE_CURRENT(),
+            });
+        }
         // True when the last ProjectSave or ProjectSaveAs command
         // started a write. A cancelled save dialog returns false.
         [[nodiscard]] virtual bool consumeProjectSaveStarted() {
@@ -282,6 +313,9 @@ namespace lfs::vis {
         }
         // True while a stop-then-create is queued and has not bound yet.
         [[nodiscard]] virtual bool projectCreatePending() const {
+            return false;
+        }
+        [[nodiscard]] virtual bool projectOpenPending() const {
             return false;
         }
         virtual void projectWaitWrite() {}

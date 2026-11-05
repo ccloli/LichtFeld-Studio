@@ -24,6 +24,7 @@ def _install_lf_stub(monkeypatch):
             pass
 
     lf_stub = ModuleType("lichtfeld")
+    lf_stub.get_scene = lambda: None
     lf_stub.ui = SimpleNamespace(
         Panel=_Panel,
         PanelSpace=SimpleNamespace(FLOATING="FLOATING"),
@@ -33,6 +34,10 @@ def _install_lf_stub(monkeypatch):
         open_url=lambda _url: None,
         get_ui_scale=lambda: 1.0,
         set_panel_enabled=lambda _panel_id, _enabled: None,
+        get_panel_object=lambda _panel_id: None,
+        get_image_info=lambda _path: (0, 0, 0),
+        preview_texture_status=lambda _source, _document=None: "ready",
+        request_redraw=lambda _delay=0.0: None,
     )
     monkeypatch.setitem(sys.modules, "lichtfeld", lf_stub)
 
@@ -41,8 +46,9 @@ def _install_lf_stub(monkeypatch):
 def panel_modules(monkeypatch):
     project_root = Path(__file__).parent.parent.parent
     source_python = project_root / "src" / "python"
-    if str(source_python) not in sys.path:
-        sys.path.insert(0, str(source_python))
+    if str(source_python) in sys.path:
+        sys.path.remove(str(source_python))
+    sys.path.insert(0, str(source_python))
 
     for module_name in [
         "lfs_plugins.image_preview_panel",
@@ -90,6 +96,36 @@ def test_first_preview_request_survives_lazy_panel_creation(panel_modules, tmp_p
     assert panel._camera_uids == [17]
 
 
+def test_first_preview_request_opens_once_during_lazy_reentry(
+        panel_modules, tmp_path, monkeypatch):
+    image_preview, _ = panel_modules
+    image_preview._instance = None
+    image_preview._pending_open = None
+    image_path = tmp_path / "first.jpg"
+    open_calls = []
+    original_open = image_preview.ImagePreviewPanel.open
+
+    def track_open(panel, image_paths, mask_paths, start_index, camera_uids=None, camera_nodes=None):
+        open_calls.append((image_paths, mask_paths, start_index, camera_uids))
+        return original_open(panel, image_paths, mask_paths, start_index, camera_uids, camera_nodes)
+
+    monkeypatch.setattr(image_preview.ImagePreviewPanel, "open", track_open)
+
+    class LazyPanel:
+        @property
+        def open(self):
+            return image_preview.ImagePreviewPanel().open
+
+    sys.modules["lichtfeld"].ui.get_panel_object = lambda _panel_id: LazyPanel()
+
+    image_preview.open_image_preview([image_path], [None], 0, [17])
+
+    assert image_preview._pending_open is None
+    assert open_calls == [([image_path], [None], 0, [17])]
+    assert image_preview._instance._image_paths == [image_path.resolve()]
+    assert image_preview._instance._camera_uids == [17]
+
+
 def test_image_preview_discards_info_for_previous_image_sets(panel_modules, tmp_path):
     image_preview, _ = panel_modules
     panel = image_preview.ImagePreviewPanel()
@@ -115,6 +151,12 @@ class _ElementStub:
         self.client_height = 600
         self.offset_top = 0
         self.offset_height = 0
+        self.id = ""
+        self.tag_name = "div"
+        self.scroll_top = 0.0
+
+    def parent(self):
+        return None
 
     def set_property(self, name, value):
         self.properties[name] = value
@@ -136,7 +178,9 @@ class _ElementStub:
 
 class _DocumentStub:
     def __init__(self, elements):
-        self._elements = elements
+        self._elements = dict(elements)
+        if "main-image-a" in elements:
+            self._elements.setdefault("main-image-b", _ElementStub())
         self.removed_models = []
 
     def get_element_by_id(self, element_id):
@@ -190,7 +234,9 @@ def test_image_preview_mask_decorator_escapes_paths(panel_modules, tmp_path):
 
     expected_mask = quote(str(mask_path), safe=_RML_PATH_SAFE_CHARS)
     mask_img = panel._doc.get_element_by_id("mask-overlay")
-    assert mask_img.properties["decorator"] == f"image({expected_mask})"
+    assert mask_img.properties["decorator"].startswith("image(preview://")
+    assert mask_img.properties["decorator"].endswith(f"&path={expected_mask})")
+    assert "&rev=" in mask_img.properties["decorator"]
 
 
 def test_getting_started_panel_escapes_thumbnail_paths(panel_modules, tmp_path):
@@ -216,7 +262,7 @@ def test_getting_started_panel_escapes_thumbnail_paths(panel_modules, tmp_path):
 def test_getting_started_panel_uses_dirty_update_policy(panel_modules):
     _, getting_started = panel_modules
     assert getting_started.GettingStartedPanel.update_policy == "dirty"
-    assert getting_started.GettingStartedPanel.update_interval_ms == 100
+    assert getting_started.GettingStartedPanel.update_interval_ms is None
 
 
 def test_image_preview_uses_dirty_update_policy(panel_modules):

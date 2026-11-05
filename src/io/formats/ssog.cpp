@@ -1,7 +1,11 @@
 /* SPDX-FileCopyrightText: 2026 LichtFeld Studio Authors
  * SPDX-License-Identifier: GPL-3.0-or-later */
 #include "ssog.hpp"
+#include "core/file_extensions.hpp"
 #include "core/logger.hpp"
+#include "core/native_fs.hpp"
+#include "core/path_utils.hpp"
+#include "formats/archive_member_names.hpp"
 #include "io/atomic_output.hpp"
 #include "io/splat_decimate.hpp"
 #include "sogs.hpp"
@@ -16,6 +20,7 @@
 #include <chrono>
 #include <climits>
 #include <cmath>
+#include <cstring>
 #include <cuda_runtime.h>
 #include <fstream>
 #include <map>
@@ -27,6 +32,7 @@
 #include <tbb/parallel_for.h>
 #include <tbb/parallel_invoke.h>
 #include <thread>
+#include <zlib.h>
 #ifdef _WIN32
 #include <process.h>
 #else
@@ -35,7 +41,7 @@
 
 namespace lfs::io {
     namespace {
-        namespace fs = std::filesystem;
+        namespace fs = lfs::core::native_fs;
         using Json = nlohmann::json;
         using core::Device;
         using core::Tensor;
@@ -46,7 +52,7 @@ namespace lfs::io {
                 throw Cancelled{};
         }
         fs::path manifest_path(const fs::path& p) {
-            return fs::is_directory(p) ? p / "lod-meta.json" : p;
+            return lfs::core::native_fs::is_directory(p) ? p / "lod-meta.json" : p;
         }
         size_t integer(const Json& j, const char* name) {
             if (!j.is_number_integer() || j.get<double>() < 0 ||
@@ -56,8 +62,11 @@ namespace lfs::io {
         }
         fs::path related(const fs::path& base, const std::string& name) {
             const auto p = core::utf8_to_path(name);
-            const auto root = fs::weakly_canonical(base);
-            const auto resolved = fs::weakly_canonical(base / p);
+            std::error_code error;
+            const auto root = lfs::core::native_fs::weakly_canonical(base, error);
+            const auto resolved = error ? fs::path{} : lfs::core::native_fs::weakly_canonical(base / p, error);
+            if (error)
+                throw std::runtime_error("Cannot resolve SSOG unit path: " + error.message());
             const auto rel = resolved.lexically_relative(root);
             if (rel.empty() || *rel.begin() == "..")
                 throw std::runtime_error("Unit path escapes SSOG directory");
@@ -84,29 +93,29 @@ namespace lfs::io {
             }
 
             static std::string extension_of(const fs::path& path) {
-                auto extension = path.extension().string();
+                auto extension = lfs::core::path_to_utf8(path.extension());
                 std::transform(extension.begin(), extension.end(), extension.begin(),
                                [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
                 return extension;
             }
 
         public:
-            explicit EntryProvider(const fs::path& path) : bundled_(extension_of(path) == ".ssog" && !fs::is_directory(path)) {
+            explicit EntryProvider(const fs::path& path) : bundled_(extension_of(path) == ".ssog" && !lfs::core::native_fs::is_directory(path)) {
                 if (!bundled_) {
                     base_ = fs::absolute(manifest_path(path)).parent_path();
                     std::vector<fs::path> candidates;
-                    for (const auto& entry : fs::directory_iterator(base_)) {
+                    for (const auto& entry : lfs::core::native_fs::directory_iterator(base_)) {
                         if (is_sog_license_member(core::path_to_utf8(entry.path().filename())) &&
-                            fs::is_regular_file(entry.symlink_status()))
-                            candidates.push_back(entry.path());
+                            lfs::core::native_fs::is_regular_file(lfs::core::native_fs::entry_symlink_status(base_, entry)))
+                            candidates.push_back(lfs::core::native_fs::entry_path(base_, entry.path()));
                     }
                     std::sort(candidates.begin(), candidates.end());
                     for (const auto& candidate : candidates) {
-                        const auto size = fs::file_size(candidate);
+                        const auto size = lfs::core::native_fs::file_size(candidate);
                         if (size > 64 * 1024)
                             continue;
                         std::vector<uint8_t> bytes(static_cast<size_t>(size));
-                        std::ifstream file(candidate, std::ios::binary);
+                        std::ifstream file(lfs::core::native_fs::native_path(candidate), std::ios::binary);
                         if (size && !file.read(reinterpret_cast<char*>(bytes.data()),
                                                static_cast<std::streamsize>(size)))
                             throw std::runtime_error("Cannot read SSOG license");
@@ -115,10 +124,10 @@ namespace lfs::io {
                     }
                     return;
                 }
-                const auto size = fs::file_size(path);
+                const auto size = lfs::core::native_fs::file_size(path);
                 if (size < 4 || size > MAX_ARCHIVE_BYTES || size > std::numeric_limits<size_t>::max())
                     throw std::runtime_error("Invalid SSOG archive size (limit 4 GiB)");
-                std::ifstream file(path, std::ios::binary);
+                std::ifstream file(lfs::core::native_fs::native_path(path), std::ios::binary);
                 std::vector<uint8_t> bytes(static_cast<size_t>(size));
                 if (!file.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(size)))
                     throw std::runtime_error("Cannot read complete SSOG archive");
@@ -152,7 +161,7 @@ namespace lfs::io {
                 while ((status = archive_read_next_header(reader.get(), &entry)) == ARCHIVE_OK) {
                     if (++count > 1000000)
                         throw std::runtime_error("Too many SSOG archive entries");
-                    const auto* raw_name = archive_entry_pathname(entry);
+                    const auto* raw_name = archive_member_name(entry);
                     if (!raw_name)
                         throw std::runtime_error("Missing SSOG archive entry name");
                     const auto name = safe_name(raw_name);
@@ -233,11 +242,11 @@ namespace lfs::io {
                         return it->second;
                     }
                     const auto path = related(base_, name);
-                    const auto size = fs::file_size(path);
+                    const auto size = lfs::core::native_fs::file_size(path);
                     if (!size || size > limit)
                         return make_error(ErrorCode::CORRUPTED_DATA, "Invalid SSOG entry size", path);
                     std::vector<uint8_t> data(static_cast<size_t>(size));
-                    std::ifstream file(path, std::ios::binary);
+                    std::ifstream file(lfs::core::native_fs::native_path(path), std::ios::binary);
                     if (!file.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(size)))
                         return make_error(ErrorCode::READ_FAILURE, "Cannot read complete SSOG entry", path);
                     return data;
@@ -264,7 +273,7 @@ namespace lfs::io {
                         return std::unexpected(bytes.error());
                     return EntryProvider(*bytes, "meta.json", expansion_limit_).prepare("meta.json");
                 }
-                auto prefix = fs::path(manifest).parent_path().generic_string();
+                auto prefix = lfs::core::path_to_generic_utf8(fs::path(manifest).parent_path());
                 if (!prefix.empty())
                     prefix += '/';
                 return prepare_sog_entries([this](const std::string& name, size_t limit) { return read(name, limit); }, prefix);
@@ -309,7 +318,7 @@ namespace lfs::io {
                 const auto unit = core::utf8_to_path(name.get<std::string>()).lexically_normal();
                 if (!unique.insert(unit).second)
                     throw std::runtime_error("Duplicate SOG unit filename");
-                unit_counts.push_back(integer(m.entries->unit_metadata(unit.generic_string()).at("count"), "unit count"));
+                unit_counts.push_back(integer(m.entries->unit_metadata(lfs::core::path_to_generic_utf8(unit)).at("count"), "unit count"));
             }
             m.files.resize(levels);
             std::vector<size_t> counts(levels);
@@ -527,7 +536,7 @@ namespace lfs::io {
             fs::path path;
             ~TempDirectory() {
                 std::error_code ec;
-                fs::remove_all(path, ec);
+                lfs::core::native_fs::remove_all(path, ec);
             }
         };
         // Match the reference's JSON number rounding without altering provenance strings.
@@ -622,25 +631,19 @@ namespace lfs::io {
                 out = out.parent_path();
             if (out == out.root_path())
                 return make_error(ErrorCode::PATH_NOT_WRITABLE, "Cannot export to filesystem root", out);
-            fs::create_directories(out.parent_path());
-            static std::atomic_uint64_t sequence{0};
-#ifdef _WIN32
-            const auto pid = _getpid();
-#else
-            const auto pid = getpid();
-#endif
-            const bool bundled = out.extension() == ".ssog";
+            lfs::core::native_fs::create_directories(out.parent_path());
+            const bool bundled = core::has_extension(out, ".ssog");
             std::unique_ptr<ScopedAtomicOutputFile> atomic_output;
             std::unique_ptr<SogSink> archive;
             std::mutex archive_mutex;
             if (bundled) {
                 atomic_output = std::make_unique<ScopedAtomicOutputFile>(out);
-                archive = make_sog_archive(atomic_output->temp_path());
+                archive = make_sog_archive(atomic_output->temp_path(), true);
                 if (auto opened = archive->open(); !opened)
                     return opened;
             }
-            TempDirectory temp{bundled ? fs::path{} : fs::path(out.string() + std::format(".tmp-{}-{}", pid, sequence++))};
-            if (!bundled && !fs::create_directory(temp.path))
+            TempDirectory temp{bundled ? fs::path{} : make_atomic_temp_output_path(out)};
+            if (!bundled && !lfs::core::native_fs::create_directory(temp.path))
                 throw std::runtime_error("Temporary export directory already exists");
             progress(o, 0, "Preparing SSOG");
             std::vector<HostSplats> levels;
@@ -936,7 +939,7 @@ namespace lfs::io {
                 if (auto closed = archive->close(); !closed)
                     return closed;
             } else {
-                std::ofstream file(temp.path / "lod-meta.json", std::ios::binary);
+                std::ofstream file(lfs::core::native_fs::native_path(temp.path / "lod-meta.json"), std::ios::binary);
                 file << manifest.dump();
                 file.close();
                 if (!file)
@@ -950,43 +953,43 @@ namespace lfs::io {
                 if (auto committed = atomic_output->commit(); !committed)
                     return committed;
             } else {
-                fs::create_directories(out);
-                TempDirectory backup{fs::path(temp.path.string() + ".backup")};
-                fs::create_directory(backup.path);
+                lfs::core::native_fs::create_directories(out);
+                TempDirectory backup{make_atomic_temp_output_path(out)};
+                lfs::core::native_fs::create_directory(backup.path);
                 std::vector<fs::path> old_paths, installed;
-                const bool replacing = fs::exists(out / "lod-meta.json");
+                const bool replacing = lfs::core::native_fs::exists(out / "lod-meta.json");
                 const std::regex unit_name("[0-9]+_[0-9]+");
-                for (const auto& e : fs::directory_iterator(out)) {
+                for (const auto& e : lfs::core::native_fs::directory_iterator(out)) {
                     const auto name = e.path().filename();
-                    const bool owned = name == "lod-meta.json" || name == "env" || std::regex_match(name.string(), unit_name);
+                    const bool owned = name == "lod-meta.json" || name == "env" || std::regex_match(lfs::core::path_to_utf8(name), unit_name);
                     if (owned && replacing)
                         old_paths.push_back(name);
                 }
                 for (const auto& u : units) {
                     const auto name = fs::path(std::format("{}_{}", u.level, u.index));
-                    if (fs::exists(out / name) && !replacing)
+                    if (lfs::core::native_fs::exists(out / name) && !replacing)
                         throw std::runtime_error("Output unit already exists in unrelated directory");
                 }
                 std::vector<fs::path> moved;
                 try {
                     for (const auto& name : old_paths) {
-                        fs::rename(out / name, backup.path / name);
+                        lfs::core::native_fs::rename(out / name, backup.path / name);
                         moved.push_back(name);
                     }
                     for (const auto& u : units) {
                         const auto name = fs::path(std::format("{}_{}", u.level, u.index));
-                        fs::rename(temp.path / name, out / name);
+                        lfs::core::native_fs::rename(temp.path / name, out / name);
                         installed.push_back(name);
                     }
-                    fs::rename(temp.path / "lod-meta.json", out / "lod-meta.json");
+                    lfs::core::native_fs::rename(temp.path / "lod-meta.json", out / "lod-meta.json");
                 } catch (...) {
                     std::error_code ec;
                     for (const auto& name : installed)
-                        fs::remove_all(out / name, ec);
+                        lfs::core::native_fs::remove_all(out / name, ec);
                     for (const auto& name : moved)
-                        fs::rename(backup.path / name, out / name, ec);
+                        lfs::core::native_fs::rename(backup.path / name, out / name, ec);
                     // Retain a backup if rollback itself fails, rather than deleting recoverable data.
-                    if (!fs::is_empty(backup.path))
+                    if (!lfs::core::native_fs::is_empty(backup.path))
                         backup.path.clear();
                     throw;
                 }
@@ -997,5 +1000,144 @@ namespace lfs::io {
         } catch (const Cancelled&) { return make_error(ErrorCode::CANCELLED, "Export cancelled by user", o.output_path); } catch (const std::exception& e) {
             return make_error(ErrorCode::ENCODING_FAILED, std::string("Failed to save SSOG: ") + e.what(), o.output_path);
         }
+    }
+
+    Result<SsogArchiveSummary> summarize_ssog_archive(const std::uint64_t size, const ByteRangeReader& read_at) {
+        const auto invalid = [](const char* what) {
+            return make_error(ErrorCode::INVALID_DATASET, std::string("Invalid SSOG archive: ") + what);
+        };
+        const auto read = [&](const std::uint64_t offset, const std::uint64_t length, std::vector<std::byte>& out) {
+            if (offset > size || length > size - offset)
+                return false;
+            out.resize(static_cast<std::size_t>(length));
+            return read_at(offset, out);
+        };
+        const auto le = [](const std::byte* p, const int bytes) {
+            std::uint64_t value = 0;
+            for (int i = bytes - 1; i >= 0; --i)
+                value = value << 8 | std::to_integer<std::uint64_t>(p[i]);
+            return value;
+        };
+        constexpr std::uint64_t kEndRecord = 22, kLocator = 20, kMaxDirectory = 64ull << 20, kMaxMeta = 16ull << 20;
+        if (size < kEndRecord)
+            return invalid("too small");
+        std::vector<std::byte> tail;
+        const auto tail_size = std::min<std::uint64_t>(size, kEndRecord + 0xFFFF + kLocator);
+        if (!read(size - tail_size, tail_size, tail))
+            return invalid("unreadable");
+        std::optional<std::size_t> end;
+        for (std::size_t i = tail.size() - kEndRecord + 1; i-- > 0;)
+            if (le(&tail[i], 4) == 0x06054b50) {
+                end = i;
+                break;
+            }
+        if (!end)
+            return invalid("no central directory");
+        std::uint64_t entries = le(&tail[*end + 10], 2), directory_size = le(&tail[*end + 12], 4),
+                      directory_offset = le(&tail[*end + 16], 4);
+        if (entries == 0xFFFF || directory_size == 0xFFFFFFFF || directory_offset == 0xFFFFFFFF) {
+            std::vector<std::byte> record;
+            if (*end < kLocator || le(&tail[*end - kLocator], 4) != 0x07064b50 ||
+                !read(le(&tail[*end - kLocator + 8], 8), 56, record) || le(record.data(), 4) != 0x06064b50)
+                return invalid("no ZIP64 directory");
+            entries = le(&record[32], 8);
+            directory_size = le(&record[40], 8);
+            directory_offset = le(&record[48], 8);
+        }
+        std::vector<std::byte> directory;
+        if (directory_size > kMaxDirectory || !read(directory_offset, directory_size, directory))
+            return invalid("central directory out of range");
+
+        struct Member {
+            std::uint64_t uncompressed = 0, compressed = 0, offset = 0;
+            std::uint64_t method = 0;
+        };
+        std::map<std::string, Member> members;
+        SsogArchiveSummary summary;
+        std::size_t at = 0;
+        for (std::uint64_t entry = 0; entry < entries; ++entry) {
+            if (at + 46 > directory.size() || le(&directory[at], 4) != 0x02014b50)
+                return invalid("damaged central directory");
+            const auto* header = &directory[at];
+            const auto name_length = le(header + 28, 2), extra_length = le(header + 30, 2), comment_length = le(header + 32, 2);
+            if (at + 46 + name_length + extra_length + comment_length > directory.size())
+                return invalid("damaged central directory");
+            Member member{le(header + 24, 4), le(header + 20, 4), le(header + 42, 4), le(header + 10, 2)};
+            // A ZIP64 extra field carries the saturated sizes and offset, in this order.
+            const auto extra_end = 46 + name_length + extra_length;
+            for (std::uint64_t x = 46 + name_length; x + 4 <= extra_end;) {
+                const auto id = le(header + x, 2), length = le(header + x + 2, 2);
+                if (x + 4 + length > extra_end)
+                    break;
+                if (id == 0x0001) {
+                    auto field = x + 4;
+                    for (auto* value : {&member.uncompressed, &member.compressed, &member.offset})
+                        if (*value == 0xFFFFFFFF && field + 8 <= x + 4 + length) {
+                            *value = le(header + field, 8);
+                            field += 8;
+                        }
+                }
+                x += 4 + length;
+            }
+            std::string name(reinterpret_cast<const char*>(header + 46), static_cast<std::size_t>(name_length));
+            at += static_cast<std::size_t>(46 + name_length + extra_length + comment_length);
+            if (name.ends_with(".webp") && member.method != 0)
+                summary.webp_stored = false;
+            members.insert_or_assign(std::move(name), member);
+        }
+
+        constexpr std::string_view kMeta = "lod-meta.json";
+        const std::string* meta_name = nullptr;
+        for (const auto& [name, member] : members)
+            if ((name == kMeta || name.ends_with(std::string("/").append(kMeta))) &&
+                (!meta_name || name.size() < meta_name->size()))
+                meta_name = &name;
+        if (!meta_name)
+            return invalid("no lod-meta.json");
+        const auto root = meta_name->substr(0, meta_name->size() - kMeta.size());
+        for (const auto& [name, member] : members)
+            if (name.starts_with(root) && name.find('/', root.size()) == std::string::npos &&
+                is_sog_license_member(std::string_view(name).substr(root.size())) && member.uncompressed == 0)
+                summary.empty_license = true;
+
+        const auto& meta = members.at(*meta_name);
+        std::vector<std::byte> local, packed;
+        if (meta.uncompressed > kMaxMeta || meta.compressed > kMaxMeta || !read(meta.offset, 30, local) ||
+            le(local.data(), 4) != 0x04034b50 ||
+            !read(meta.offset + 30 + le(&local[26], 2) + le(&local[28], 2), meta.compressed, packed))
+            return invalid("lod-meta.json unreadable");
+        std::string text(static_cast<std::size_t>(meta.uncompressed), '\0');
+        if (meta.method == 0) {
+            if (meta.compressed != meta.uncompressed)
+                return invalid("lod-meta.json size mismatch");
+            std::memcpy(text.data(), packed.data(), packed.size());
+        } else if (meta.method == 8) {
+            z_stream stream{};
+            if (inflateInit2(&stream, -MAX_WBITS) != Z_OK)
+                return invalid("lod-meta.json does not inflate");
+            stream.next_in = reinterpret_cast<Bytef*>(packed.data());
+            stream.avail_in = static_cast<uInt>(packed.size());
+            stream.next_out = reinterpret_cast<Bytef*>(text.data());
+            stream.avail_out = static_cast<uInt>(text.size());
+            const bool complete = inflate(&stream, Z_FINISH) == Z_STREAM_END && stream.total_out == text.size();
+            inflateEnd(&stream);
+            if (!complete)
+                return invalid("lod-meta.json does not inflate");
+        } else {
+            return invalid("lod-meta.json uses an unsupported compression");
+        }
+        const auto json = nlohmann::json::parse(text, nullptr, false);
+        if (json.is_discarded() || !json.is_object())
+            return invalid("lod-meta.json is not an object");
+        if (const auto counts = json.find("counts"); counts != json.end()) {
+            if (!counts->is_array())
+                return invalid("lod-meta.json counts");
+            for (const auto& count : *counts) {
+                if (!count.is_number_unsigned())
+                    return invalid("lod-meta.json counts");
+                summary.counts.push_back(count.get<std::size_t>());
+            }
+        }
+        return summary;
     }
 } // namespace lfs::io

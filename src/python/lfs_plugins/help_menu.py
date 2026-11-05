@@ -19,25 +19,6 @@ class GettingStartedOperator(Operator):
         return {"FINISHED"}
 
 
-class SetDefaultAppOperator(Operator):
-    label = "file_association.menu_register"
-    description = "Open Windows default app settings for splat and project files (.ply, .sog, .ssog, .spz, .rad, .usd, .usda, .usdc, .usdz, .licht)"
-
-    def execute(self, context) -> set:
-        lf.ui.register_file_associations()
-        lf.ui.open_file_association_settings()
-        return {"FINISHED"}
-
-
-class UnsetDefaultAppOperator(Operator):
-    label = "file_association.menu_unregister"
-    description = "Remove file type associations"
-
-    def execute(self, context) -> set:
-        lf.ui.unregister_file_associations()
-        return {"FINISHED"}
-
-
 class AboutOperator(Operator):
     label = "menu.help.about"
     description = "Show About dialog"
@@ -98,13 +79,10 @@ class HelpMenu:
 
     label = "menu.help"
     location = "MENU_BAR"
-    order = 100
+    order = 0  # Drawn as the brand logo, which leads the menu bar.
 
     def menu_items(self):
         items = [menu_operator(GettingStartedOperator)]
-        if lf.ui.is_windows_platform():
-            items.append(menu_separator())
-            items.append(menu_operator(SetDefaultAppOperator))
         items.append(menu_separator())
         items.append(menu_operator(BugReportOperator))
         items.append(menu_operator(AboutOperator))
@@ -114,8 +92,6 @@ class HelpMenu:
 _operator_classes = [
     GalleryTransfersOperator,
     GettingStartedOperator,
-    SetDefaultAppOperator,
-    UnsetDefaultAppOperator,
     PortalConnectionOperator,
     BugReportOperator,
     AboutOperator,

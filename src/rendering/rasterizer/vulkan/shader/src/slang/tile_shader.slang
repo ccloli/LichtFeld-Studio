@@ -110,7 +110,10 @@ void main(
         inv_cov_opac.xyz = portal_gut_bin_inverse(inv_cov_opac.xyz, camera_width, camera_height);
     }
 
-    float extend = extend_from_opacity(inv_cov_opac.w);
+    // Match GUT projection's expanded support for high-density RAD parents.
+    float extend = is_gut_projection_mode(uniforms.camera_model) && (uniforms.lod_enabled & 4u) != 0u
+        ? sqrt(2.0f * power_threshold_for_spark_rad_opacity(inv_cov_opac.w))
+        : extend_from_opacity(inv_cov_opac.w);
     float3 inv_cov = inv_cov_opac.xyz / (extend*extend);
 #endif  // TILE_CULLING_MODE > 0
 
@@ -154,7 +157,8 @@ void main(
     if (wrap_x) {
         for (uint16_t y = rect.min_y; y < rect.max_y; y++) {
             for (uint16_t x = rect.min_x; x < rect.max_x && offset < offset_max; x++) {
-                uint32_t key = uint32_t(y) * grid_width + (uint32_t(x) % grid_width);
+                uint32_t key = (uint32_t(y) - tile_origin.y) * grid_width +
+                    (uint32_t(x) % grid_width) - tile_origin.x;
                 out_unsorted_keys[offset] = sortingKey_t(key);
                 out_unsorted_gauss_idx[offset] = primitive_idx;
                 offset++;

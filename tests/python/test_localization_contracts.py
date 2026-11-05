@@ -441,8 +441,9 @@ def test_cached_native_panels_request_a_frame_for_language_changes():
     sequencer_panel = (ROOT / "src" / "visualizer" / "sequencer" / "rml_sequencer_panel.cpp").read_text(encoding="utf-8")
     assert "bool RmlSequencerPanel::needsLocalizationFrame() const" in sequencer_panel
     sequencer_manager = (ROOT / "src" / "visualizer" / "gui" / "sequencer_ui_manager.cpp").read_text(encoding="utf-8")
-    sequencer_demand = sequencer_manager[sequencer_manager.index("bool SequencerUIManager::needsAnimationFrame() const") :]
-    assert "panel_->needsLocalizationFrame()" in sequencer_demand.split("controller_.isPlaying()", 1)[0]
+    demand_start = sequencer_manager.index("bool SequencerUIManager::needsAnimationFrame(")
+    sequencer_demand = sequencer_manager[demand_start : sequencer_manager.index("\n    }\n", demand_start)]
+    assert "panel_->needsLocalizationFrame()" in sequencer_demand
 
 
 def test_rendering_labels_preserve_fullwidth_colons():
@@ -490,8 +491,40 @@ def test_immediate_python_controls_request_one_followup_frame_without_polling():
     assert 'append_reason("immediate_input")' in adapter_source
 
 
+def test_collision_error_keys_cover_native_producers_and_all_locales():
+    native = [
+        "src/core/collision_volume.cpp", "src/core/collision_walk.cpp", "src/core/collision_voxelization.cpp",
+        "src/core/include/core/collision.hpp", "src/core/include/core/collision_volume.hpp",
+        "src/core/scene.cpp",
+        "src/io/collision_export.cpp", "src/io/project/collision_serialization.hpp",
+        "src/io/project/project_document.cpp", "src/python/lfs/py_scene.cpp",
+        "src/python/lfs/py_io.cpp", "src/visualizer/gui/async_task_manager.cpp",
+        "src/visualizer/input/input_controller.cpp",
+    ]
+    keys = set()
+    for name in native:
+        source = (ROOT / name).read_text(encoding="utf-8")
+        keys.update(re.findall(r'(?:collisionError|exportError)\(\s*"([a-z0-9_.]+)"', source))
+        keys.update(re.findall(r'"message_key",\s*(?:std::string_view\()?"([a-z0-9_.]+)"', source))
+        if Path(name).name == "project_document.cpp":
+            keys.update(re.findall(r'"(collision\.[a-z_]+)"', source))
+        if Path(name).name in {"collision_volume.cpp", "collision_walk.cpp", "collision_voxelization.cpp", "collision_export.cpp", "collision_serialization.hpp"}:
+            assert not re.search(r'throw\s+std::\w*error|throw\s+std::invalid_argument', source), name
+    assert {"collision.source_unsupported", "collision.source_load_failed", "collision.geometry_invalid",
+            "collision.data_invalid", "collision.gui_required", "collision.replace_required"} <= keys
+    english = dict(_flatten(_load("en")))
+    for path in sorted(LOCALES.glob("*.json")):
+        localized = dict(_flatten(json.loads(path.read_text(encoding="utf-8"))))
+        for key in keys:
+            assert key in localized and localized[key].strip(), f"{path.name}: {key}"
+            assert _fields(localized[key]) == _fields(english[key]), f"{path.name}: {key}"
+            if path.stem != "en":
+                assert localized[key] != english[key], f"{path.name}: untranslated {key}"
+
+
 if __name__ == "__main__":
     contracts = [
+        test_collision_error_keys_cover_native_producers_and_all_locales,
         test_shipped_locales_match_english_keys_and_placeholders,
         test_locale_json_uses_one_key_per_line,
         test_shipped_locale_files_are_strict_utf8_without_bom_or_replacement_characters,
@@ -516,3 +549,32 @@ if __name__ == "__main__":
     for contract in contracts:
         contract()
         print(f"PASS {contract.__name__}")
+
+
+def test_locale_strings_use_real_line_breaks():
+    """A JSON "\\\\n" decodes to a backslash and an n, which dialogs print literally."""
+    def strings(node, key=""):
+        if isinstance(node, dict):
+            for child_key, child in node.items():
+                yield from strings(child, f"{key}.{child_key}" if key else child_key)
+        elif isinstance(node, str):
+            yield key, node
+
+    escaped = [
+        f"{path.name}:{key}"
+        for path in sorted(LOCALES.glob("*.json"))
+        for key, text in strings(json.loads(path.read_text(encoding="utf-8")))
+        if "\\n" in text
+    ]
+    assert not escaped, escaped
+
+
+def test_checkpoint_retention_labels_are_present_and_technical_english():
+    keys = ("training.save.keep_all_checkpoints", "training.tooltip.keep_all_checkpoints")
+    english = _load("en")
+    assert english[keys[0]] == "Keep all checkpoints"
+    assert "Existing checkpoint history is preserved" in english[keys[1]]
+    for path in LOCALES.glob("*.json"):
+        localized = json.loads(path.read_text(encoding="utf-8"))
+        for key in keys:
+            assert localized[key] == english[key], (path.name, key)

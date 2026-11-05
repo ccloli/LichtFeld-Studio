@@ -303,6 +303,12 @@ namespace lfs::vis {
         // Ellipsoid (data stored in scene graph EllipsoidData, these are UI toggles only)
         bool show_ellipsoid = false;
         bool use_ellipsoid = false;
+        bool selection_outline = false;
+        float selection_outline_opacity = 1.0f;
+        float selection_outline_width = 2.0f;
+        float selection_outline_threshold = 0.5f;
+        bool selection_outline_holes = true;
+        glm::vec3 selection_outline_color{0.0f, 0.604f, 0.733f};
         bool desaturate_unselected = false;     // Desaturate unselected PLYs when one is selected
         bool desaturate_cropping = false;       // Desaturate outside crop box/ellipsoid instead of hiding
         bool hide_outside_depth_box = false;    // Hide gaussians outside the selection depth box
@@ -319,6 +325,9 @@ namespace lfs::vis {
         float color_exposure = 1.0f;
         int color_tonemapping = 0;
         int splat_render_profile = 0; // 0: Studio, 1: standard portal
+        lfs::rendering::GaussianTransparencyMode transparency_mode =
+            lfs::rendering::GaussianTransparencyMode::AlphaBlend;
+        int stochastic_max_frames = lfs::rendering::DEFAULT_STOCHASTIC_REFINEMENT_FRAMES;
 
         // Background
         glm::vec3 background_color = glm::vec3(0.0f, 0.0f, 0.0f);
@@ -336,6 +345,7 @@ namespace lfs::vis {
         bool show_grid = true;
         int grid_plane = 1;
         float grid_opacity = 0.5f;
+        float collision_preview_opacity = 0.4f;
 
         // Point cloud
         bool point_cloud_mode = false;
@@ -349,6 +359,7 @@ namespace lfs::vis {
         // Camera frustums
         bool show_camera_frustums = false; // Master toggle for camera frustum rendering
         float camera_frustum_scale = 0.25f;
+        bool hide_disabled_camera_frustums = false;
         glm::vec3 train_camera_color = glm::vec3(1.0f, 1.0f, 1.0f);
         glm::vec3 eval_camera_color = glm::vec3(1.0f, 0.0f, 0.0f);
 
@@ -364,6 +375,8 @@ namespace lfs::vis {
         lfs::rendering::GaussianRasterBackend raster_backend = lfs::rendering::GaussianRasterBackend::ThreeDgs;
         bool gut = false;
         bool equirectangular = false;
+        // Live projection override; persisted as optional VIEW state, excluded from render proxies.
+        std::optional<lfs::rendering::GaussianRasterBackend> raster_backend_before_equirectangular;
         bool orthographic = false;
         float ortho_scale = 100.0f; // Pixels per world unit (larger = more zoomed in)
         bool depth_view = false;
@@ -372,8 +385,7 @@ namespace lfs::vis {
         lfs::rendering::DepthVisualizationMode depth_visualization_mode =
             lfs::rendering::DepthVisualizationMode::Palette;
 
-        // Selection colors (RGB: committed=219,83,83 preview=0,222,76 center=0,154,187)
-        glm::vec3 selection_color_committed{0.859f, 0.325f, 0.325f};
+        // Selection colors (RGB: preview=0,222,76 center=0,154,187); committed splats use their group color
         glm::vec3 selection_color_preview{0.0f, 0.871f, 0.298f};
         glm::vec3 selection_color_center_marker{0.0f, 0.604f, 0.733f};
 
@@ -452,11 +464,27 @@ namespace lfs::vis {
         }
     }
 
-    inline void enforceProjectionBackend(RenderSettings& settings) {
+    inline void enforceProjectionBackend(RenderSettings& settings, const bool remember_backend = false) {
+        using Backend = lfs::rendering::GaussianRasterBackend;
+        auto& previous_backend = settings.raster_backend_before_equirectangular;
+        // Full settings restoration must use its saved backend, without a live override.
+        if (!remember_backend) {
+            previous_backend.reset();
+        }
         if (!settings.equirectangular) {
+            if (previous_backend) {
+                if (settings.raster_backend == Backend::ThreeDgut) {
+                    settings.raster_backend = *previous_backend;
+                }
+                settings.gut = lfs::rendering::isGutBackend(settings.raster_backend);
+                previous_backend.reset();
+            }
             return;
         }
-        settings.raster_backend = lfs::rendering::GaussianRasterBackend::ThreeDgut;
+        if (remember_backend && !previous_backend && settings.raster_backend != Backend::ThreeDgut) {
+            previous_backend = settings.raster_backend;
+        }
+        settings.raster_backend = Backend::ThreeDgut;
         settings.gut = true;
     }
 
@@ -468,7 +496,7 @@ namespace lfs::vis {
     [[nodiscard]] inline bool environmentBackgroundUsesTransparentViewerCompositing(
         const RenderSettings& settings) {
         return environmentBackgroundEnabled(settings) &&
-               !splitViewEnabled(settings.split_view_mode);
+               !splitViewUsesGTComparison(settings.split_view_mode);
     }
 
     struct SplitViewInfo {

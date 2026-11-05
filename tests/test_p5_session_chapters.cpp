@@ -3,6 +3,8 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
+#include "user_shader_test_access.hpp"
+
 #include "core/camera.hpp"
 #include "core/event_bridge/event_bridge.hpp"
 #include "core/event_bridge/scoped_handler.hpp"
@@ -12,15 +14,20 @@
 #include "core/uuid.hpp"
 #include "gui/editor/python_editor.hpp"
 #include "gui/gui_manager.hpp"
+#include "gui/panel_registry.hpp"
 #include "gui/panels/python_console_panel.hpp"
 #include "gui/scene_tree_session.hpp"
 #include "gui/sequencer_ui_state.hpp"
+#include "input/input_controller.hpp"
 #include "io/project_document.hpp"
+#include "io/session_chapters.hpp"
 #include "io/video/video_export_options.hpp"
 #include "licht_matrix_test_data.hpp"
 #include "licht_test_support.hpp"
+#include "operation/undo_history.hpp"
 #include "project/session_state.hpp"
 #include "rendering/rendering_types.hpp"
+#include "sequencer/reveal_render_state.hpp"
 #include "sequencer/timeline.hpp"
 #include "tools/unified_tool_registry.hpp"
 #include "training/control/command_api.hpp"
@@ -28,6 +35,7 @@
 #include "training/trainer.hpp"
 #include "training/training_manager.hpp"
 #include "training/training_state.hpp"
+#include "user_shader_sources.hpp"
 #include "visualizer_impl.hpp"
 
 #include <gtest/gtest.h>
@@ -35,6 +43,7 @@
 #include <array>
 #include <bit>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <functional>
 #include <limits>
@@ -50,6 +59,10 @@
 #include <glm/gtc/constants.hpp>
 #include <glm/gtc/quaternion.hpp>
 
+namespace lfs::vis {
+    void installSessionTestInputController(VisualizerImpl& viewer);
+}
+
 namespace {
 
     namespace fs = std::filesystem;
@@ -62,6 +75,351 @@ namespace {
     using lfs::test::licht::rolled_panel_camera;
     using lfs::test::licht::TemporaryDirectory;
     using namespace lfs::vis::project;
+
+    TEST(P5SessionChapterTest, ShaderAssetCountAndAggregateSourceBoundaries) {
+        using Json = lfs::io::JsonChapterDom::Json;
+        auto root = json_root(ShaderLibraryChapter{}.dom());
+        for (std::size_t i = 0; i <= kMaxShaderAssets; ++i)
+            root["assets"].push_back({{"uuid", lfs::test::licht::fixed_uuid(30000 + i).to_string()}, {"name", "Generated"}, {"language", "slang"}, {"source", lfs::test::kIdentity}, {"parameters", Json::object()}});
+        auto recovered = require_result(ShaderLibraryChapter::parse(root.dump()));
+        EXPECT_EQ(recovered.dom().get_json("assets")->size(), kMaxShaderAssets);
+        EXPECT_EQ(recovered.warnings.size(), 1u);
+        root["assets"].erase(root["assets"].begin() + 17, root["assets"].end());
+        for (auto& asset : root["assets"])
+            asset["source"] = std::string(kMaxShaderSourceBytes, ' ');
+        recovered = require_result(ShaderLibraryChapter::parse(root.dump()));
+        EXPECT_EQ(recovered.dom().get_json("assets")->size(), 16u);
+        EXPECT_EQ(recovered.warnings.size(), 1u);
+        root["assets"] = Json::array({root["assets"][0]});
+        const Json binding{{"target", "global"}, {"shader_uuid", root["assets"][0]["uuid"]}};
+        root["bindings"] = Json::array({binding, binding});
+        recovered = require_result(ShaderLibraryChapter::parse(root.dump()));
+        EXPECT_TRUE(recovered.dom().get_json("bindings")->empty());
+        EXPECT_EQ(recovered.warnings.size(), 2u);
+    }
+
+    TEST(P5SessionChapterTest, ShaderRecoveryPreservesExtensionsAndSkipsOnlyDamagedEntries) {
+        using Json = lfs::io::JsonChapterDom::Json;
+        auto root = json_root(ShaderLibraryChapter{}.dom());
+        const auto id = lfs::core::generate_uuid_v4().to_string();
+        Json valid{{"uuid", id}, {"name", "Generated"}, {"language", "future"}, {"source", lfs::test::kIdentity}, {"parameters", {{"valid", Json::array({1, 2, 3})}, {"wrong", Json::array({1})}, {"bool", true}}}, {"extension", 7}};
+        root["assets"] = Json::array({valid, Json{{"uuid", "invalid"}}});
+        root["bindings"] = Json::array({Json{{"target", "global"}, {"shader_uuid", id}, {"extension", 8}},
+                                        Json{{"target", "node"}, {"node_uuid", "invalid"}, {"shader_uuid", id}}});
+        root["extension"] = "kept";
+        auto recovered = ShaderLibraryChapter::parse(root.dump());
+        ASSERT_TRUE(recovered);
+        EXPECT_EQ(recovered->warnings.size(), 4u);
+        auto saved = json_root(recovered->dom());
+        ASSERT_EQ(saved["assets"].size(), 1u);
+        EXPECT_EQ(saved["assets"][0]["parameters"].size(), 1u);
+        EXPECT_EQ(saved["assets"][0]["extension"], 7);
+        EXPECT_EQ(saved["bindings"][0]["extension"], 8);
+        EXPECT_EQ(saved["extension"], "kept");
+        root["assets"].push_back(valid);
+        recovered = ShaderLibraryChapter::parse(root.dump());
+        ASSERT_TRUE(recovered);
+        EXPECT_TRUE(recovered->dom().get_json("assets")->empty());
+        EXPECT_TRUE(recovered->dom().get_json("bindings")->empty());
+        root["version"] = 2;
+        EXPECT_FALSE(ShaderLibraryChapter::parse(root.dump()));
+        EXPECT_FALSE(ShaderLibraryChapter::parse("{"));
+    }
+
+    TEST(P5SessionChapterTest, ShaderLimitsAreBoundedAndDraftWireStaysLegacyValid) {
+        using Json = lfs::io::JsonChapterDom::Json;
+        auto root = json_root(ShaderLibraryChapter{}.dom());
+        root["assets"] = Json::array({{{"uuid", lfs::core::generate_uuid_v4().to_string()}, {"name", "Boundary"}, {"language", "slang"}, {"source", std::string(kMaxShaderSourceBytes, ' ')}, {"parameters", Json::object()}}});
+        auto parsed = ShaderLibraryChapter::parse(root.dump());
+        ASSERT_TRUE(parsed);
+        EXPECT_TRUE(parsed->warnings.empty());
+        root["assets"][0]["source"] = std::string(kMaxShaderSourceBytes + 1, ' ');
+        parsed = ShaderLibraryChapter::parse(root.dump());
+        ASSERT_TRUE(parsed);
+        EXPECT_TRUE(parsed->dom().get_json("assets")->empty());
+        EXPECT_FALSE(ShaderLibraryChapter::parse(std::string(kMaxShaderChapterBytes + 1, ' ')));
+        auto editor = json_root(EditorSessionChapter{}.dom());
+        editor["open_files"] = Json::array({{{"locator", "untitled://shader"}, {"kind", "shader"}, {"shader_id", lfs::core::generate_uuid_v4().to_string()}, {"target", {{"kind", "global"}}}, {"modified", false}, {"file_modified", true}}});
+        EXPECT_TRUE(EditorSessionChapter::parse(editor.dump()));
+        editor["open_files"][0].erase("kind");
+        EXPECT_TRUE(EditorSessionChapter::parse(editor.dump()));
+    }
+
+    TEST(P5SessionChapterTest, ShaderLibraryPrecedesCustomAndEditorRestore) {
+        lfs::event::EventBridge::instance().clear_all();
+        lfs::vis::ViewerOptions options;
+        options.show_startup_overlay = false;
+        lfs::vis::VisualizerImpl viewer(options);
+        lfs::vis::installSessionTestInputController(viewer);
+        auto* service = viewer.getShaderService();
+        ASSERT_NE(service, nullptr);
+        const auto id = require_result(lfs::vis::ShaderCommands{*service}.createAsset("Generated", lfs::test::kIdentity));
+        ProjectSessionChapters retained;
+        retained.shaders = require_result(service->captureProject(retained.shaders)).chapter;
+        auto& controller = viewer.getGuiManager()->sequencer();
+        controller.addKeyframe(lfs::sequencer::Keyframe{});
+        lfs::sequencer::RevealClip custom;
+        custom.effect = lfs::sequencer::RevealEffect::Custom;
+        custom.shader_id = id;
+        ASSERT_TRUE(controller.setRevealClip(custom));
+        auto* editor = lfs::vis::gui::panels::PythonConsoleState::getInstance().getEditor();
+        ASSERT_NE(editor, nullptr);
+        ASSERT_TRUE(editor->setDocumentMode(editor->document().id, lfs::vis::editor::DocumentKind::Shader, service->assets().front()));
+        editor->setText(lfs::test::kIdentity);
+        ASSERT_TRUE(editor->setDocumentTarget(editor->document().id, {lfs::vis::shaders::ShaderSlot::Kind::Reveal, {}}, *service));
+        ASSERT_TRUE(editor->runShader(*service));
+        ASSERT_TRUE(editor->hasShaderBinding(*service));
+        std::vector<CameraBookmarkProjectState> bookmarks;
+        auto captured = require_result(captureGuiSession(viewer, retained, bookmarks));
+        GuiSessionRestoreCoordinator coordinator;
+        ASSERT_TRUE(coordinator.stage(captured));
+        coordinator.onFirstGuiFrame();
+        coordinator.onPanelsReady(1);
+        EXPECT_FALSE(coordinator.takeReady(false));
+        EXPECT_TRUE(coordinator.hasPending());
+        EXPECT_TRUE(coordinator.takeReady(true));
+        const auto files = captured.editor.dom().get_json("open_files");
+        const auto associated = std::ranges::find_if(*files, [&](const auto& file) { return file.contains("shader_id") && file["shader_id"] == id.to_string(); });
+        ASSERT_NE(associated, files->end());
+        EXPECT_FALSE(associated->contains("embedded_buffer"));
+        ASSERT_TRUE(controller.setRevealClip(lfs::sequencer::RevealClip{}));
+        auto builtin = require_result(captureGuiSession(viewer, captured, bookmarks));
+        EXPECT_FALSE(json_root(builtin.sequencer.dom())["timeline"]["reveal_clip"].contains("shader_id"));
+        service->clear();
+        applyGuiSession(viewer, require_result(prepareGuiSessionRestore(captured)), bookmarks);
+        ASSERT_TRUE(controller.timeline().revealClip());
+        EXPECT_EQ(controller.timeline().revealClip()->shader_id, id);
+        EXPECT_EQ(editor->document().shader_asset, id);
+        EXPECT_EQ(editor->getText(), lfs::test::kIdentity);
+        EXPECT_TRUE(editor->inspectDocument(editor->document().id, service)->owned_bindings.empty());
+        EXPECT_TRUE(editor->stopShader(*service).empty());
+        EXPECT_EQ(controller.timeline().revealClip()->shader_id, id);
+        auto unavailable = captured;
+        auto unavailable_assets = *unavailable.shaders.dom().get_json("assets");
+        unavailable_assets[0]["language"] = "future";
+        ASSERT_TRUE(unavailable.shaders.dom().set_json("assets", unavailable_assets));
+        applyGuiSession(viewer, require_result(prepareGuiSessionRestore(unavailable)), bookmarks);
+        ASSERT_TRUE(controller.timeline().revealClip());
+        EXPECT_EQ(controller.timeline().revealClip()->shader_id, id);
+        EXPECT_EQ(service->status(id)->state, lfs::vis::shaders::ShaderState::Failed);
+        captured.shaders = ShaderLibraryChapter{};
+        applyGuiSession(viewer, require_result(prepareGuiSessionRestore(captured)), bookmarks);
+        EXPECT_FALSE(controller.timeline().revealClip());
+        EXPECT_TRUE(service->assets().empty());
+        EXPECT_EQ(controller.timeline().keyframes().size(), 1u);
+    }
+
+    TEST(P5SessionChapterTest, RealProjectRevealRemovalSurvivesSaveAndReopen) {
+        const char* source = std::getenv("LFS_REVEAL_TEST_PROJECT");
+        if (!source || !fs::exists(source))
+            GTEST_SKIP() << "Set LFS_REVEAL_TEST_PROJECT to an existing .licht project";
+
+        TemporaryDirectory temporary;
+        const auto path = temporary.path / "reveal-removal.licht";
+        fs::copy_file(source, path);
+        auto document = require_result(ProjectDocument::open(path));
+        ProjectSessionChapters retained{
+            .gui_layout = document.gui_layout(),
+            .editor = document.editor(),
+            .view = document.view(),
+            .sequencer = document.sequencer(),
+            .metrics = document.metrics(),
+        };
+        ASSERT_TRUE(retained.sequencer.dom().set_json("timeline.review_extension", "preserve"));
+        lfs::vis::ViewerOptions options;
+        options.show_startup_overlay = false;
+        lfs::vis::VisualizerImpl viewer(options);
+        lfs::vis::installSessionTestInputController(viewer);
+        std::vector<CameraBookmarkProjectState> bookmarks;
+        ASSERT_TRUE(viewer.getGuiManager()->sequencer().setRevealClip(lfs::sequencer::RevealClip{}));
+        auto with_reveal = require_result(captureGuiSession(viewer, retained, bookmarks));
+        ASSERT_TRUE(json_root(with_reveal.sequencer.dom())["timeline"].contains("reveal_clip"));
+        document.edit_sequencer() = with_reveal.sequencer;
+        ASSERT_TRUE(document.save(path));
+
+        auto reopened = require_result(ProjectDocument::open(path));
+        with_reveal.sequencer = reopened.sequencer();
+        ASSERT_TRUE(viewer.getGuiManager()->sequencer().setRevealClip(std::nullopt));
+        auto removed = require_result(captureGuiSession(viewer, with_reveal, bookmarks));
+        document.edit_sequencer() = removed.sequencer;
+        ASSERT_TRUE(document.save(path));
+        auto final = require_result(ProjectDocument::open(path));
+        const auto timeline = json_root(final.sequencer().dom())["timeline"];
+        EXPECT_FALSE(timeline.contains("reveal_clip"));
+        EXPECT_EQ(timeline["review_extension"], "preserve");
+    }
+
+    TEST(P5SessionChapterTest, CustomRevealRunHistoryAndOwnershipUseOneTransaction) {
+        namespace shaders = lfs::vis::shaders;
+        lfs::vis::ViewerOptions options;
+        options.show_startup_overlay = false;
+        lfs::vis::VisualizerImpl viewer(options);
+        auto& controller = viewer.getGuiManager()->sequencer();
+        auto& service = *viewer.getShaderService();
+        auto& history = lfs::vis::op::undoHistory();
+        const lfs::sequencer::RevealClip builtin;
+        ASSERT_TRUE(controller.setRevealClip(builtin));
+        history.clear();
+        lfs::vis::editor::PythonEditor editor;
+        editor.newDocument("draft", lfs::vis::editor::DocumentKind::Shader);
+        const shaders::ShaderSlot target{shaders::ShaderSlot::Kind::Reveal, {}};
+        ASSERT_TRUE(editor.setDocumentTarget(editor.document().id, target, service));
+        ASSERT_TRUE(editor.runShader(service));
+        const auto asset = *editor.document().shader_asset;
+        ASSERT_EQ(controller.timeline().revealClip()->shader_id, asset);
+        ASSERT_TRUE(editor.hasShaderBinding(service));
+        ASSERT_EQ(history.undoCount(), 1u);
+        ASSERT_TRUE(history.undo().success);
+        EXPECT_EQ(controller.timeline().revealClip(), builtin);
+        EXPECT_FALSE(service.status(asset));
+        EXPECT_FALSE(editor.hasShaderBinding(service));
+        ASSERT_TRUE(history.redo().success);
+        EXPECT_EQ(controller.timeline().revealClip()->shader_id, asset);
+        EXPECT_EQ(service.boundAsset(target), asset);
+        EXPECT_TRUE(editor.hasShaderBinding(service));
+        ASSERT_TRUE(editor.runShader(service));
+        auto timing = *controller.timeline().revealClip();
+        timing.end += 2;
+        ASSERT_TRUE(controller.setRevealClip(timing));
+        EXPECT_TRUE(editor.hasShaderBinding(service));
+        EXPECT_FALSE(service.command(shaders::RemoveShader{asset}));
+        ASSERT_TRUE(service.command(shaders::BindShader{target, asset}));
+        EXPECT_TRUE(editor.hasShaderBinding(service));
+        EXPECT_EQ(editor.stopShader(service), std::vector{target});
+        EXPECT_FALSE(controller.timeline().revealClip());
+        EXPECT_FALSE(service.boundAsset(target));
+        ASSERT_TRUE(history.undo().success);
+        EXPECT_EQ(controller.timeline().revealClip(), timing);
+        EXPECT_FALSE(editor.hasShaderBinding(service));
+        history.clear();
+        service.clear();
+        EXPECT_FALSE(controller.timeline().revealClip());
+    }
+
+    TEST(P5SessionChapterTest, CustomRevealLoadAndStaleHistoryLeaveBindingsIntact) {
+        namespace shaders = lfs::vis::shaders;
+        lfs::vis::ViewerOptions options;
+        options.show_startup_overlay = false;
+        lfs::vis::VisualizerImpl viewer(options);
+        auto& controller = viewer.getGuiManager()->sequencer();
+        auto& service = *viewer.getShaderService();
+        auto& history = lfs::vis::op::undoHistory();
+        const auto asset = lfs::vis::ShaderCommands{service}.createAsset("Reveal", "draft");
+        ASSERT_TRUE(asset);
+        lfs::sequencer::RevealClip clip{1, 4, .2f, lfs::sequencer::RevealEffect::Custom, *asset};
+        ASSERT_TRUE(controller.setRevealClip(clip));
+        const auto saved = controller.saveToJson();
+        auto invalid = saved;
+        invalid["reveal_clip"]["shader_id"] = lfs::core::generate_uuid_v4().to_string();
+        EXPECT_FALSE(controller.loadFromJson(invalid));
+        EXPECT_EQ(controller.saveToJson(), saved);
+        EXPECT_EQ(service.boundAsset({shaders::ShaderSlot::Kind::Reveal, {}}), *asset);
+        history.clear();
+        ASSERT_TRUE(controller.setRevealClip(std::nullopt));
+        ASSERT_TRUE(lfs::vis::ShaderCommands{service}.removeAsset(*asset));
+        EXPECT_FALSE(history.undo().success);
+        EXPECT_FALSE(controller.timeline().revealClip());
+        EXPECT_FALSE(service.boundAsset({shaders::ShaderSlot::Kind::Reveal, {}}));
+        history.clear();
+    }
+
+    TEST(P5SessionChapterTest, RevealControllerEditsAreUndoable) {
+        lfs::vis::ViewerOptions options;
+        options.show_startup_overlay = false;
+        lfs::vis::VisualizerImpl viewer(options);
+        auto& controller = viewer.getGuiManager()->sequencer();
+        auto& history = lfs::vis::op::undoHistory();
+        history.clear();
+        const float original_duration = controller.clipDuration();
+        lfs::sequencer::RevealClip clip;
+        clip.end = original_duration + 5.0f;
+        ASSERT_TRUE(controller.setRevealClip(clip));
+        ASSERT_TRUE(controller.timeline().revealClip());
+        EXPECT_FLOAT_EQ(controller.clipDuration(), clip.end);
+        ASSERT_TRUE(history.canUndo());
+        const auto undo = history.undo();
+        EXPECT_TRUE(undo.success);
+        EXPECT_TRUE(undo.changed);
+        EXPECT_FALSE(controller.timeline().revealClip());
+        EXPECT_FLOAT_EQ(controller.clipDuration(), original_duration);
+        const auto redo = history.redo();
+        EXPECT_TRUE(redo.success);
+        EXPECT_TRUE(redo.changed);
+        EXPECT_TRUE(controller.timeline().revealClip());
+        EXPECT_FLOAT_EQ(controller.clipDuration(), clip.end);
+        history.clear();
+        auto changed = clip;
+        changed.effect = lfs::sequencer::RevealEffect::Unveil;
+        changed.softness = 0.4f;
+        changed.end -= 1.0f;
+        ASSERT_TRUE(controller.setRevealClip(changed));
+        ASSERT_EQ(history.undoCount(), 1u);
+        const auto undo_change = history.undo();
+        EXPECT_TRUE(undo_change.success);
+        EXPECT_TRUE(undo_change.changed);
+        ASSERT_TRUE(controller.timeline().revealClip());
+        EXPECT_EQ(controller.timeline().revealClip()->effect, clip.effect);
+        EXPECT_FLOAT_EQ(controller.timeline().revealClip()->softness, clip.softness);
+        EXPECT_FLOAT_EQ(controller.timeline().revealClip()->end, clip.end);
+        const auto redo_change = history.redo();
+        EXPECT_TRUE(redo_change.success);
+        EXPECT_TRUE(redo_change.changed);
+        ASSERT_TRUE(controller.timeline().revealClip());
+        EXPECT_EQ(controller.timeline().revealClip()->effect, changed.effect);
+        EXPECT_FLOAT_EQ(controller.timeline().revealClip()->softness, changed.softness);
+        EXPECT_FLOAT_EQ(controller.timeline().revealClip()->end, changed.end);
+        ASSERT_TRUE(controller.setRevealClip(clip));
+        history.clear();
+        controller.beginRevealEdit();
+        clip.start = 1.0f;
+        ASSERT_TRUE(controller.setRevealClip(clip));
+        clip.start = 2.0f;
+        ASSERT_TRUE(controller.setRevealClip(clip));
+        controller.endRevealEdit();
+        EXPECT_EQ(history.undoCount(), 1u);
+        const auto grouped_undo = history.undo();
+        EXPECT_TRUE(grouped_undo.success);
+        EXPECT_FLOAT_EQ(controller.timeline().revealClip()->start, 0.0f);
+        const auto grouped_redo = history.redo();
+        EXPECT_TRUE(grouped_redo.success);
+        EXPECT_FLOAT_EQ(controller.timeline().revealClip()->start, 2.0f);
+        history.clear();
+        ASSERT_TRUE(controller.setRevealClip(std::nullopt));
+        EXPECT_FALSE(controller.timeline().revealClip());
+        EXPECT_TRUE(history.undo().success);
+        EXPECT_TRUE(controller.timeline().revealClip());
+        history.clear();
+    }
+
+    TEST(P5SessionChapterTest, RealProjectRevealBoundsSurviveConsolidation) {
+        const char* source = std::getenv("LFS_REVEAL_TEST_PROJECT");
+        if (!source || !fs::exists(source))
+            GTEST_SKIP() << "Set LFS_REVEAL_TEST_PROJECT to an existing .licht project";
+        auto document = require_result(ProjectDocument::open(source));
+        lfs::core::Scene scene;
+        auto staged = document.stage_hydration(scene);
+        ASSERT_TRUE(staged) << lfs::format_for_developer(staged.error());
+        (void)ProjectDocument::commit_hydration(scene, std::move(*staged));
+        auto slots = scene.getVisibleSplatNodeSlots();
+        ASSERT_FALSE(slots.empty()) << "Project must contain a visible splat model";
+        ASSERT_NE(slots.front().node, nullptr);
+        ASSERT_NE(slots.front().node->model, nullptr);
+        const auto name = slots.front().node->name;
+        const auto duplicate = scene.duplicateNode(name);
+        ASSERT_FALSE(duplicate.empty());
+        slots = scene.getVisibleSplatNodeSlots();
+        ASSERT_GE(slots.size(), 2u);
+        glm::vec3 before_min, before_max;
+        ASSERT_TRUE(scene.getNodeRevealBounds(slots.front().node->id, before_min, before_max));
+        ASSERT_GE(scene.consolidateNodeModels(), 2u);
+        glm::vec3 after_min, after_max;
+        ASSERT_TRUE(scene.getNodeRevealBounds(slots.front().node->id, after_min, after_max));
+        EXPECT_EQ(after_min, before_min);
+        EXPECT_EQ(after_max, before_max);
+        EXPECT_TRUE(lfs::vis::makeRevealRenderState(scene, lfs::sequencer::RevealClip{}, 0.0f));
+        EXPECT_FALSE(lfs::vis::makeRevealRenderState(scene, lfs::sequencer::RevealClip{}, 3.0f));
+        EXPECT_FALSE(lfs::vis::makeRevealRenderState(scene, lfs::sequencer::RevealClip{}, 4.0f));
+    }
 
     void overwrite_f32_le(
         std::vector<std::byte>& bytes,
@@ -108,6 +466,66 @@ namespace {
             viewer.getSceneManager(),
             viewer.getTrainerManager());
         return node;
+    }
+
+    TEST(P5SessionChapterTest, NavigationVerticalSurvivesLichtSaveOpenAndSaveAs) {
+        TemporaryDirectory temporary;
+        for (const std::string axis : {"legacy_y", "data_z", "absent", "future_up"}) {
+            SCOPED_TRACE(axis);
+            auto document = lfs::test::licht::make_empty_document(lfs::core::generate_uuid_v4());
+            ProjectSessionChapters session;
+            session.view = document->view();
+            session.gui_layout = document->gui_layout();
+            session.editor = document->editor();
+            session.sequencer = document->sequencer();
+            session.metrics = document->metrics();
+            auto view = json_root(session.view.dom());
+            if (axis == "absent")
+                view["navigation"].erase("up_axis");
+            else
+                view["navigation"]["up_axis"] = axis;
+            session.view = require_result(ViewSessionChapter::parse(view.dump()));
+            document->edit_view() = session.view;
+            document->edit_gui_layout() = session.gui_layout;
+            document->edit_editor() = session.editor;
+            document->edit_sequencer() = session.sequencer;
+            const auto source = temporary.path / (axis + ".licht");
+            const auto destination = temporary.path / (axis + "-copy.licht");
+            auto saved = document->save(source);
+            ASSERT_TRUE(saved) << lfs::format_for_developer(saved.error());
+            auto reopened = require_result(ProjectDocument::open(source));
+            EXPECT_EQ(json_root(reopened.view().dom()), view);
+            ASSERT_TRUE(reopened.save_as(destination));
+            auto copied = require_result(ProjectDocument::open(destination));
+            EXPECT_EQ(json_root(copied.view().dom()), view);
+            session.view = copied.view();
+            EXPECT_TRUE(prepareGuiSessionRestore(session));
+        }
+    }
+
+    TEST(P5SessionChapterTest, NavigationVerticalIsOptionalAndPreservesUnknownValues) {
+        auto session = make_populated_session_chapters();
+        auto view = json_root(session.view.dom());
+        view["navigation"].erase("up_axis");
+        session.view = require_result(ViewSessionChapter::parse(view.dump()));
+        EXPECT_TRUE(prepareGuiSessionRestore(session));
+        view["navigation"]["up_axis"] = "data_z";
+        session.view = require_result(ViewSessionChapter::parse(view.dump()));
+        EXPECT_TRUE(prepareGuiSessionRestore(session));
+        // An earlier writer knows mode/view_snap only. Its normal merge must
+        // preserve the additive vertical field without changing chapter version.
+        Json earlier_state = view;
+        earlier_state["navigation"].erase("up_axis");
+        require_status(session.view.merge_known_state(earlier_state));
+        auto reopened = require_result(ViewSessionChapter::from_bytes(session.view.to_bytes()));
+        EXPECT_EQ(json_root(reopened.dom())["navigation"]["up_axis"], "data_z");
+        EXPECT_EQ(json_root(reopened.dom())["version"], view["version"]);
+        for (const Json unknown : {Json("future_up"), Json(2), Json(nullptr), Json(true), Json::array(), Json::object()}) {
+            view["navigation"]["up_axis"] = unknown;
+            session.view = require_result(ViewSessionChapter::parse(view.dump()));
+            EXPECT_TRUE(prepareGuiSessionRestore(session));
+            EXPECT_EQ(json_root(session.view.dom())["navigation"]["up_axis"], unknown);
+        }
     }
 
     TEST(P5SessionChapterTest,
@@ -633,7 +1051,9 @@ namespace {
     TEST(P5SessionChapterTest,
          EditorDefaultBufferDropsOnlyEmptyStateAndKeepsTypedCode) {
         using namespace lfs::vis::editor;
+        EXPECT_EQ(PythonEditorSessionFile{}, PythonEditorSessionFile{});
         PythonEditor editor;
+        EXPECT_FALSE(editor.document().id.is_nil());
         editor.restoreWorkspaceSessionState({});
         EXPECT_TRUE(
             editor.captureWorkspaceSessionState(
@@ -655,6 +1075,20 @@ namespace {
             "typed = 1\n");
         EXPECT_TRUE(
             captured.open_files.front().modified);
+    }
+
+    TEST(P5SessionChapterTest, EmptyShaderDraftRetainsIdentityWithoutMakingDefaultStateNonempty) {
+        using namespace lfs::vis::editor;
+        PythonEditor editor;
+        editor.setDocumentKind(DocumentKind::Shader);
+        const auto id = editor.document().id;
+        const auto captured = editor.captureWorkspaceSessionState({}, false);
+        ASSERT_EQ(captured.open_files.size(), 1u);
+        EXPECT_EQ(captured.open_files.front().document.id, id);
+        EXPECT_TRUE(captured.open_files.front().text.empty());
+        editor.restoreWorkspaceSessionState(captured);
+        EXPECT_EQ(editor.document().id, id);
+        EXPECT_EQ(editor.document().kind, DocumentKind::Shader);
     }
 
     TEST(P5SessionChapterTest,
@@ -761,6 +1195,45 @@ namespace {
             lfs::ErrorCode::DataLoss);
     }
 
+    TEST(P5SessionChapterTest, BuiltinEnvironmentsRoundTripWithoutExternalReferences) {
+        for (const auto path : {lfs::vis::kDefaultEnvironmentMapPath,
+                                std::string_view("environments/alps_field_1k.hdr")}) {
+            SCOPED_TRACE(path);
+            lfs::vis::RenderSettings settings;
+            settings.environment_map_path = path;
+            const auto json = renderSettingsToProjectJson(settings);
+            EXPECT_EQ(json["environment_builtin"].get<std::string>(), path);
+            EXPECT_TRUE(json["environment_reference_uuid"].is_null());
+            const auto restored = renderSettingsFromProjectJson(json);
+            ASSERT_TRUE(restored);
+            EXPECT_EQ(restored->environment_map_path, path);
+        }
+    }
+
+    TEST(P5SessionChapterTest, ExternalEnvironmentsKeepReferenceEncoding) {
+        for (const auto path : {"", "custom.hdr", "/tmp/custom.hdr",
+                                "environments/custom.hdr", "/tmp/environments/alps_field_1k.hdr"}) {
+            SCOPED_TRACE(path);
+            lfs::vis::RenderSettings settings;
+            settings.environment_map_path = path;
+            const auto json = renderSettingsToProjectJson(settings);
+            EXPECT_TRUE(json["environment_builtin"].is_null());
+            EXPECT_TRUE(json["environment_reference_uuid"].is_null());
+        }
+    }
+
+    TEST(P5SessionChapterTest, BuiltinEnvironmentUsesExistingReaderContract) {
+        auto json = renderSettingsToProjectJson(lfs::vis::RenderSettings{});
+        json["environment_builtin"] = "environments/alps_field_1k.hdr";
+        auto restored = renderSettingsFromProjectJson(json);
+        ASSERT_TRUE(restored);
+        EXPECT_EQ(restored->environment_map_path, "environments/alps_field_1k.hdr");
+        json.erase("environment_builtin");
+        restored = renderSettingsFromProjectJson(json);
+        ASSERT_TRUE(restored);
+        EXPECT_EQ(restored->environment_map_path, lfs::vis::kDefaultEnvironmentMapPath);
+    }
+
     TEST(P5SessionChapterTest,
          RenderBackendAndPanelRotationRoundTripCanonically) {
         lfs::vis::RenderSettings settings;
@@ -793,6 +1266,54 @@ namespace {
             capturePanelCameraProjectState(
                 viewport),
             expected);
+    }
+
+    TEST(P5SessionChapterTest,
+         EquirectangularSessionRoundTripRestoresPreviousBackend) {
+        using Backend = lfs::rendering::GaussianRasterBackend;
+
+        lfs::vis::RenderSettings settings;
+        settings.equirectangular = true;
+        settings.raster_backend = Backend::ThreeDgut;
+        settings.gut = true;
+        settings.raster_backend_before_equirectangular = Backend::ThreeDgs;
+
+        auto json = renderSettingsToProjectJson(settings);
+        ASSERT_TRUE(json.contains("raster_backend_before_equirectangular"));
+        EXPECT_EQ(json["raster_backend_before_equirectangular"], "3dgs");
+
+        auto restored = renderSettingsFromProjectJson(json);
+        ASSERT_TRUE(restored) << lfs::format_for_developer(restored.error());
+        EXPECT_EQ(restored->raster_backend, Backend::ThreeDgut);
+        EXPECT_EQ(restored->raster_backend_before_equirectangular, Backend::ThreeDgs);
+        restored->equirectangular = false;
+        lfs::vis::enforceProjectionBackend(*restored, true);
+        EXPECT_EQ(restored->raster_backend, Backend::ThreeDgs);
+
+        // An explicit 3DGUT choice and older projects without the additive field
+        // retain the existing behavior when the projection is turned off.
+        settings.raster_backend_before_equirectangular.reset();
+        auto explicit_gut = renderSettingsToProjectJson(settings);
+        ASSERT_TRUE(explicit_gut["raster_backend_before_equirectangular"].is_null());
+        auto old_project = explicit_gut;
+        old_project.erase("raster_backend_before_equirectangular");
+        for (const auto& project : {explicit_gut, old_project}) {
+            auto old_restored = renderSettingsFromProjectJson(project);
+            ASSERT_TRUE(old_restored) << lfs::format_for_developer(old_restored.error());
+            old_restored->equirectangular = false;
+            lfs::vis::enforceProjectionBackend(*old_restored, true);
+            EXPECT_EQ(old_restored->raster_backend, Backend::ThreeDgut);
+        }
+
+        auto invalid_previous_backend = explicit_gut;
+        invalid_previous_backend["raster_backend_before_equirectangular"] =
+            "future-backend";
+        auto invalid_restored =
+            renderSettingsFromProjectJson(invalid_previous_backend);
+        ASSERT_TRUE(invalid_restored)
+            << lfs::format_for_developer(invalid_restored.error());
+        EXPECT_EQ(invalid_restored->raster_backend, Backend::ThreeDgut);
+        EXPECT_FALSE(invalid_restored->raster_backend_before_equirectangular);
     }
 
     TEST(P5SessionChapterTest, GalleryOrthographicExtentSurvivesViewportSizes) {
@@ -844,6 +1365,110 @@ namespace {
         EXPECT_FALSE(captured.ortho_extent_world.has_value());
         captured = capturePanelCameraProjectState(invalid, std::nullopt);
         EXPECT_FALSE(captured.ortho_extent_world.has_value());
+    }
+
+    TEST(P5SessionChapterTest, ViewRenderSettingsKeepEveryKeyEarlierReadersRequire) {
+        // Every VIEW render-settings key earlier readers require; a project written without one
+        // of them does not open there. Removed settings keep being written.
+        static constexpr std::array<std::string_view, 76> earlier_reader_keys{
+            "focal_length_mm",
+            "scaling_modifier",
+            "antialiasing",
+            "mip_filter",
+            "sh_degree",
+            "render_scale",
+            "camera_metrics_mode",
+            "show_crop_box",
+            "use_crop_box",
+            "show_ellipsoid",
+            "use_ellipsoid",
+            "desaturate_unselected",
+            "desaturate_cropping",
+            "hide_outside_depth_box",
+            "crop_filter_for_selection",
+            "apply_appearance_correction",
+            "ppisp_mode",
+            "background_color",
+            "environment_mode",
+            "environment_exposure",
+            "environment_rotation_degrees",
+            "show_coord_axes",
+            "axes_size",
+            "show_grid",
+            "grid_plane",
+            "grid_opacity",
+            "point_cloud_mode",
+            "voxel_size",
+            "show_rings",
+            "ring_width",
+            "show_center_markers",
+            "show_camera_frustums",
+            "camera_frustum_scale",
+            "train_camera_color",
+            "eval_camera_color",
+            "show_pivot",
+            "split_view_mode",
+            "gt_comparison_mode",
+            "split_position",
+            "split_view_offset",
+            "equirectangular",
+            "orthographic",
+            "ortho_scale",
+            "depth_view",
+            "depth_view_min",
+            "depth_view_max",
+            "depth_visualization_mode",
+            "selection_color_committed",
+            "selection_color_preview",
+            "selection_color_center_marker",
+            "depth_clip_enabled",
+            "depth_clip_far",
+            "mesh_wireframe",
+            "mesh_wireframe_color",
+            "mesh_wireframe_width",
+            "mesh_light_dir",
+            "mesh_light_intensity",
+            "mesh_ambient",
+            "mesh_backface_culling",
+            "mesh_shadow_enabled",
+            "mesh_shadow_resolution",
+            "depth_filter_enabled",
+            "depth_filter_min",
+            "depth_filter_max",
+            "lod_enabled",
+            "lod_auto_enable_rad",
+            "lod_max_splats",
+            "lod_render_scale",
+            "lod_behind_camera_penalty",
+            "lod_cone_foveation",
+            "lod_cone_inner_degrees",
+            "lod_cone_outer_degrees",
+            "lod_page_pool_splats",
+            "lod_pool_vram_fraction",
+            "lod_fade_frames",
+            "lod_debug_colors",
+        };
+        const auto written = renderSettingsToProjectJson(lfs::vis::RenderSettings{});
+        const auto default_view =
+            lfs::io::project::default_session_chapter_dom(lfs::io::project::SessionJsonChapterKind::View)
+                .get_json("render_settings");
+        ASSERT_TRUE(default_view);
+        for (const auto key : earlier_reader_keys) {
+            EXPECT_TRUE(written.contains(std::string(key))) << key;
+            EXPECT_TRUE(default_view->contains(std::string(key))) << key;
+        }
+
+        const auto& committed = written.at("selection_color_committed");
+        ASSERT_TRUE(committed.is_array());
+        ASSERT_EQ(committed.size(), 3u);
+        EXPECT_FLOAT_EQ(committed[0].get<float>(), 0.859f);
+        EXPECT_FLOAT_EQ(committed[1].get<float>(), 0.325f);
+        EXPECT_FLOAT_EQ(committed[2].get<float>(), 0.325f);
+
+        auto without_removed = written;
+        without_removed.erase("selection_color_committed");
+        EXPECT_TRUE(renderSettingsFromProjectJson(without_removed));
+        EXPECT_TRUE(renderSettingsFromProjectJson(written));
     }
 
     TEST(P5SessionChapterTest,
@@ -2214,7 +2839,6 @@ namespace {
         expect_bool(render, "/orthographic", true);
         expect_bool(render, "/depth_view", true);
         prove("VIEW-198");
-        expect_json(render, "/selection_color_committed", Json::array({0.11f, 0.22f, 0.33f}));
         expect_bool(render, "/depth_clip_enabled", true);
         expect_float(render, "/depth_clip_far", 34.0f);
         prove("VIEW-199");
@@ -2421,6 +3045,211 @@ namespace {
         }
     }
 
+} // namespace
+
+namespace lfs::vis {
+    void installSessionTestInputController(VisualizerImpl& viewer);
+}
+
+namespace {
+
+    class UnknownSessionValueFixture {
+    public:
+        struct TestPanel final : lfs::vis::gui::IPanel {
+            void draw(const lfs::vis::gui::PanelDrawContext&) override {}
+            lfs::vis::gui::PanelRenderCapabilities renderCapabilities() const override { return {.direct = true}; }
+        };
+
+        UnknownSessionValueFixture() {
+            lfs::event::EventBridge::instance().clear_all();
+            lfs::vis::ViewerOptions options;
+            options.show_startup_overlay = false;
+            viewer = std::make_unique<lfs::vis::VisualizerImpl>(options);
+            lfs::vis::installSessionTestInputController(*viewer);
+            if (seed_splat_selection(*viewer) == lfs::core::NULL_NODE ||
+                !lfs::vis::gui::PanelRegistry::instance().register_panel({
+                    .panel = std::make_shared<TestPanel>(),
+                    .label = "Session test panel",
+                    .id = panel_id,
+                    .space = lfs::vis::gui::PanelSpace::SidePanel,
+                }))
+                throw std::runtime_error("Failed to initialize unknown-session test fixture");
+        }
+
+        ~UnknownSessionValueFixture() {
+            lfs::vis::gui::PanelRegistry::instance().unregister_panel(panel_id);
+        }
+
+        PreparedGuiSessionRestore restore(
+            const std::string& name,
+            const std::function<void(Json&, Json&, Json&)>& mutate = {}) {
+            auto document = lfs::test::licht::make_empty_document(lfs::core::generate_uuid_v4());
+            auto view = json_root(document->view().dom());
+            auto gui = json_root(document->gui_layout().dom());
+            auto sequencer = json_root(document->sequencer().dom());
+            if (mutate)
+                mutate(view, gui, sequencer);
+            document->edit_view() = require_result(ViewSessionChapter::parse(view.dump()));
+            document->edit_gui_layout() = require_result(GuiLayoutChapter::parse(gui.dump()));
+            document->edit_sequencer() = require_result(SequencerSessionChapter::parse(sequencer.dump()));
+            const auto path = temporary.path / (name + ".licht");
+            (void)require_result(document->save(path));
+            auto reopened = require_result(ProjectDocument::open(path));
+            ProjectSessionChapters chapters{
+                .gui_layout = reopened.gui_layout(),
+                .editor = reopened.editor(),
+                .view = reopened.view(),
+                .sequencer = reopened.sequencer(),
+                .metrics = reopened.metrics(),
+            };
+            auto prepared = require_result(prepareGuiSessionRestore(std::move(chapters)));
+            applyGuiSession(*viewer, prepared, bookmarks);
+            applyGuiSessionTools(*viewer, prepared);
+            return prepared;
+        }
+
+        const std::string panel_id = "test.session.unknown-space";
+        TemporaryDirectory temporary;
+        std::unique_ptr<lfs::vis::VisualizerImpl> viewer;
+        std::vector<CameraBookmarkProjectState> bookmarks;
+    };
+
+    TEST(P5SessionChapterTest, UnknownProjectValuesUseRuntimeDefaults) {
+        UnknownSessionValueFixture test;
+        auto prepared = test.restore("fallbacks", [](Json& view, Json&, Json& sequencer) {
+            view["split"]["focused_panel"] = "future_panel";
+            view["navigation"]["mode"] = "future_navigation";
+            view["navigation"]["up_axis"] = "future_axis";
+            view["render_settings"]["raster_backend"] = "future_backend";
+            view["render_settings"]["camera_metrics_mode"] = 99;
+            view["tools"]["gizmo_operation"] = "future_operation";
+            sequencer["loop_mode"] = "future_loop";
+            sequencer["preferences"]["preset"] = "future_preset";
+        });
+        EXPECT_EQ(test.viewer->getRenderingManager()->getFocusedSplitPanel(), lfs::vis::SplitViewPanelId::Left);
+        EXPECT_EQ(test.viewer->getInputController()->cameraNavigationMode(),
+                  lfs::vis::InputController::CameraNavigationMode::Orbit);
+        EXPECT_EQ(test.viewer->getInputController()->navigationUpAxis(), lfs::vis::NavigationUpAxis::LegacyY);
+        EXPECT_EQ(test.viewer->getRenderingManager()->getSettings().raster_backend,
+                  lfs::vis::RenderSettings{}.raster_backend);
+        EXPECT_EQ(test.viewer->getGuiManager()->gizmo().getOperation(), lfs::vis::gui::GizmoOperation::Translate);
+        EXPECT_EQ(test.viewer->getGuiManager()->sequencer().loopMode(), lfs::vis::LoopMode::ONCE);
+        EXPECT_EQ(test.viewer->getGuiManager()->getSequencerUIState().preset, lfs::io::video::VideoPreset::CUSTOM);
+        EXPECT_EQ(prepared.unsupported_settings.size(), 8u);
+    }
+
+    TEST(P5SessionChapterTest, PolygonCropShapeRestoresAndIsCapturedAgain) {
+        UnknownSessionValueFixture test;
+        auto prepared = test.restore("crop-polygon", [](Json& view, Json&, Json&) {
+            view["tools"]["crop_shape"] = "polygon";
+        });
+        EXPECT_TRUE(prepared.unsupported_settings.empty());
+        EXPECT_EQ(test.viewer->getGuiManager()->gizmo().cropToolShape(), "polygon");
+        auto captured = require_result(captureGuiSession(*test.viewer, ProjectSessionChapters{}, test.bookmarks));
+        EXPECT_EQ(json_root(captured.view.dom())["tools"]["crop_shape"], "polygon");
+    }
+
+    TEST(P5SessionChapterTest, UnknownNavigationAxisWarnsAndUsesLegacyY) {
+        UnknownSessionValueFixture test;
+        auto prepared = test.restore("axis", [](Json& view, Json&, Json&) {
+            view["navigation"]["up_axis"] = "future_axis";
+        });
+        EXPECT_EQ(test.viewer->getInputController()->navigationUpAxis(), lfs::vis::NavigationUpAxis::LegacyY);
+        ASSERT_EQ(prepared.unsupported_settings.size(), 1u);
+        EXPECT_EQ(prepared.unsupported_settings.front().value, "future_axis");
+        EXPECT_EQ(prepared.unsupported_settings.front().fallback, "legacy_y");
+    }
+
+    TEST(P5SessionChapterTest, NoActiveToolIsNotReportedAsANewerSetting) {
+        UnknownSessionValueFixture test;
+        auto prepared = test.restore("no-tool", [](Json& view, Json&, Json&) {
+            view["tools"]["active_tool_id"] = "";
+        });
+        EXPECT_TRUE(prepared.unsupported_settings.empty());
+    }
+
+    TEST(P5SessionChapterTest, UnknownSelectionSubmodesResetIndependently) {
+        UnknownSessionValueFixture test;
+        auto prepared = test.restore("submodes", [](Json& view, Json&, Json&) {
+            view["tools"]["selection_submode"] = "future_selection";
+            view["tools"]["active_submode_id"] = "future_active";
+        });
+        EXPECT_EQ(test.viewer->getGuiManager()->gizmo().getSelectionSubMode(), lfs::vis::SelectionSubMode::Centers);
+        // The active submode belongs to whichever tool was active, so only the selection mode is checked.
+        ASSERT_EQ(prepared.unsupported_settings.size(), 1u);
+        EXPECT_EQ(prepared.unsupported_settings[0].value, "future_selection");
+    }
+
+    TEST(P5SessionChapterTest, DeprecatedScenePanelTabIsIgnoredAndNoLongerWritten) {
+        UnknownSessionValueFixture test;
+        for (const char* value : {"history", "logging", "future_tab"}) {
+            auto prepared = test.restore(value, [&](Json&, Json& gui, Json&) {
+                gui["layouts"][0]["areas"][0]["spaces"][1]["opaque_payload"]["active_tabs"]["scene_panel"] = value;
+            });
+            EXPECT_TRUE(prepared.unsupported_settings.empty()) << value;
+        }
+        auto captured = require_result(captureGuiSession(*test.viewer, ProjectSessionChapters{}, test.bookmarks));
+        const auto gui = json_root(captured.gui_layout.dom());
+        EXPECT_FALSE(gui["layouts"][0]["areas"][0]["spaces"][1]["opaque_payload"]["active_tabs"].contains("scene_panel"));
+    }
+
+    // Fails if a submode this version saves, from any tool or none, reads back as a newer-version setting.
+    TEST(P5SessionChapterTest, SavedToolSubmodesAreNotReportedAsNewerSettings) {
+        UnknownSessionValueFixture test;
+        for (const char* value : {"", "local", "x", "plugin.paint"}) {
+            auto prepared = test.restore(std::string("submode_") + value, [&](Json& view, Json&, Json&) {
+                view["tools"]["active_submode_id"] = value;
+            });
+            EXPECT_TRUE(prepared.unsupported_settings.empty()) << value;
+        }
+    }
+
+    // Fails if a plugin's tool or tab, missing only because the plugin is not loaded,
+    // reads back as a newer-version setting.
+    TEST(P5SessionChapterTest, ItemsFromUnloadedPluginsAreNotReportedAsNewerSettings) {
+        UnknownSessionValueFixture test;
+        const auto restore = [&](const char* name, const char* tool, const char* tab) {
+            return test.restore(name, [&](Json& view, Json& gui, Json&) {
+                view["tools"]["active_tool_id"] = tool;
+                gui["layouts"][0]["areas"][0]["spaces"][1]["opaque_payload"]["active_tabs"]["main_panel"] = tab;
+            });
+        };
+        EXPECT_TRUE(restore("plugin", "camera_selector.pick", "lfs_plugins.camera_selector.Panel")
+                        .unsupported_settings.empty());
+        EXPECT_EQ(restore("builtin", "builtin.future_tool", "lfs.future_panel").unsupported_settings.size(), 2u);
+    }
+
+    TEST(P5SessionChapterTest, UnknownValuesSurviveCaptureAndResave) {
+        UnknownSessionValueFixture test;
+        auto prepared = test.restore("preserve", [&](Json& view, Json& gui, Json& sequencer) {
+            view["navigation"]["up_axis"] = "future_axis";
+            view["panel_cameras"][0]["panel"] = "future_camera_role";
+            view["render_settings"]["camera_metrics_mode"] = 99;
+            auto& payload = gui["layouts"][0]["areas"][0]["spaces"][1]["opaque_payload"];
+            payload["panels"] = Json::array({{{"id", test.panel_id}, {"space", "future_space"}}});
+            payload["active_tabs"]["main_panel"] = "future_main_panel";
+            sequencer["preferences"]["preset"] = "future_preset";
+        });
+        auto captured = require_result(captureGuiSession(*test.viewer, prepared.chapters, test.bookmarks));
+        auto document = require_result(ProjectDocument::open(test.temporary.path / "preserve.licht"));
+        document.edit_view() = captured.view;
+        document.edit_gui_layout() = captured.gui_layout;
+        document.edit_sequencer() = captured.sequencer;
+        (void)require_result(document.save(test.temporary.path / "preserve.licht"));
+        auto reopened = require_result(ProjectDocument::open(test.temporary.path / "preserve.licht"));
+        const auto view = json_root(reopened.view().dom());
+        const auto gui = json_root(reopened.gui_layout().dom());
+        const auto sequencer = json_root(reopened.sequencer().dom());
+        EXPECT_EQ(view["navigation"]["up_axis"], "future_axis");
+        EXPECT_EQ(view["panel_cameras"][0]["panel"], "future_camera_role");
+        EXPECT_EQ(view["render_settings"]["camera_metrics_mode"], 99);
+        EXPECT_EQ(gui["layouts"][0]["areas"][0]["spaces"][1]["opaque_payload"]["panels"][0]["space"],
+                  "future_space");
+        EXPECT_EQ(gui["layouts"][0]["areas"][0]["spaces"][1]["opaque_payload"]["active_tabs"]["main_panel"],
+                  "future_main_panel");
+        EXPECT_EQ(sequencer["preferences"]["preset"], "future_preset");
+    }
+
     TEST(P5SessionChapterTest, SnapshotAbsolutizesRelativeDatasetPath) {
         std::filesystem::path relative{"data/bicycle"};
         ASSERT_FALSE(relative.is_absolute());
@@ -2440,6 +3269,26 @@ namespace {
             scene, params, lfs::core::generate_uuid_v4(), 1, cpu);
         ASSERT_TRUE(captured) << lfs::format_for_developer(captured.error());
         EXPECT_TRUE(cpu.parameters.dataset.data_path.is_absolute());
+    }
+
+    // A transient preview has no payload binding and is never saved, so a
+    // training snapshot leaves it out instead of failing on it.
+    TEST(P5SessionChapterTest, SnapshotLeavesTransientNodesOut) {
+        lfs::core::param::TrainingParameters params;
+        params.dataset.data_path = "data/bicycle";
+        params.optimization.strategy = std::string(lfs::core::param::kStrategyMCMC);
+        lfs::core::Scene scene;
+        const auto training = scene.addSplatPlaceholder("Train");
+        ASSERT_NE(training, lfs::core::NULL_NODE);
+        scene.setTrainingModelNode(scene.getNodeUuid(training));
+        ASSERT_NE(scene.addSplatPlaceholder("Preview"), lfs::core::NULL_NODE);
+        scene.getMutableNode("Preview")->transient = true;
+        lfs::training::ProjectSnapshotCpuState cpu;
+        auto captured = lfs::training::capture_project_snapshot_cpu_state(
+            scene, params, lfs::core::generate_uuid_v4(), 1, cpu);
+        ASSERT_TRUE(captured) << lfs::format_for_developer(captured.error());
+        EXPECT_TRUE(std::ranges::any_of(cpu.scene_graph.nodes, [](const auto& node) { return node.name == "Train"; }));
+        EXPECT_TRUE(std::ranges::none_of(cpu.scene_graph.nodes, [](const auto& node) { return node.name == "Preview"; }));
     }
 
 } // namespace

@@ -4,6 +4,8 @@
 
 import lichtfeld as lf
 
+from .rml_widgets import request_model_update
+
 
 class KeymapBindingsSection:
     """Retained key-binding editor bound onto the Preferences data model."""
@@ -16,9 +18,20 @@ class KeymapBindingsSection:
         lf.keymap.ToolMode.SCALE,
         lf.keymap.ToolMode.ALIGN,
         lf.keymap.ToolMode.CROP_BOX,
+        lf.keymap.ToolMode.WALK,
+        lf.keymap.ToolMode.VR,
+        lf.keymap.ToolMode.EDITOR,
     ]
 
     BINDING_SECTIONS = {
+        "editor": [lf.keymap.Action.EDITOR_TOGGLE_KIND, lf.keymap.Action.EDITOR_RUN, lf.keymap.Action.EDITOR_STOP],
+        "walk": [lf.keymap.Action.EXIT_WALK],
+        "vr": [
+            lf.keymap.Action.VR_SNAP_TURN_LEFT,
+            lf.keymap.Action.VR_SNAP_TURN_RIGHT,
+            lf.keymap.Action.VR_RECENTER,
+            lf.keymap.Action.EXIT_VR,
+        ],
         "navigation": [
             lf.keymap.Action.CAMERA_ORBIT,
             lf.keymap.Action.CAMERA_PAN,
@@ -39,6 +52,8 @@ class KeymapBindingsSection:
         "navigation_global": [
             lf.keymap.Action.CAMERA_RESET_HOME,
             lf.keymap.Action.CAMERA_SET_HOME,
+            lf.keymap.Action.CAMERA_RESTORE_HOME,
+            lf.keymap.Action.CAMERA_FOCUS_SELECTION,
             lf.keymap.Action.CAMERA_NEXT_VIEW,
             lf.keymap.Action.CAMERA_PREV_VIEW,
         ],
@@ -46,6 +61,12 @@ class KeymapBindingsSection:
             lf.keymap.Action.SELECTION_REPLACE,
             lf.keymap.Action.SELECTION_ADD,
             lf.keymap.Action.SELECTION_REMOVE,
+            lf.keymap.Action.SELECTION_INTERSECT,
+            lf.keymap.Action.CONFIRM_POLYGON,
+            lf.keymap.Action.CANCEL_POLYGON,
+            lf.keymap.Action.UNDO_POLYGON_VERTEX,
+            lf.keymap.Action.DELETE_SELECTED,
+            lf.keymap.Action.BRUSH_RESIZE,
         ],
         "selection_global": [
             lf.keymap.Action.SELECT_MODE_CENTERS,
@@ -57,11 +78,6 @@ class KeymapBindingsSection:
             lf.keymap.Action.SELECT_MODE_BOX,
             lf.keymap.Action.SELECT_MODE_SPHERE,
         ],
-        "selection_modal": [
-            lf.keymap.Action.CONFIRM_POLYGON,
-            lf.keymap.Action.CANCEL_POLYGON,
-            lf.keymap.Action.UNDO_POLYGON_VERTEX,
-        ],
         "depth": [
             lf.keymap.Action.TOGGLE_SELECTION_DEPTH_FILTER,
             lf.keymap.Action.TOGGLE_SELECTION_CROP_FILTER,
@@ -69,10 +85,17 @@ class KeymapBindingsSection:
         ],
         "crop_box": [
             lf.keymap.Action.APPLY_CROP_BOX,
+            lf.keymap.Action.INSERT_CROP_POLYGON_VERTEX,
+            lf.keymap.Action.REMOVE_CROP_POLYGON_VERTEX,
+        ],
+        "align": [
+            lf.keymap.Action.APPLY_ALIGNMENT,
+            lf.keymap.Action.REMOVE_LAST_POINT,
         ],
         "node_picking": [
             lf.keymap.Action.NODE_PICK,
             lf.keymap.Action.NODE_RECT_SELECT,
+            lf.keymap.Action.DELETE_NODE,
         ],
         "editing": [
             lf.keymap.Action.UNDO,
@@ -100,19 +123,28 @@ class KeymapBindingsSection:
             lf.keymap.Action.TOOL_SCALE,
             lf.keymap.Action.TOOL_MIRROR,
             lf.keymap.Action.TOOL_ALIGN,
+            lf.keymap.Action.TOOL_SCALE_DISTANCE,
             lf.keymap.Action.PIE_MENU,
         ],
         "ui_global": [
+            lf.keymap.Action.NEXT_SIDEBAR_CATEGORY,
+            lf.keymap.Action.PREVIOUS_SIDEBAR_CATEGORY,
             lf.keymap.Action.TOGGLE_UI,
             lf.keymap.Action.TOGGLE_FULLSCREEN,
             lf.keymap.Action.OPEN_PREFERENCES,
             lf.keymap.Action.SELECT_ALL_SCENE_NODES,
             lf.keymap.Action.TOGGLE_SCENE_SELECTION_VISIBILITY,
             lf.keymap.Action.TOGGLE_SCENE_SELECTION_TRAINING,
+            lf.keymap.Action.GROUP_SELECTED_SCENE_NODES,
+            lf.keymap.Action.UNGROUP_SELECTED_SCENE_NODE,
             lf.keymap.Action.TOGGLE_MCP_SERVER,
             lf.keymap.Action.TOGGLE_MCP_BINDING,
+            lf.keymap.Action.ASSET_GALLERY_PRIMARY,
+            lf.keymap.Action.ASSET_GALLERY_COPY_LINK,
+            lf.keymap.Action.ASSET_REFRESH,
             lf.keymap.Action.HISTOGRAM_ZOOM_MARKED,
             lf.keymap.Action.TOGGLE_PERFORMANCE_HUD,
+            lf.keymap.Action.TOGGLE_PYTHON_CONSOLE,
         ],
         "sequencer_global": [
             lf.keymap.Action.SEQUENCER_ADD_KEYFRAME,
@@ -146,12 +178,18 @@ class KeymapBindingsSection:
         self._last_current_profile = ""
         self._last_capturing = None
         self._rows_built = False
+        self._altgr_capture_rejected = False
+        self._search = ""
+        self._search_empty = False
 
     # ── Data model ────────────────────────────────────────────
 
     def bind(self, model):
         model.bind_func("bindings_hint", self._get_bindings_hint)
         model.bind_func("is_capturing", lambda: lf.keymap.is_capturing())
+        model.bind("binding_search", lambda: self._search, self._set_search)
+        model.bind_func("binding_search_empty", lambda: self._search_empty)
+        model.bind_event("clear_binding_search", lambda *_: self._set_search(""))
 
         model.bind(
             "profile_idx",
@@ -181,13 +219,45 @@ class KeymapBindingsSection:
         current = lf.keymap.get_current_profile()
         return profiles.index(current) if current in profiles else 0
 
+    def _set_search(self, value):
+        if lf.keymap.is_capturing():
+            return
+        value = str(value)
+        if value == self._search:
+            return
+        self._search = value
+        self._last_state_key = None
+        if self._rows_built:
+            self._rebuild_binding_rows(self.TOOL_MODES[self._selected_mode_idx])
+        if self._handle:
+            self._handle.dirty("binding_search")
+
+    @staticmethod
+    def _filter_rows(rows, query):
+        terms = query.casefold().split()
+        if not terms:
+            return rows
+        result, heading, emitted = [], None, False
+        for row in rows:
+            if row["is_section"]:
+                heading, emitted = row, False
+                continue
+            text = " ".join((heading["section_title"] if heading else "",
+                             row.get("action_name", ""), row.get("desc_text", ""))).casefold()
+            if all(term in text for term in terms):
+                if heading is not None and not emitted:
+                    result.append(heading)
+                    emitted = True
+                result.append(row)
+        return result
+
     def _set_profile_idx(self, v):
         try:
             idx = int(v)
         except (ValueError, TypeError):
             return
         profiles = lf.keymap.get_available_profiles()
-        if 0 <= idx < len(profiles):
+        if 0 <= idx < len(profiles) and profiles[idx] != lf.keymap.get_current_profile():
             self._clear_pending_conflict()
             lf.keymap.load_profile(profiles[idx])
             self._last_state_key = None
@@ -209,20 +279,24 @@ class KeymapBindingsSection:
         lf.keymap.save_profile(lf.keymap.get_current_profile())
 
     def _on_reset_default(self, _handle, _ev, _args):
+        label = lf.ui.tr("input_settings.reset_to_default")
+        lf.ui.confirm_dialog(label, lf.ui.tr("input_settings.reset_scope"),
+                             [lf.ui.tr("common.cancel"), label],
+                             lambda button: self.reset_to_default() if button == label else None)
+
+    def reset_to_default(self):
         self._clear_pending_conflict()
         lf.keymap.reset_to_default()
         self._last_state_key = None
         self._dirty_owned()
 
     def _on_export_profile(self, _handle, _ev, _args):
-        tr = lf.ui.tr
-        path = lf.ui.save_file_dialog(tr("input_settings.export_dialog_title"), "json")
+        path = lf.ui.save_json_file_dialog(lf.keymap.get_current_profile() + ".json")
         if path:
             lf.keymap.export_profile(path)
 
     def _on_import_profile(self, _handle, _ev, _args):
-        tr = lf.ui.tr
-        path = lf.ui.open_file_dialog(tr("input_settings.import_dialog_title"), "json")
+        path = lf.ui.open_json_file_dialog()
         if path:
             self._clear_pending_conflict()
             lf.keymap.import_profile(path)
@@ -241,15 +315,8 @@ class KeymapBindingsSection:
         self._dirty_owned()
 
     def _on_cancel_conflict(self, _handle, _ev, _args):
-        if not self._pending_conflict:
+        if not self._restore_pending_conflict():
             return
-        mode = self._pending_conflict["mode"]
-        action = self._pending_conflict["action"]
-        previous_trigger = self._pending_conflict.get("previous_trigger")
-        lf.keymap.clear_binding(mode, action)
-        if previous_trigger is not None:
-            lf.keymap.set_trigger_binding(mode, action, previous_trigger)
-        self._clear_pending_conflict()
         self._last_state_key = None
         self._rebuild_binding_rows(self.TOOL_MODES[self._selected_mode_idx])
         self._dirty_owned()
@@ -262,6 +329,7 @@ class KeymapBindingsSection:
         self._last_current_profile = lf.keymap.get_current_profile()
         self._rows_built = False
         self._last_state_key = None
+        self._altgr_capture_rejected = False
 
         self._rebuild_profile_records()
         self._rebuild_mode_records()
@@ -272,6 +340,7 @@ class KeymapBindingsSection:
         self._hide_conflict_overlay()
 
     def on_unmount(self):
+        self._restore_pending_conflict()
         self._doc = None
         self._handle = None
         self._rows_built = False
@@ -294,6 +363,11 @@ class KeymapBindingsSection:
             self._dirty_model()
 
         is_capturing = lf.keymap.is_capturing()
+        if lf.keymap.take_altgr_capture_rejection():
+            self._altgr_capture_rejected = True
+            self._dirty_model("bindings_hint")
+        elif not is_capturing:
+            self._altgr_capture_rejected = False
         current_profile = lf.keymap.get_current_profile()
         if self._rows_built:
             mode = self.TOOL_MODES[self._selected_mode_idx]
@@ -341,6 +415,10 @@ class KeymapBindingsSection:
             self._last_capturing = is_capturing
             self._dirty_model("is_capturing")
 
+        # The native capture ends without notifying dirty-policy panels, so keep polling until it does.
+        if self._rebinding_action is not None and self._handle:
+            request_model_update(self._handle)
+
     # ── Retained model updates ────────────────────────────────
 
     def _dirty_model(self, *fields):
@@ -359,6 +437,18 @@ class KeymapBindingsSection:
         self._pending_conflict = None
         self._previous_trigger = None
         self._hide_conflict_overlay()
+
+    def _restore_pending_conflict(self):
+        if not self._pending_conflict:
+            return False
+        mode = self._pending_conflict["mode"]
+        action = self._pending_conflict["action"]
+        previous_trigger = self._pending_conflict.get("previous_trigger")
+        lf.keymap.clear_binding(mode, action)
+        if previous_trigger is not None:
+            lf.keymap.set_trigger_binding(mode, action, previous_trigger)
+        self._clear_pending_conflict()
+        return True
 
     def _hide_conflict_overlay(self):
         if not self._doc:
@@ -391,6 +481,8 @@ class KeymapBindingsSection:
 
     def _get_bindings_hint(self):
         tr = lf.ui.tr
+        if self._altgr_capture_rejected:
+            return tr("input_settings.altgr_capture_unsupported")
         mode = self.TOOL_MODES[self._selected_mode_idx]
         if mode == lf.keymap.ToolMode.GLOBAL:
             return tr("input_settings.global_bindings_hint")
@@ -432,6 +524,7 @@ class KeymapBindingsSection:
             is_capturing,
             current_profile,
             current_lang,
+            lf.keymap.bindings_revision(),
         )
 
     def ensure_binding_rows(self):
@@ -454,6 +547,12 @@ class KeymapBindingsSection:
         tr = lf.ui.tr
         rows = []
 
+        if mode == lf.keymap.ToolMode.EDITOR:
+            self._append_binding_section(rows, tr("input_settings.mode.editor"), self.BINDING_SECTIONS["editor"], mode)
+        if mode == lf.keymap.ToolMode.WALK:
+            self._append_binding_section(rows, tr("collision.walk"), self.BINDING_SECTIONS["walk"], mode)
+        if mode == lf.keymap.ToolMode.VR:
+            self._append_binding_section(rows, tr("input_settings.mode.vr"), self.BINDING_SECTIONS["vr"], mode)
         if mode == lf.keymap.ToolMode.GLOBAL:
             self._append_binding_section(
                 rows, tr("input_settings.section.navigation"),
@@ -463,13 +562,9 @@ class KeymapBindingsSection:
                 rows.append(self._binding_row_record(action, mode))
 
         if mode == lf.keymap.ToolMode.SELECTION:
-            selection_actions = list(self.BINDING_SECTIONS["selection"])
-            selection_actions.extend(self.BINDING_SECTIONS["selection_modal"])
-            selection_actions.append(lf.keymap.Action.DELETE_SELECTED)
-            selection_actions.append(lf.keymap.Action.BRUSH_RESIZE)
             self._append_binding_section(
                 rows, tr("input_settings.section.selection"),
-                selection_actions, mode)
+                self.BINDING_SECTIONS["selection"], mode)
 
             self._append_binding_section(
                 rows, tr("input_settings.section.depth"),
@@ -485,12 +580,15 @@ class KeymapBindingsSection:
                 rows, tr("input_settings.section.crop_box"),
                 self.BINDING_SECTIONS["crop_box"], mode)
 
+        if mode == lf.keymap.ToolMode.ALIGN:
+            self._append_binding_section(
+                rows, tr("input_settings.section.align"),
+                self.BINDING_SECTIONS["align"], mode)
+
         if mode in self.SCENE_NODE_MODES:
-            scene_node_actions = list(self.BINDING_SECTIONS["node_picking"])
-            scene_node_actions.append(lf.keymap.Action.DELETE_NODE)
             self._append_binding_section(
                 rows, tr("input_settings.section.node_picking"),
-                scene_node_actions, mode)
+                self.BINDING_SECTIONS["node_picking"], mode)
 
         editing_rows = []
         if mode == lf.keymap.ToolMode.GLOBAL:
@@ -528,6 +626,11 @@ class KeymapBindingsSection:
             actions = [getattr(lf.keymap.Action, name) for name, *_ in SHORTCUTS if hasattr(lf.keymap.Action, name)]
             if actions:
                 self._append_binding_section(rows, tr("preferences.gallery.shortcuts"), actions, mode)
+        rows = self._filter_rows(rows, self._search)
+        search_empty = not any(not row["is_section"] for row in rows)
+        if search_empty != self._search_empty:
+            self._search_empty = search_empty
+            self._handle.dirty("binding_search_empty")
         self._handle.update_record_list("binding_rows", rows)
 
     def _binding_row_record(self, action, mode):
@@ -573,6 +676,9 @@ class KeymapBindingsSection:
             "button_action": button_action,
             "button_label": button_label,
             "button_class": button_class,
+            "show_clear": (not lf.keymap.is_capturing() and
+                           lf.keymap.get_trigger(action, mode) is not None),
+            "clear_label": tr("input_settings.clear_binding"),
             "action_id": action_val,
             "mode_id": mode_val,
         }
@@ -636,6 +742,12 @@ class KeymapBindingsSection:
             self._rebinding_mode = None
             self._previous_trigger = None
             self._last_state_key = None
+            self._dirty_owned()
+        elif btn_action == "clear":
+            self._clear_pending_conflict()
+            lf.keymap.clear_binding(mode, action)
+            self._last_state_key = None
+            self._rebuild_binding_rows(self.TOOL_MODES[self._selected_mode_idx])
             self._dirty_owned()
 
     def _find_btn_action(self, element):

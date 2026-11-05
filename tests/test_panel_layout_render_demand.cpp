@@ -9,12 +9,126 @@
 #include <visualizer/gui/panel_layout.hpp>
 #include <visualizer/gui/panel_registry.hpp>
 #include <visualizer/gui/resize_geometry.hpp>
+#include <visualizer/gui/rmlui/rmlui_manager.hpp>
+#include <visualizer/gui/viewport_gizmo_geometry.hpp>
 
 #include <memory>
 #include <string>
 #include <unordered_map>
 
 namespace {
+
+    TEST(ViewportGizmoGeometryTest, SmallScaledPanelsKeepNavigationClearOfTheToolRail) {
+        using namespace lfs::vis::gui;
+        for (const float scale : {1.0f, 1.5f, 2.0f}) {
+            EXPECT_TRUE(viewportGizmoFits(209.0f * scale, 164.0f * scale, scale));
+            EXPECT_FALSE(viewportGizmoFits(208.0f * scale, 164.0f * scale, scale));
+            EXPECT_FALSE(viewportGizmoFits(209.0f * scale, 163.0f * scale, scale));
+            EXPECT_FALSE(viewportGizmoFits(100.0f * scale, 200.0f * scale, scale));
+        }
+    }
+
+    std::array<lfs::vis::gui::ViewportGizmoMarker, 6> homeGizmoMarkers(const float scale = 1.0f) {
+        using lfs::vis::gui::ViewportGizmoMarker;
+        std::array<ViewportGizmoMarker, 6> markers{{
+            {0, {1164.0f, 81.0f}, 8.2f, true},
+            {1, {1182.0f, 60.0f}, 8.2f, true},
+            {2, {1201.0f, 81.0f}, 8.2f, true},
+            {3, {1208.0f, 96.0f}, 8.2f, true},
+            {4, {1182.0f, 115.0f}, 8.2f, true},
+            {5, {1156.0f, 96.0f}, 8.2f, true},
+        }};
+        for (auto& marker : markers) {
+            marker.screen_pos *= scale;
+            marker.radius *= scale;
+        }
+        return markers;
+    }
+
+    TEST(ViewportGizmoGeometryTest, EveryCircleCenterSelectsItsAxisAtEveryUiScale) {
+        using namespace lfs::vis::gui;
+        for (const float scale : {1.0f, 1.5f, 2.0f}) {
+            auto markers = homeGizmoMarkers(scale);
+            for (const auto& marker : markers) {
+                EXPECT_EQ(hitTestViewportGizmoMarkers(markers, marker.screen_pos), marker.encoded_axis);
+                EXPECT_EQ(hitTestViewportGizmoMarkers(markers, marker.screen_pos + glm::vec2(scale)),
+                          marker.encoded_axis);
+            }
+            std::reverse(markers.begin(), markers.end());
+            for (const auto& marker : markers) {
+                EXPECT_EQ(hitTestViewportGizmoMarkers(markers, marker.screen_pos), marker.encoded_axis);
+            }
+        }
+    }
+
+    TEST(ViewportGizmoGeometryTest, OverlappingPositiveCirclesSelectTheNearestCenter) {
+        using namespace lfs::vis::gui;
+        std::array<ViewportGizmoMarker, 6> markers{};
+        markers[0] = {0, {10.0f, 10.0f}, 8.0f, true};
+        markers[1] = {1, {25.0f, 10.0f}, 8.0f, true};
+        EXPECT_EQ(hitTestViewportGizmoMarkers(markers, {24.0f, 10.0f}), 1);
+        EXPECT_EQ(hitTestViewportGizmoMarkers(markers, {11.0f, 10.0f}), 0);
+    }
+
+    TEST(ViewportGizmoGeometryTest, ExistingUnambiguousHitsAndMissesMatchFirstHitReference) {
+        using namespace lfs::vis::gui;
+        const auto markers = homeGizmoMarkers();
+        int checked = 0;
+        for (int y = 30; y <= 145; ++y) {
+            for (int x = 1120; x <= 1240; ++x) {
+                const glm::vec2 mouse(x, y);
+                int first = -1;
+                int hits = 0;
+                for (const auto& marker : markers) {
+                    const auto delta = mouse - marker.screen_pos;
+                    const float radius = marker.radius * VIEWPORT_AXIS_MARKER_HOVER_SCALE;
+                    if (marker.visible && glm::dot(delta, delta) <= radius * radius) {
+                        if (first == -1)
+                            first = marker.encoded_axis;
+                        ++hits;
+                    }
+                }
+                if (hits <= 1) {
+                    EXPECT_EQ(hitTestViewportGizmoMarkers(markers, mouse), first);
+                    ++checked;
+                }
+            }
+        }
+        EXPECT_GT(checked, 10000);
+    }
+
+    TEST(ViewportGizmoGeometryTest, HitToleranceIncludesBoundaryAndIgnoresHiddenMarkers) {
+        using namespace lfs::vis::gui;
+        std::array<ViewportGizmoMarker, 6> markers{};
+        EXPECT_EQ(hitTestViewportGizmoMarkers(markers, {0.0f, 0.0f}), -1);
+        markers[0] = {0, {0.0f, 0.0f}, 8.0f, true};
+        markers[1] = {1, {20.0f, 0.0f}, 8.0f, false};
+        EXPECT_EQ(hitTestViewportGizmoMarkers(markers, {9.6f, 0.0f}), 0);
+        EXPECT_EQ(hitTestViewportGizmoMarkers(markers, {11.0f, 0.0f}), -1);
+        markers[1].visible = true;
+        EXPECT_EQ(hitTestViewportGizmoMarkers(markers, {11.0f, 0.0f}), 1);
+    }
+
+    TEST(ViewportGizmoGeometryTest, PickingMatchesTheDrawnFrontMarker) {
+        using namespace lfs::vis::gui;
+        std::array<ViewportGizmoMarker, 6> markers{};
+        markers[0] = {0, {100.0f, 100.0f}, 10.0f, true, 0.5f};
+        markers[4] = {4, {108.0f, 100.0f}, 10.0f, true, 0.2f};
+        // Both circles cover the point; the front one is drawn on top.
+        EXPECT_EQ(hitTestViewportGizmoMarkers(markers, {101.0f, 100.0f}), 4);
+        // Beyond a marker's hovered edge the sphere stays free to drag.
+        EXPECT_EQ(hitTestViewportGizmoMarkers(markers, {100.0f, 112.5f}), -1);
+    }
+
+    TEST(ViewportGizmoGeometryTest, EqualDistanceAndCoincidentMarkersKeepFirstHitOrder) {
+        using namespace lfs::vis::gui;
+        std::array<ViewportGizmoMarker, 6> markers{};
+        markers[0] = {2, {0.0f, 0.0f}, 8.0f, true};
+        markers[1] = {5, {16.0f, 0.0f}, 8.0f, true};
+        EXPECT_EQ(hitTestViewportGizmoMarkers(markers, {8.0f, 0.0f}), 2);
+        markers[1].screen_pos = markers[0].screen_pos;
+        EXPECT_EQ(hitTestViewportGizmoMarkers(markers, {0.0f, 0.0f}), 2);
+    }
 
     TEST(ResizeGeometryTest, HitZoneStraddlesEdgeAtEveryUiScale) {
         using namespace lfs::vis::gui;
@@ -83,6 +197,8 @@ namespace {
             const lfs::vis::gui::PanelDirectRenderRequest& request,
             const lfs::vis::gui::PanelDrawContext&) override {
             using lfs::vis::gui::PanelDirectRenderMode;
+            last_clip_y_min = request.clip_y_min;
+            last_clip_y_max = request.clip_y_max;
             switch (request.mode) {
             case PanelDirectRenderMode::Measure:
                 break;
@@ -105,6 +221,8 @@ namespace {
             return {.handled = true, .height = height_};
         }
 
+        float last_clip_y_min = -1.0f;
+        float last_clip_y_max = -1.0f;
         int preload_count = 0;
         int draw_count = 0;
         int cached_draw_count = 0;
@@ -375,6 +493,59 @@ TEST_F(PanelLayoutRenderDemandTest, BottomDockCachedDrawsOnlyLastActivePanel) {
 
     EXPECT_EQ(first->cached_draw_count, 0);
     EXPECT_EQ(second->cached_draw_count, 1);
+}
+
+TEST_F(PanelLayoutRenderDemandTest, VerticalTabsReserveWidthInLiveAndCachedContent) {
+    using namespace lfs::vis::gui;
+    auto scene = registerPanel("test.scene.vertical", PanelSpace::SceneHeader, 120.0f);
+    auto active = registerPanel("test.active.vertical", PanelSpace::MainPanelTab, 2000.0f);
+    UIContext ui;
+    PanelDrawContext draw_ctx{.ui = &ui};
+    std::unordered_map<std::string, bool> windows;
+    std::string focus;
+    const float previous_dpi = lfs::python::get_shared_dpi_scale();
+    for (float dpi : {1.0f, 1.5f, 2.0f}) {
+        lfs::python::set_shared_dpi_scale(dpi);
+        for (float height : {320.0f, 720.0f, 1600.0f}) {
+            PanelLayoutManager layout;
+            layout.setActiveTab("test.active.vertical");
+            PanelInputState input;
+            auto s = screen();
+            s.work_size = {2400, height};
+            layout.renderRightPanel(ui, draw_ctx, true, false, windows, focus, input, s);
+            const float expected_width = layout.getRightPanelWidth() - 16.0f -
+                                         PanelLayoutManager::RIGHT_TAB_BAR_W * dpi;
+            const float expected_y = 8.0f + layout.scenePanelHeight(s.work_size.y - 16.0f, dpi) +
+                                     (PanelLayoutManager::SPLITTER_H + PanelLayoutManager::RIGHT_PANEL_SECTION_GAP) * dpi;
+            const float expected_x = s.work_size.x - layout.getRightPanelWidth() + 8 +
+                                     PanelLayoutManager::RIGHT_TAB_BAR_W * dpi;
+            EXPECT_FLOAT_EQ(active->last_draw_x, expected_x);
+            EXPECT_FLOAT_EQ(active->last_draw_width, expected_width);
+            EXPECT_FLOAT_EQ(active->last_draw_y, expected_y);
+            EXPECT_FLOAT_EQ(scene->last_draw_width, layout.getRightPanelWidth() - 16.0f);
+            EXPECT_FLOAT_EQ(scene->last_clip_y_min, 8.0f);
+            EXPECT_FLOAT_EQ(scene->last_clip_y_max, 8.0f + layout.scenePanelHeight(s.work_size.y - 16.0f, dpi));
+            EXPECT_LT(scene->last_clip_y_max, active->last_draw_y);
+            layout.renderRightPanelCached(ui, draw_ctx, true, false, windows, focus, input, s);
+            EXPECT_FLOAT_EQ(active->last_cached_x, expected_x);
+            EXPECT_FLOAT_EQ(active->last_cached_width, expected_width);
+            EXPECT_FLOAT_EQ(scene->last_cached_width, layout.getRightPanelWidth() - 16.0f);
+            EXPECT_FLOAT_EQ(scene->last_clip_y_min, 8.0f);
+            EXPECT_FLOAT_EQ(scene->last_clip_y_max, 8.0f + layout.scenePanelHeight(s.work_size.y - 16.0f, dpi));
+            // Scrolling the category rail must not scroll the panel beneath it.
+            input.mouse_x = s.work_size.x - layout.getRightPanelWidth() + 8 + 14 * dpi;
+            input.mouse_y = expected_y + 30;
+            input.mouse_wheel = -1;
+            layout.renderRightPanel(ui, draw_ctx, true, false, windows, focus, input, s);
+            EXPECT_EQ(layout.captureProjectState().tab_scroll_offset, 0);
+            // Ctrl+wheel in the content remains available to the panel.
+            input.mouse_x = active->last_draw_x + 10;
+            input.key_ctrl = true;
+            layout.renderRightPanel(ui, draw_ctx, true, false, windows, focus, input, s);
+            EXPECT_GT(layout.captureProjectState().tab_scroll_offset, 0);
+        }
+    }
+    lfs::python::set_shared_dpi_scale(previous_dpi);
 }
 
 TEST_F(PanelLayoutRenderDemandTest, CanCacheSceneHeaderWhileDrawingActiveTabLive) {
@@ -725,7 +896,12 @@ TEST_F(PanelLayoutRenderDemandTest, PanelsGrowBackWhenTheWindowGrowsAgain) {
     EXPECT_FLOAT_EQ(layout.captureProjectState().left_dock_width, 320.0f);
     EXPECT_FLOAT_EQ(layout.captureProjectState().right_panel_width, 360.0f);
 
+    lfs::python::set_shared_dpi_scale(2.0f);
+    show(ScreenState{.work_size = {1000.0f, 700.0f}});
+    EXPECT_FALSE(layout.isLeftDockVisible());
+    lfs::python::set_shared_dpi_scale(1.0f);
     show(wide);
+    EXPECT_TRUE(layout.isLeftDockVisible());
     EXPECT_FLOAT_EQ(layout.getLeftDockWidth(), 320.0f);
     EXPECT_FLOAT_EQ(layout.getRightPanelWidth(), 360.0f);
     lfs::python::set_shared_dpi_scale(previous_dpi);

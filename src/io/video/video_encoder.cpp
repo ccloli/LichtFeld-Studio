@@ -8,8 +8,12 @@
 #include "core/logger.hpp"
 #include "core/path_utils.hpp"
 #include "core/provenance.hpp"
+#include <algorithm>
+#include <cctype>
+#include <cstring>
 #include <cuda_runtime.h>
 #include <format>
+#include <optional>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -18,6 +22,8 @@ extern "C" {
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_cuda.h>
 #include <libavutil/opt.h>
+#include <libavutil/spherical.h>
+#include <libavutil/stereo3d.h>
 }
 
 namespace lfs::io::video {
@@ -35,6 +41,70 @@ namespace lfs::io::video {
                 LOG_WARN("Failed to set video provenance comment metadata");
             }
         }
+
+        std::string encoderProbeError(
+            const VideoExportOptions& options,
+            const std::string& nvenc_error,
+            const std::string& fallback_error) {
+            return std::format(
+                "H.264 encoding is unavailable for {}x{}. h264_nvenc: {}; H.264 fallback: {}",
+                options.width, options.height, nvenc_error, fallback_error);
+        }
+
+        std::string codecOpenFailure(
+            const AVCodec* codec,
+            const int width,
+            const int height,
+            const char* error) {
+            std::string reason = std::format("{} codec open failed: {}", codec->name, error);
+            // These codec-specific limits make FFmpeg's generic open error actionable; the
+            // encoder open result remains the sole capability check.
+            if (std::strcmp(codec->name, "h264_nvenc") == 0 && (width > 4096 || height > 4096)) {
+                reason += std::format(" (NVENC side limit is 4096 pixels; requested {}x{})", width, height);
+            } else if (std::strcmp(codec->name, "libopenh264") == 0 &&
+                       static_cast<std::int64_t>(width) * height > 9'437'184) {
+                reason += std::format(" (OpenH264 pixel limit is 9437184; requested {}x{})", width, height);
+            }
+            return reason;
+        }
+
+        bool applySphericalMetadata(AVFormatContext* const fmt_ctx, AVStream* const stream) {
+            if (!fmt_ctx || !stream || !stream->codecpar)
+                return false;
+
+            fmt_ctx->strict_std_compliance = FF_COMPLIANCE_UNOFFICIAL;
+            size_t spherical_size = 0;
+            auto* const spherical = av_spherical_alloc(&spherical_size);
+            if (!spherical)
+                return false;
+            spherical->projection = AV_SPHERICAL_EQUIRECTANGULAR;
+            if (!av_packet_side_data_add(&stream->codecpar->coded_side_data,
+                                         &stream->codecpar->nb_coded_side_data,
+                                         AV_PKT_DATA_SPHERICAL,
+                                         spherical,
+                                         spherical_size,
+                                         0)) {
+                av_free(spherical);
+                return false;
+            }
+
+            size_t stereo_size = 0;
+            auto* const stereo = av_stereo3d_alloc_size(&stereo_size);
+            if (!stereo)
+                return false;
+            stereo->type = AV_STEREO3D_2D;
+            if (!av_packet_side_data_add(&stream->codecpar->coded_side_data,
+                                         &stream->codecpar->nb_coded_side_data,
+                                         AV_PKT_DATA_STEREO3D,
+                                         stereo,
+                                         stereo_size,
+                                         0)) {
+                av_free(stereo);
+                return false;
+            }
+            return true;
+        }
+
     } // namespace
 
     class VideoEncoderImpl {
@@ -55,24 +125,42 @@ namespace lfs::io::video {
             if (const auto validation = validateVideoEncodingOptions(opts); !validation)
                 return std::unexpected(validation.error());
 
-            const size_t width = static_cast<size_t>(opts.width);
-            const size_t height = static_cast<size_t>(opts.height);
+            auto extension = core::path_to_utf8(path.extension());
+            std::transform(extension.begin(), extension.end(), extension.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (!extension.empty() && extension != ".mp4")
+                return std::unexpected("Video export supports only MP4 (.mp4); unsupported filename extension");
 
             width_ = opts.width;
             height_ = opts.height;
             framerate_ = opts.framerate;
-            y_plane_bytes_ = width * height;
+            framerate_denominator_ = opts.framerate_denominator;
+            render_size_ = opts.spherical_video ? VideoFrameGeometry{width_, height_} : videoCameraRenderSize(width_, height_, opts.camera_width, opts.camera_height, opts.framing);
+            mapping_ = videoFrameMapping(render_size_.width, render_size_.height, width_, height_, opts.framing);
+            reframe_ = !opts.spherical_video && opts.camera_width > 0 &&
+                       (render_size_.width != width_ || render_size_.height != height_);
+            y_plane_bytes_ = static_cast<size_t>(width_) * static_cast<size_t>(height_);
             uv_plane_bytes_ = y_plane_bytes_ / 4;
 
-            if (!tryInitNvenc(path, opts)) {
+            if (const auto nvenc_error = tryInitNvenc(path, opts); nvenc_error) {
                 cleanup();
                 LOG_INFO("NVENC unavailable, falling back to x264");
                 if (const auto result = initX264(path, opts); !result) {
+                    const std::string fallback_error = result.error();
+                    cleanup();
+                    return std::unexpected(encoderProbeError(opts, *nvenc_error, fallback_error));
+                }
+            }
+
+            if (reframe_) {
+                if (auto result = checkCuda(cudaMalloc(reinterpret_cast<void**>(&reframed_rgb_),
+                                                       y_plane_bytes_ * 3 * sizeof(float)),
+                                            "Video reframing allocation");
+                    !result) {
                     cleanup();
                     return result;
                 }
             }
-
             is_open_ = true;
             frame_count_ = 0;
             return {};
@@ -90,7 +178,7 @@ namespace lfs::io::video {
             if (!rgb_gpu_ptr) {
                 return std::unexpected("GPU frame pointer is null");
             }
-            if (width != width_ || height != height_) {
+            if (width != render_size_.width || height != render_size_.height) {
                 return std::unexpected("Frame size mismatch");
             }
 
@@ -99,8 +187,14 @@ namespace lfs::io::video {
             // Keep the expected-based API non-throwing so the GUI export
             // jthread is not terminate-on-exception (Phase 6B-3c-2).
             try {
-                return use_nvenc_ ? writeFrameNvenc(rgb_gpu_ptr, stream)
-                                  : writeFrameX264Gpu(rgb_gpu_ptr, stream);
+                const void* input = rgb_gpu_ptr;
+                if (reframe_) {
+                    reframeRgbCuda(static_cast<const float*>(input), reframed_rgb_, width, height,
+                                   width_, height_, mapping_, stream);
+                    input = reframed_rgb_;
+                }
+                return use_nvenc_ ? writeFrameNvenc(input, stream)
+                                  : writeFrameX264Gpu(input, stream);
             } catch (const lfs::Exception& e) {
                 lfs::Error error = lfs::Error(e.error())
                                        .with_context("write video frame", LFS_SOURCE_SITE_CURRENT(),
@@ -144,40 +238,39 @@ namespace lfs::io::video {
         [[nodiscard]] bool isOpen() const { return is_open_; }
 
     private:
-        bool tryInitNvenc(const std::filesystem::path& path, const VideoExportOptions& opts) {
+        std::optional<std::string> tryInitNvenc(
+            const std::filesystem::path& path,
+            const VideoExportOptions& opts) {
             const AVCodec* const codec = avcodec_find_encoder_by_name("h264_nvenc");
             if (!codec) {
-                LOG_DEBUG("NVENC not available");
-                return false;
+                return "encoder unavailable";
             }
 
-            const std::string path_utf8 = lfs::core::path_to_utf8(path);
+            const std::string path_utf8 = lfs::core::path_to_native_utf8(path);
 
-            int ret = avformat_alloc_output_context2(&fmt_ctx_, nullptr, "mp4", path_utf8.c_str());
+            int ret = avformat_alloc_output_context2(
+                &fmt_ctx_, nullptr, "mp4", path_utf8.c_str());
             if (ret < 0 || !fmt_ctx_)
-                return false;
+                return "MP4 output context creation failed";
 
             stream_ = avformat_new_stream(fmt_ctx_, nullptr);
-            if (!stream_) {
-                avformat_free_context(fmt_ctx_);
-                fmt_ctx_ = nullptr;
-                return false;
-            }
+            if (!stream_)
+                return "stream creation failed";
             stream_->id = 0;
 
             codec_ctx_ = avcodec_alloc_context3(codec);
-            if (!codec_ctx_) {
-                avformat_free_context(fmt_ctx_);
-                fmt_ctx_ = nullptr;
-                return false;
-            }
+            if (!codec_ctx_)
+                return "codec context allocation failed";
 
             codec_ctx_->width = width_;
             codec_ctx_->height = height_;
-            codec_ctx_->time_base = AVRational{1, framerate_};
-            codec_ctx_->framerate = AVRational{framerate_, 1};
+            codec_ctx_->time_base = AVRational{framerate_denominator_, framerate_};
+            codec_ctx_->framerate = AVRational{framerate_, framerate_denominator_};
+            codec_ctx_->sample_aspect_ratio = AVRational{1, 1};
             codec_ctx_->pix_fmt = AV_PIX_FMT_CUDA;
-            codec_ctx_->gop_size = framerate_;
+            codec_ctx_->colorspace = AVCOL_SPC_SMPTE170M;
+            codec_ctx_->color_range = AVCOL_RANGE_MPEG;
+            codec_ctx_->gop_size = std::max(1, static_cast<int>(std::lround(static_cast<double>(framerate_) / framerate_denominator_)));
             codec_ctx_->max_b_frames = 0;
 
             av_opt_set(codec_ctx_->priv_data, "preset", "p4", 0);
@@ -191,17 +284,15 @@ namespace lfs::io::video {
 
             ret = av_hwdevice_ctx_create(&hw_device_ctx_, AV_HWDEVICE_TYPE_CUDA, nullptr, nullptr, 0);
             if (ret < 0) {
-                LOG_DEBUG("CUDA hw context failed");
-                cleanupCodecContext();
-                return false;
+                char err[AV_ERROR_MAX_STRING_SIZE];
+                av_strerror(ret, err, sizeof(err));
+                return std::string("CUDA hardware context failed: ") + err;
             }
             codec_ctx_->hw_device_ctx = av_buffer_ref(hw_device_ctx_);
 
             hw_frames_ctx_ = av_hwframe_ctx_alloc(hw_device_ctx_);
-            if (!hw_frames_ctx_) {
-                cleanupHwContexts();
-                return false;
-            }
+            if (!hw_frames_ctx_)
+                return "CUDA frame context allocation failed";
 
             auto* const frames_ctx = reinterpret_cast<AVHWFramesContext*>(hw_frames_ctx_->data);
             frames_ctx->format = AV_PIX_FMT_CUDA;
@@ -212,30 +303,35 @@ namespace lfs::io::video {
 
             ret = av_hwframe_ctx_init(hw_frames_ctx_);
             if (ret < 0) {
-                cleanupHwContexts();
-                return false;
+                char err[AV_ERROR_MAX_STRING_SIZE];
+                av_strerror(ret, err, sizeof(err));
+                return std::string("CUDA frame context initialization failed: ") + err;
             }
             codec_ctx_->hw_frames_ctx = av_buffer_ref(hw_frames_ctx_);
 
             ret = avcodec_open2(codec_ctx_, codec, nullptr);
             if (ret < 0) {
-                LOG_DEBUG("NVENC open failed");
-                cleanupHwContexts();
-                return false;
+                char err[AV_ERROR_MAX_STRING_SIZE];
+                av_strerror(ret, err, sizeof(err));
+                return codecOpenFailure(codec, width_, height_, err);
             }
 
             ret = avcodec_parameters_from_context(stream_->codecpar, codec_ctx_);
             if (ret < 0) {
-                cleanupHwContexts();
-                return false;
+                char err[AV_ERROR_MAX_STRING_SIZE];
+                av_strerror(ret, err, sizeof(err));
+                return std::string("codec parameter copy failed: ") + err;
             }
+            if (opts.spherical_video && !applySphericalMetadata(fmt_ctx_, stream_))
+                return "spherical video metadata setup failed";
             stream_->time_base = codec_ctx_->time_base;
 
             if (!(fmt_ctx_->oformat->flags & AVFMT_NOFILE)) {
                 ret = avio_open(&fmt_ctx_->pb, path_utf8.c_str(), AVIO_FLAG_WRITE);
                 if (ret < 0) {
-                    cleanupHwContexts();
-                    return false;
+                    char err[AV_ERROR_MAX_STRING_SIZE];
+                    av_strerror(ret, err, sizeof(err));
+                    return std::string("output file open failed: ") + err;
                 }
             }
 
@@ -243,35 +339,38 @@ namespace lfs::io::video {
 
             ret = avformat_write_header(fmt_ctx_, nullptr);
             if (ret < 0) {
-                cleanupHwContexts();
-                return false;
+                char err[AV_ERROR_MAX_STRING_SIZE];
+                av_strerror(ret, err, sizeof(err));
+                return std::string("MP4 header write failed: ") + err;
             }
 
             frame_ = av_frame_alloc();
+            if (!frame_)
+                return "frame allocation failed";
             ret = av_hwframe_get_buffer(hw_frames_ctx_, frame_, 0);
             if (ret < 0) {
-                cleanupHwContexts();
-                return false;
+                char err[AV_ERROR_MAX_STRING_SIZE];
+                av_strerror(ret, err, sizeof(err));
+                return std::string("NVENC frame allocation failed: ") + err;
             }
 
             packet_ = av_packet_alloc();
-            if (!packet_) {
-                cleanupHwContexts();
-                return false;
-            }
+            if (!packet_)
+                return "packet allocation failed";
 
             use_nvenc_ = true;
-            LOG_INFO("NVENC: {}x{} @ {} fps", width_, height_, framerate_);
-            return true;
+            LOG_INFO("NVENC: {}x{} @ {} fps", width_, height_, static_cast<double>(framerate_) / framerate_denominator_);
+            return std::nullopt;
         }
 
         std::expected<void, std::string> initX264(
             const std::filesystem::path& path,
             const VideoExportOptions& opts) {
 
-            const std::string path_utf8 = lfs::core::path_to_utf8(path);
+            const std::string path_utf8 = lfs::core::path_to_native_utf8(path);
 
-            int ret = avformat_alloc_output_context2(&fmt_ctx_, nullptr, "mp4", path_utf8.c_str());
+            int ret = avformat_alloc_output_context2(
+                &fmt_ctx_, nullptr, "mp4", path_utf8.c_str());
             if (ret < 0 || !fmt_ctx_) {
                 return std::unexpected("MP4 context creation failed");
             }
@@ -294,10 +393,13 @@ namespace lfs::io::video {
 
             codec_ctx_->width = width_;
             codec_ctx_->height = height_;
-            codec_ctx_->time_base = AVRational{1, framerate_};
-            codec_ctx_->framerate = AVRational{framerate_, 1};
+            codec_ctx_->time_base = AVRational{framerate_denominator_, framerate_};
+            codec_ctx_->framerate = AVRational{framerate_, framerate_denominator_};
+            codec_ctx_->sample_aspect_ratio = AVRational{1, 1};
             codec_ctx_->pix_fmt = AV_PIX_FMT_YUV420P;
-            codec_ctx_->gop_size = framerate_;
+            codec_ctx_->colorspace = AVCOL_SPC_SMPTE170M;
+            codec_ctx_->color_range = AVCOL_RANGE_MPEG;
+            codec_ctx_->gop_size = std::max(1, static_cast<int>(std::lround(static_cast<double>(framerate_) / framerate_denominator_)));
             codec_ctx_->max_b_frames = 2;
             codec_ctx_->thread_count = 0;
 
@@ -312,13 +414,15 @@ namespace lfs::io::video {
             if (ret < 0) {
                 char err[AV_ERROR_MAX_STRING_SIZE];
                 av_strerror(ret, err, sizeof(err));
-                return std::unexpected(std::string("Codec open failed: ") + err);
+                return std::unexpected(codecOpenFailure(codec, width_, height_, err));
             }
 
             ret = avcodec_parameters_from_context(stream_->codecpar, codec_ctx_);
             if (ret < 0) {
                 return std::unexpected("Codec parameters copy failed");
             }
+            if (opts.spherical_video && !applySphericalMetadata(fmt_ctx_, stream_))
+                return std::unexpected("Spherical video metadata setup failed");
             stream_->time_base = codec_ctx_->time_base;
 
             if (!(fmt_ctx_->oformat->flags & AVFMT_NOFILE)) {
@@ -359,7 +463,7 @@ namespace lfs::io::video {
 
             if (const auto allocation = allocateGpuBuffers(); !allocation)
                 return allocation;
-            LOG_INFO("x264: {}x{} @ {} fps, CRF {}", width_, height_, framerate_, opts.crf);
+            LOG_INFO("x264: {}x{} @ {} fps, CRF {}", width_, height_, static_cast<double>(framerate_) / framerate_denominator_, opts.crf);
             return {};
         }
 
@@ -468,6 +572,11 @@ namespace lfs::io::video {
         }
 
         std::expected<void, std::string> encodeFrame(AVFrame* const frame) {
+            // Both RGB conversion paths produce BT.601 limited-range planes.
+            if (frame) {
+                frame->colorspace = AVCOL_SPC_SMPTE170M;
+                frame->color_range = AVCOL_RANGE_MPEG;
+            }
             int ret = avcodec_send_frame(codec_ctx_, frame);
             if (ret < 0) {
                 char err[AV_ERROR_MAX_STRING_SIZE];
@@ -485,6 +594,10 @@ namespace lfs::io::video {
                     return std::unexpected(std::string("Receive packet error: ") + err);
                 }
 
+                // Each submitted frame spans one tick of the fixed-rate codec time base.
+                // The muxer cannot infer this from timestamps for a single-frame video.
+                if (packet_->duration <= 0)
+                    packet_->duration = 1;
                 av_packet_rescale_ts(packet_, codec_ctx_->time_base, stream_->time_base);
                 packet_->stream_index = stream_->index;
 
@@ -562,6 +675,11 @@ namespace lfs::io::video {
                 frame_ = nullptr;
             }
 
+            if (reframed_rgb_) {
+                if (const auto result = checkCuda(cudaFree(reframed_rgb_), "Video reframing release"); !result)
+                    LOG_WARN("{}", result.error());
+                reframed_rgb_ = nullptr;
+            }
             cleanupHwContexts();
             is_open_ = false;
             use_nvenc_ = false;
@@ -586,6 +704,11 @@ namespace lfs::io::video {
         int width_ = 0;
         int height_ = 0;
         int framerate_ = DEFAULT_FRAMERATE;
+        int framerate_denominator_ = 1;
+        VideoFrameGeometry render_size_{};
+        VideoFrameMapping mapping_{};
+        float* reframed_rgb_ = nullptr;
+        bool reframe_ = false;
         int64_t frame_count_ = 0;
         size_t y_plane_bytes_ = 0;
         size_t uv_plane_bytes_ = 0;

@@ -8,6 +8,18 @@
 #include <cuda_runtime.h>
 
 namespace lfs::core::nn::kernels {
+    void resample_pil_axis(const float* input, float* output, const int* bounds, const int* coefficients,
+                           int taps, int planes, int in_h, int in_w, int out_h, int out_w,
+                           bool horizontal, cudaStream_t stream);
+    void round_bfloat16(const float* input, float* output, size_t count, cudaStream_t stream);
+    void dilate_binary_disk(const float* input, float* horizontal_distance, float* output,
+                            int planes, int height, int width, int radius, cudaStream_t stream);
+    void fill_small_background(const float* input, float* output, int planes, int height, int width, float fill,
+                               cudaStream_t stream);
+    void remove_small_foreground(const float* input, float* output, int planes, int height, int width, float fill,
+                                 cudaStream_t stream);
+    void rotary_embedding_2d(const void* input, void* output, int sequences, int tokens, int dim,
+                             int height, int width, int excluded_tokens, DataType dtype, cudaStream_t stream);
 
     // Activation integers match lfs::core::nn::Activation.
     // Coord/resize integers match CoordTransform / ResizeMode.
@@ -57,10 +69,13 @@ namespace lfs::core::nn::kernels {
     // LPIPS block tail: channel-normalised, lin-weighted squared distance of two
     // fp16 NCHW feature maps accumulated into *result (caller zeroes it), with
     // an optional fused 2x2 stride-2 max pool of both maps into pooled_x/y.
+    // Optional per-position weights (row stride weights_width) are addressed at
+    // (row + weights_y0, col + weights_x0).
     void lpips_pool_reduce(const void* x, const void* y, const void* lin_weight, float* result,
                            void* pooled_x, void* pooled_y, int n, int channels, int h, int w,
                            int interior_y0, int interior_y1, int interior_x0, int interior_x1,
-                           float inv_count, cudaStream_t stream);
+                           float inv_count, const float* weights, int weights_width,
+                           int weights_y0, int weights_x0, cudaStream_t stream);
 
     void layer_norm(const void* x, const void* weight, const void* bias, void* y,
                     int rows, int cols, float eps, DataType dtype, cudaStream_t stream);
@@ -82,10 +97,19 @@ namespace lfs::core::nn::kernels {
                 int dil_h, int dil_w, int c_start, int c_count, int pad_mode, DataType dtype,
                 cudaStream_t stream);
 
+    // fp32 convolution with one input and one output channel per group; weight [C, 1, k_h, k_w], NCHW in and out.
+    void depthwise_conv2d(const float* input, const float* weight, const float* bias, float* output, int n, int c,
+                          int h, int w, int k_h, int k_w, int out_h, int out_w, int stride_h, int stride_w, int pad_h,
+                          int pad_w, int dil_h, int dil_w, int pad_mode, cudaStream_t stream);
+
     void col2im(const void* col, void* output, int n, int c, int h, int w, int k_h, int k_w,
                 int in_h, int in_w, int stride_h, int stride_w, int pad_h, int pad_w,
                 int dil_h, int dil_w, int c_start, int c_count, DataType dtype,
                 cudaStream_t stream);
+
+    void resize_bilinear_antialiased_axis(const void* input, void* output, int planes,
+                                          int in_h, int in_w, int out_h, int out_w,
+                                          bool horizontal, DataType dtype, cudaStream_t stream);
 
     void resize2d(const void* input, void* output, int n, int c, int in_h, int in_w,
                   int out_h, int out_w, int mode, int coord, DataType dtype,

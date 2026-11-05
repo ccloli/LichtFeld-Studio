@@ -25,6 +25,8 @@ namespace lfs::core {
     class Scene;
 }
 
+struct SDL_Window;
+
 namespace lfs::vis::gui {
 
     struct UIContext;
@@ -162,6 +164,11 @@ namespace lfs::vis::gui {
     class IPanel {
     public:
         virtual ~IPanel() = default;
+        [[nodiscard]] virtual SDL_Window* nativeWindow() const { return nullptr; }
+        virtual bool detachToDesktop(float, float, float, float) { return false; }
+        virtual bool restoreDesktopWindow() { return false; }
+        virtual void releaseDesktopWindow() {}
+        virtual void resetDesktopRestoreState() {}
         // Called on the GUI thread only after a native viewport drop hit test.
         virtual bool onViewportDrop(const std::string& type, const std::string& data) {
             (void)type;
@@ -219,6 +226,8 @@ namespace lfs::vis::gui {
     struct PanelInfo {
         std::shared_ptr<IPanel> panel;
         std::string label;
+        // The label as registered or set; a localization key is shown translated in the current language.
+        std::string label_source;
         std::string id;
         std::string parent_id;
         PanelSpace space = PanelSpace::Floating;
@@ -392,6 +401,9 @@ namespace lfs::vis::gui {
         std::vector<std::string> get_panel_names(PanelSpace space) const;
         std::optional<PanelDetails> get_panel(const std::string& id);
         std::shared_ptr<IPanel> get_panel_instance(const std::string& id) const;
+        std::optional<PanelDrawBounds> live_floating_bounds(const std::string& id) const;
+        [[nodiscard]] std::optional<PanelSpace>
+        default_space_for_panel(const std::string& id) const;
         [[nodiscard]] std::vector<PanelProjectState>
         capture_project_state() const;
         void apply_project_state(
@@ -400,6 +412,7 @@ namespace lfs::vis::gui {
         // placement and registration are unchanged.
         void clear_project_state_retention();
         void reset_project_state();
+        void resetDesktopRestoreState();
         [[nodiscard]] std::unordered_map<std::string, std::string>
         capture_panel_payloads() const;
         // Replaces the pending payload map. Registered panels receive their
@@ -433,6 +446,7 @@ namespace lfs::vis::gui {
         std::optional<double> nextScheduledAnimationDelayForVisiblePanels(
             PanelAnimationVisibility visibility) const;
         bool set_panel_label(const std::string& id, const std::string& new_label);
+        void refresh_localized_labels();
         bool set_panel_order(const std::string& id, int new_order);
         bool set_panel_space(const std::string& id, PanelSpace new_space);
         bool set_panel_parent(const std::string& id, const std::string& parent_id);
@@ -478,6 +492,7 @@ namespace lfs::vis::gui {
         uint64_t next_float_stack_order_ = 1;
         uint64_t registration_revision_ = 0;
         uint64_t visibility_revision_ = 0;
+        uint64_t localized_label_generation_ = 0;
         int8_t floating_cursor_dir_x_ = 0;
         int8_t floating_cursor_dir_y_ = 0;
     };

@@ -6,6 +6,7 @@ No bearer or signed URL is stored in a transfer checkpoint. Call from a worker;
 progress and checkpoint callbacks let the panel publish state on the UI thread.
 """
 from __future__ import annotations
+from _lfs_path_io import native_path
 
 import hashlib
 from http.client import IncompleteRead, RemoteDisconnected
@@ -19,8 +20,10 @@ import threading
 import urllib.parse
 import urllib.request
 import uuid
-from pathlib import Path
+from _lfs_path_io import Path
 
+from .gallery_storage import GalleryStorageError, gallery_quota, storage_requirement, is_storage_error
+from .private_directory import mkdir_private
 from .http import urlopen
 from .portal_retry import retry_call
 from .portal_account import _default_client_version
@@ -415,7 +418,7 @@ class PortalGalleryClient:
         destination = Path(destination)
         final = Path(final_destination) if final_destination else destination
         disk_preflight([(destination, total * 2), (final, total + (final.stat().st_size if final.exists() else 0))])
-        destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        mkdir_private(destination.parent, parents=True, exist_ok=True)
         partial = destination.with_name('.' + destination.name + '.part')
         if partial.is_symlink() or destination.is_symlink():
             raise ValueError("Download destination was redirected")
@@ -541,7 +544,7 @@ class PortalGalleryClient:
                 scene = {**scene, **{key: current[key] for key in
                          ('title', 'description', 'visibility', 'metadataRevision') if key in current}}
             destination_identity.validate()
-            os.replace(partial, destination)
+            os.replace(native_path(partial), native_path(destination))
             log_stage("download_complete", scene_id=scene["id"], bytes=total,
                       sha256=checksum, status="completed", path=destination.name)
             return scene
@@ -572,7 +575,7 @@ class PortalGalleryClient:
         destination = Path(destination)
         final = Path(final_destination) if final_destination else destination
         disk_preflight([(destination, total * 2), (final, total)])
-        destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        mkdir_private(destination.parent, parents=True, exist_ok=True)
         partial = destination.with_name("." + destination.name + ".part")
         if partial.is_symlink() or destination.is_symlink():
             raise ValueError("Download destination was redirected")
@@ -626,7 +629,7 @@ class PortalGalleryClient:
                 raise GalleryTransferInvalid("The gallery scene changed while downloading. Check gallery again.")
             on_checkpoint({**pin, "sha256": checksum})
             destination_identity.validate()
-            os.replace(partial, destination)
+            os.replace(native_path(partial), native_path(destination))
             return scene
         except (GalleryTransferCanceled, OSError, PortalHTTPError):
             raise
@@ -645,6 +648,7 @@ class PortalGalleryClient:
         explicit_deadline = self.processing_deadline is not None
         monotonic_deadline = time.monotonic() + max(0, min(PROCESSING_TIMEOUT, deadline - time.time()))
         poll = 0
+        logged_stage = None
         while upload.get("status") == "processing":
             if _identifier(upload.get("id")) != upload_id:
                 raise PortalProtocolError("The portal returned a different upload.")
@@ -664,8 +668,10 @@ class PortalGalleryClient:
                     raise PortalProtocolError('Invalid portal processing start time') from None
             self.processing_deadline = deadline
             poll += 1
-            log_stage("processing_wait", upload_id=upload_id, poll=poll, status=upload.get("status"),
-                      stage=state["stage"], progress=f"{state['bytesProcessed']}/{size}")
+            if state["stage"] != logged_stage:
+                logged_stage = state["stage"]
+                log_stage("processing_wait", upload_id=upload_id, poll=poll, status=upload.get("status"),
+                          stage=state["stage"], progress=f"{state['bytesProcessed']}/{size}")
             on_processing({"stage": state["stage"], "completed": state["bytesProcessed"], "total": size})
             if time.time() >= deadline or time.monotonic() >= monotonic_deadline:
                 raise GalleryProcessingTimeout('Portal is taking longer than expected · Retry / Keep waiting')
@@ -677,6 +683,8 @@ class PortalGalleryClient:
         if upload.get("status") == "conflict":
             raise PortalHTTPError(409, "sync_conflict", detail=(upload.get("conflict") or {}).get("detail"))
         if upload.get("status") == "failed":
+            if is_storage_error(upload.get("processing", {}).get("message", "")):
+                raise GalleryStorageError()
             if upload.get("processing", {}).get("retryable"):
                 raise ValueError("The portal could not finish checking this upload. Resume to retry.")
             raise ValueError("The uploaded scene is incomplete or invalid. Export it again and start a new upload.")
@@ -718,6 +726,17 @@ class PortalGalleryClient:
             if not all(isinstance(tokens.get(name), str) and tokens[name] for name in ("content", "metadata")):
                 raise PortalProtocolError("Missing gallery revision tokens")
         request = {**metadata, "sourceFormat": path.suffix.lower()[1:], "contentLength": size}
+        needed = None
+        replaced = 0
+        quota, used, free = gallery_quota(capabilities)
+        # A saved create key can own a reservation even if its response was lost.
+        # Let the portal replay that key instead of counting its space twice.
+        if checkpoint is None and free is not None:
+            replaced = self.scene(metadata["replaceSceneId"]).get("contentLength") if metadata.get("replaceSceneId") else 0
+            needed = storage_requirement(size, capabilities, request["sourceFormat"], replaced)
+            if needed > free or used > quota:
+                raise GalleryStorageError(needed, free, quota)
+
         origin = {key: metadata[key] for key in ("originProjectUuid", "originCommitUuid", "originFileUuid", "clientMutationId") if key in metadata}
         if checkpoint is None:
             checkpoint = {"origin": self.account.base_url, "owner": identity, "sha256": fingerprint,
@@ -735,6 +754,17 @@ class PortalGalleryClient:
             upload = self._request("POST", "/splats/uploads", create)
         except Exception as exc:
             log_failure("upload_create", exc, path=path.name, bytes=size)
+            if isinstance(exc, PortalHTTPError) and exc.status == 400 and is_storage_error(
+                    str(exc) + " " + str((exc.detail or {}).get("message", ""))):
+                # Quota may have changed since preflight. Do not show stale numbers.
+                try:
+                    latest = self._request("GET", "/me")
+                    quota, _, free = gallery_quota(latest)
+                    replaced = self.scene(metadata["replaceSceneId"]).get("contentLength") if metadata.get("replaceSceneId") else 0
+                    needed = storage_requirement(size, latest, request["sourceFormat"], replaced)
+                except Exception:
+                    needed = free = quota = None
+                raise GalleryStorageError(needed, free, quota) from exc
             raise
         checkpoint["request"] = {key: value for key, value in create.items() if key != "idempotencyKey"}
         upload_id = _identifier(upload["id"])
@@ -743,6 +773,8 @@ class PortalGalleryClient:
                   part_count=((size + upload["partSize"] - 1) // upload["partSize"])
                   if type(upload.get("partSize")) is int and upload.get("partSize") else 0)
         checkpoint["uploadId"] = upload_id
+        if not resuming:
+            checkpoint["reservedBytes"] = max(0, size - (replaced or 0)) if not metadata.get("replaceSceneId") or needed is not None else None
         on_checkpoint(dict(checkpoint))
         # The create response can be an idempotent replay. Storage is the
         # authority for parts acknowledged before the last local checkpoint.

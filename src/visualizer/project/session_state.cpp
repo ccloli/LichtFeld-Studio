@@ -4,15 +4,18 @@
  */
 
 #include "project/session_state.hpp"
+#include "core/native_fs.hpp"
 
 #include "core/error.hpp"
 #include "core/error_bus.hpp"
+#include "core/event_bridge/localization_manager.hpp"
 #include "core/events.hpp"
 #include "core/logger.hpp"
 #include "core/path_utils.hpp"
 #include "core/scene.hpp"
 #include "gui/editor/python_editor.hpp"
 #include "gui/error_event_bridge.hpp"
+#include "gui/error_surface_types.hpp"
 #include "gui/gui_manager.hpp"
 #include "gui/panel_layout.hpp"
 #include "gui/panel_registry.hpp"
@@ -26,6 +29,7 @@
 #include "rendering/render_constants.hpp"
 #include "rendering/rendering_manager.hpp"
 #include "sequencer/sequencer_controller.hpp"
+#include "shaders/shader_api.hpp"
 #include "tools/selection_tool.hpp"
 #include "tools/unified_tool_registry.hpp"
 #include "visualizer_impl.hpp"
@@ -33,6 +37,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <charconv>
 #include <cmath>
 #include <concepts>
 #include <cstddef>
@@ -41,7 +46,9 @@
 #include <format>
 #include <fstream>
 #include <functional>
+#include <initializer_list>
 #include <limits>
+#include <numeric>
 #include <optional>
 #include <ranges>
 #include <string>
@@ -60,6 +67,11 @@ namespace lfs::vis::project {
     namespace {
 
         using Json = SessionJson;
+
+        bool is_builtin_environment(const std::string_view path) {
+            return path == lfs::vis::kDefaultEnvironmentMapPath ||
+                   path == "environments/alps_field_1k.hdr";
+        }
 
         lfs::Error session_state_error(
             const lfs::ErrorCode code,
@@ -348,6 +360,30 @@ namespace lfs::vis::project {
             };
         }
 
+        // Written for earlier readers, which require the key; ignored when reading.
+        template <typename Owner>
+        JsonField<Owner> legacy_vec3_field(
+            const std::string_view name,
+            const glm::vec3 value) {
+            return {
+                .name = name,
+                .write = [value](const Owner&) { return vec3_json(value); },
+                .read = [](const Json&, Owner&, std::string_view, std::string_view) { return lfs::Result<void>{}; },
+            };
+        }
+
+        template <typename Owner>
+        JsonField<Owner> optional_vec3_field(const std::string_view name, glm::vec3 Owner::*member) {
+            return {.name = name,
+                    .write = [member](const Owner& source) { return vec3_json(source.*member); },
+                    .read = [member](const Json& json, Owner& destination, const std::string_view prefix, const std::string_view field) {
+                        if (!json.contains(field)) return lfs::Result<void>{};
+                        auto value = required_vec3(json, field, prefix);
+                        if (!value) return lfs::Status::failure(std::move(value).error());
+                        destination.*member = *value;
+                        return lfs::Result<void>{}; }};
+        }
+
         template <typename Owner>
         JsonField<Owner> vec3_field(
             const std::string_view name,
@@ -378,7 +414,6 @@ namespace lfs::vis::project {
             Enum Owner::*member,
             const int minimum,
             const int maximum,
-            const std::string_view invalid_detail,
             AfterAssign after_assign = nullptr) {
             return {
                 .name = name,
@@ -395,13 +430,10 @@ namespace lfs::vis::project {
                         return status;
                     }
                     if (value < minimum || value > maximum) {
-                        return fail<void>(
-                            lfs::ErrorCode::DataLoss,
-                            std::string(invalid_detail),
-                            std::string(prefix) + "." +
-                                std::string(field));
+                        destination.*member = Owner{}.*member;
+                    } else {
+                        destination.*member = static_cast<Enum>(value);
                     }
-                    destination.*member = static_cast<Enum>(value);
                     if constexpr (!std::same_as<
                                       AfterAssign,
                                       std::nullptr_t>)
@@ -609,18 +641,24 @@ namespace lfs::vis::project {
                 required_field("sh_degree", &RenderSettings::sh_degree),
                 required_field("render_scale", &RenderSettings::render_scale),
                 enum_field("camera_metrics_mode", &RenderSettings::camera_metrics_mode,
-                           0, 2, "Unsupported camera metrics mode"),
+                           0, 2),
                 required_field("show_crop_box", &RenderSettings::show_crop_box),
                 required_field("use_crop_box", &RenderSettings::use_crop_box),
                 required_field("show_ellipsoid", &RenderSettings::show_ellipsoid),
                 required_field("use_ellipsoid", &RenderSettings::use_ellipsoid),
+                optional_field("selection_outline", &RenderSettings::selection_outline),
+                optional_field("selection_outline_opacity", &RenderSettings::selection_outline_opacity),
+                optional_field("selection_outline_width", &RenderSettings::selection_outline_width),
+                optional_field("selection_outline_threshold", &RenderSettings::selection_outline_threshold),
+                optional_field("selection_outline_holes", &RenderSettings::selection_outline_holes),
+                optional_vec3_field("selection_outline_color", &RenderSettings::selection_outline_color),
                 required_field("desaturate_unselected", &RenderSettings::desaturate_unselected),
                 required_field("desaturate_cropping", &RenderSettings::desaturate_cropping),
                 required_field("hide_outside_depth_box", &RenderSettings::hide_outside_depth_box),
                 required_field("crop_filter_for_selection", &RenderSettings::crop_filter_for_selection),
                 required_field("apply_appearance_correction", &RenderSettings::apply_appearance_correction),
                 enum_field("ppisp_mode", &RenderSettings::ppisp_mode,
-                           0, 1, "Unsupported PPISP mode"),
+                           0, 1),
                 custom_field<RenderSettings>(
                     "ppisp_overrides",
                     [](const RenderSettings& settings) {
@@ -643,7 +681,7 @@ namespace lfs::vis::project {
                     }),
                 vec3_field("background_color", &RenderSettings::background_color),
                 enum_field("environment_mode", &RenderSettings::environment_mode,
-                           0, 1, "Unsupported environment mode"),
+                           0, 1),
                 custom_field<RenderSettings>(
                     "environment_reference_uuid",
                     [](const RenderSettings&) { return Json(nullptr); },
@@ -652,8 +690,7 @@ namespace lfs::vis::project {
                 custom_field<RenderSettings>(
                     "environment_builtin",
                     [](const RenderSettings& settings) {
-                        return settings.environment_map_path ==
-                                       lfs::vis::kDefaultEnvironmentMapPath
+                        return is_builtin_environment(settings.environment_map_path)
                                    ? Json(settings.environment_map_path)
                                    : Json(nullptr);
                     },
@@ -666,6 +703,8 @@ namespace lfs::vis::project {
                 optional_field("color_exposure", &RenderSettings::color_exposure),
                 optional_field("color_tonemapping", &RenderSettings::color_tonemapping),
                 optional_field("splat_render_profile", &RenderSettings::splat_render_profile),
+                optional_field("transparency_mode", &RenderSettings::transparency_mode),
+                optional_field("stochastic_max_frames", &RenderSettings::stochastic_max_frames),
                 required_field("environment_exposure", &RenderSettings::environment_exposure),
                 required_field("environment_rotation_degrees", &RenderSettings::environment_rotation_degrees),
                 required_field("show_coord_axes", &RenderSettings::show_coord_axes),
@@ -695,6 +734,7 @@ namespace lfs::vis::project {
                     }),
                 required_field("show_grid", &RenderSettings::show_grid),
                 required_field("grid_plane", &RenderSettings::grid_plane),
+                optional_field("collision_preview_opacity", &RenderSettings::collision_preview_opacity),
                 required_field("grid_opacity", &RenderSettings::grid_opacity),
                 required_field("point_cloud_mode", &RenderSettings::point_cloud_mode),
                 required_field("voxel_size", &RenderSettings::voxel_size),
@@ -703,15 +743,15 @@ namespace lfs::vis::project {
                 required_field("show_center_markers", &RenderSettings::show_center_markers),
                 required_field("show_camera_frustums", &RenderSettings::show_camera_frustums),
                 required_field("camera_frustum_scale", &RenderSettings::camera_frustum_scale),
+                optional_field("hide_disabled_camera_frustums", &RenderSettings::hide_disabled_camera_frustums),
                 vec3_field("train_camera_color", &RenderSettings::train_camera_color),
                 vec3_field("eval_camera_color", &RenderSettings::eval_camera_color),
                 required_field("show_pivot", &RenderSettings::show_pivot),
                 enum_field("split_view_mode", &RenderSettings::split_view_mode,
-                           0, 3, "Unsupported split-view mode"),
+                           0, 3),
                 enum_field("gt_comparison_mode", &RenderSettings::gt_comparison_mode,
                            std::numeric_limits<int>::min(),
                            std::numeric_limits<int>::max(),
-                           "Unsupported GT comparison mode",
                            [](RenderSettings& settings) {
                                sanitizeGTComparisonSettings(settings);
                            }),
@@ -727,17 +767,50 @@ namespace lfs::vis::project {
                     [](const Json& json, RenderSettings& settings,
                        std::string_view prefix, std::string_view field) {
                         const auto value = scalar<std::string>(json, field);
-                        if (!value ||
-                            !lfs::rendering::isGaussianRasterBackendId(*value)) {
+                        if (!value) {
                             return fail<void>(
                                 lfs::ErrorCode::DataLoss,
-                                "Unsupported raster backend",
+                                "Raster backend must be a string",
                                 std::string(prefix) + "." + std::string(field));
                         }
                         settings.raster_backend =
-                            lfs::rendering::gaussianRasterBackendFromId(*value);
+                            lfs::rendering::isGaussianRasterBackendId(*value)
+                                ? lfs::rendering::gaussianRasterBackendFromId(*value)
+                                : RenderSettings{}.raster_backend;
                         settings.gut = lfs::rendering::isGutBackend(
                             settings.raster_backend);
+                        return lfs::Result<void>{};
+                    }),
+                custom_field<RenderSettings>(
+                    "raster_backend_before_equirectangular",
+                    [](const RenderSettings& settings) {
+                        if (!settings.equirectangular ||
+                            !settings.raster_backend_before_equirectangular) {
+                            return Json(nullptr);
+                        }
+                        return Json(std::string(
+                            lfs::rendering::gaussianRasterBackendId(
+                                *settings.raster_backend_before_equirectangular)));
+                    },
+                    [](const Json& json, RenderSettings& settings,
+                       std::string_view prefix, std::string_view field) {
+                        const auto found = json.find(field);
+                        if (found == json.end() || found->is_null()) {
+                            settings.raster_backend_before_equirectangular.reset();
+                            return lfs::Result<void>{};
+                        }
+                        const auto value = scalar<std::string>(json, field);
+                        if (!value ||
+                            !lfs::rendering::isGaussianRasterBackendId(*value)) {
+                            settings.raster_backend_before_equirectangular.reset();
+                            LOG_WARN(
+                                "Ignoring unsupported optional previous raster backend in {}.{}",
+                                prefix,
+                                field);
+                            return lfs::Result<void>{};
+                        }
+                        settings.raster_backend_before_equirectangular =
+                            lfs::rendering::gaussianRasterBackendFromId(*value);
                         return lfs::Result<void>{};
                     }),
                 required_field("equirectangular", &RenderSettings::equirectangular),
@@ -749,11 +822,11 @@ namespace lfs::vis::project {
                 enum_field("depth_visualization_mode", &RenderSettings::depth_visualization_mode,
                            std::numeric_limits<int>::min(),
                            std::numeric_limits<int>::max(),
-                           "Unsupported depth visualization mode",
                            [](RenderSettings& settings) {
                                sanitizeDepthViewSettings(settings);
                            }),
-                vec3_field("selection_color_committed", &RenderSettings::selection_color_committed),
+                // Removed setting; builds before its removal fail to open a project without it.
+                legacy_vec3_field<RenderSettings>("selection_color_committed", {0.859f, 0.325f, 0.325f}),
                 vec3_field("selection_color_preview", &RenderSettings::selection_color_preview),
                 vec3_field("selection_color_center_marker", &RenderSettings::selection_color_center_marker),
                 required_field("depth_clip_enabled", &RenderSettings::depth_clip_enabled),
@@ -875,6 +948,9 @@ namespace lfs::vis::project {
         }
 
         RenderSettings settings = base;
+        // A restored project uses only its own saved projection override. In particular,
+        // never carry an unsaved override from the project that was open previously.
+        settings.raster_backend_before_equirectangular.reset();
         if (auto status = read_fields(
                 json,
                 settings,
@@ -883,7 +959,11 @@ namespace lfs::vis::project {
             !status) {
             return std::move(status).error();
         }
-        enforceProjectionBackend(settings);
+        // Earlier outline projects shared the center-marker color. Preserve
+        // their appearance while new projects save an independent color.
+        if (!json.contains("selection_outline_color"))
+            settings.selection_outline_color = settings.selection_color_center_marker;
+        enforceProjectionBackend(settings, true);
         settings.gut =
             lfs::rendering::isGutBackend(
                 settings.raster_backend);
@@ -1360,6 +1440,20 @@ namespace lfs::vis::project {
             return {};
         }
 
+        std::vector<PreparedGuiSessionRestore::UnsupportedSetting>
+        collectUnsupportedSessionSettings(
+            const Json& gui, const Json& view, const Json& sequencer);
+
+        bool namesPluginItem(const PreparedGuiSessionRestore::UnsupportedSetting& setting) {
+            static constexpr std::array<std::string_view, 3> registry_paths{
+                "tools.active_tool_id",
+                "panel_registry.active_tabs.main_panel",
+                "fixed_arrangement.bottom_dock_active_tab"};
+            const std::string_view value = setting.value;
+            return std::ranges::find(registry_paths, setting.path) != registry_paths.end() &&
+                   !value.starts_with("builtin.") && !value.starts_with("lfs.") && !value.starts_with("native.");
+        }
+
     } // namespace
 
     lfs::Result<PreparedGuiSessionRestore>
@@ -1372,6 +1466,8 @@ namespace lfs::vis::project {
         if (auto valid =
                 chapters.gui_layout.validate();
             !valid)
+            return std::move(valid).error();
+        if (auto valid = chapters.shaders.validate(); !valid)
             return std::move(valid).error();
         if (auto valid = chapters.editor.validate();
             !valid)
@@ -1423,7 +1519,14 @@ namespace lfs::vis::project {
             return std::move(valid).error();
 
         PreparedGuiSessionRestore prepared{
-            .chapters = std::move(chapters)};
+            .chapters = std::move(chapters),
+            .unsupported_settings = {}};
+        prepared.unsupported_settings =
+            collectUnsupportedSessionSettings(
+                *gui, *view, *sequencer);
+        // A plugin's tool or panel is missing whenever the plugin is not loaded,
+        // which says nothing about a newer version. Saving still keeps the value.
+        std::erase_if(prepared.unsupported_settings, namesPluginItem);
         if (references) {
             const auto env_uuid_json =
                 prepared.chapters.view.dom().get_json(
@@ -1538,7 +1641,13 @@ namespace lfs::vis::project {
     }
 
     std::optional<PreparedGuiSessionRestore>
-    GuiSessionRestoreCoordinator::takeReady() {
+    GuiSessionRestoreCoordinator::takeReady(const bool scene_ready) {
+        if (pending_ && !scene_ready) {
+            const auto files = pending_->chapters.editor.dom().get_json("open_files");
+            if (!pending_->chapters.shaders.dom().get_json("assets")->empty() ||
+                (files && std::ranges::any_of(*files, [](const auto& file) { return file.contains("kind") && file["kind"] == "shader"; })))
+                return std::nullopt;
+        }
         if (!ready())
             return std::nullopt;
         auto result = std::move(pending_);
@@ -1746,13 +1855,31 @@ namespace lfs::vis::project {
                             if (const auto parsed =
                                     video_preset_from_name(*name)) {
                                 prefs.preset = *parsed;
+                            } else {
+                                prefs.preset = lfs::io::video::VideoPreset::CUSTOM;
                             }
                         }
                         return lfs::Result<void>{};
                     }),
                 optional_field("custom_width", &Preferences::custom_width),
                 optional_field("custom_height", &Preferences::custom_height),
-                optional_field("framerate", &Preferences::framerate),
+                optional_field("camera_width", &Preferences::camera_width),
+                optional_field("camera_height", &Preferences::camera_height),
+                // Older readers only know the integer key; keep it usable.
+                custom_field<Preferences>(
+                    "framerate",
+                    [](const Preferences& prefs) {
+                        const int denominator = std::max(prefs.framerate_denominator, 1);
+                        return Json(std::clamp<int64_t>((int64_t{prefs.framerate} + denominator / 2) / denominator, 1, 1000));
+                    },
+                    [](const Json& json, Preferences& prefs, std::string_view, const std::string_view field) {
+                        if (const auto value = scalar<int>(json, field))
+                            prefs.framerate = *value;
+                        return lfs::Result<void>{};
+                    }),
+                optional_field("framerate_numerator", &Preferences::framerate),
+                optional_field("framerate_denominator", &Preferences::framerate_denominator),
+                optional_field("export_fit", &Preferences::export_fit),
                 optional_field("quality", &Preferences::quality),
             };
             return fields;
@@ -1850,6 +1977,341 @@ namespace lfs::vis::project {
             return "once";
         }
 
+        template <typename Root>
+        Root* find_json_path(Root& root, std::string_view path);
+
+        template <typename Root>
+        Root* find_space_payload(Root& root, std::string_view type);
+
+        template <typename Root>
+        Root* session_value_path(Root& root, std::string_view chapter,
+                                 std::string_view path) {
+            if (chapter == "GUIL") {
+                const auto separator = path.find('.');
+                if (separator == std::string_view::npos)
+                    return nullptr;
+                auto* payload = find_space_payload(root, path.substr(0, separator));
+                return payload ? find_json_path(*payload, path.substr(separator + 1)) : nullptr;
+            }
+            return find_json_path(root, path);
+        }
+
+        struct SessionValueSpec {
+            std::string_view chapter;
+            std::string_view path;
+            std::function<bool(const Json&)> accepts;
+            Json fallback;
+        };
+
+        const std::vector<SessionValueSpec>& session_value_specs() {
+            using Metrics = RenderSettings::CameraMetricsMode;
+            using PPISP = RenderSettings::PPISPMode;
+            using Environment = EnvironmentBackgroundMode;
+            using Comparison = GTComparisonMode;
+            using Depth = lfs::rendering::DepthVisualizationMode;
+            const auto strings = [](std::initializer_list<std::string_view> values) {
+                return [values = std::vector<std::string_view>(values)](const Json& value) {
+                    return value.is_string() &&
+                           std::ranges::find(values, value.get_ref<const std::string&>()) != values.end();
+                };
+            };
+            const auto integers = [](std::initializer_list<int> values) {
+                return [values = std::vector<int>(values)](const Json& value) {
+                    return value.is_number_integer() &&
+                           std::ranges::find(values, value.get<int>()) != values.end();
+                };
+            };
+            const auto string_parser = [](auto parser) {
+                return [parser](const Json& value) {
+                    if (!value.is_string())
+                        return false;
+                    const auto parsed = parser(value.get_ref<const std::string&>());
+                    if constexpr (requires { parsed.has_value(); })
+                        return parsed.has_value();
+                    else
+                        return static_cast<bool>(parsed);
+                };
+            };
+            static const std::vector<SessionValueSpec> specs{
+                {"VIEW", "split.focused_panel", strings({"left", "right"}), "left"},
+                {"VIEW", "navigation.mode", string_parser([](const std::string_view value) {
+                     return InputController::cameraNavigationModeFromName(value).has_value();
+                 }),
+                 "orbit"},
+                {"VIEW", "navigation.up_axis", string_parser([](const std::string_view value) {
+                     return navigationUpAxisFromName(value).has_value();
+                 }),
+                 "legacy_y"},
+                {"VIEW", "render_settings.raster_backend", string_parser([](const std::string_view value) {
+                     return lfs::rendering::isGaussianRasterBackendId(value);
+                 }),
+                 std::string(lfs::rendering::gaussianRasterBackendId(RenderSettings{}.raster_backend))},
+                {"VIEW", "render_settings.camera_metrics_mode", integers({0, 1, 2}), static_cast<int>(Metrics::Off)},
+                {"VIEW", "render_settings.transparency_mode", integers({0, 1, 2}), 0},
+                {"VIEW", "render_settings.ppisp_mode", integers({0, 1}), static_cast<int>(PPISP::AUTO)},
+                {"VIEW", "render_settings.environment_mode", integers({0, 1}), static_cast<int>(Environment::SolidColor)},
+                {"VIEW", "render_settings.split_view_mode", integers({0, 1, 2, 3}), static_cast<int>(SplitViewMode::Disabled)},
+                {"VIEW", "render_settings.gt_comparison_mode", integers({0, 1, 2}), static_cast<int>(Comparison::RGB)},
+                {"VIEW", "render_settings.depth_visualization_mode", integers({0, 1}), static_cast<int>(Depth::Palette)},
+                {"VIEW", "tools.selection_submode", string_parser([](const std::string_view value) {
+                     return selection_submode_from_name(value).has_value();
+                 }),
+                 "centers"},
+                {"VIEW", "tools.active_tool_id", string_parser([](const std::string_view value) {
+                     static constexpr std::array builtins{
+                         "builtin.select", "builtin.translate", "builtin.rotate",
+                         "builtin.scale", "builtin.mirror", "builtin.align", "builtin.cropbox"};
+                     const auto tools = UnifiedToolRegistry::instance().getAllTools();
+                     return std::ranges::find(builtins, value) != builtins.end() ||
+                            std::ranges::any_of(tools, [&](const auto* tool) {
+                                return tool && tool->id == value;
+                            });
+                 }),
+                 ""},
+                {"VIEW", "tools.gizmo_operation", strings({"translate", "rotate", "scale"}), "translate"},
+                {"VIEW", "tools.transform_space", strings({"local", "world"}), "local"},
+                {"VIEW", "tools.pivot_mode", strings({"origin", "bounds_center"}), "origin"},
+                {"VIEW", "tools.multi_transform_mode", strings({"selection", "individual"}), "selection"},
+                {"VIEW", "tools.crop_shape", strings({"box", "ellipsoid", "polygon"}), "box"},
+                {"VIEW", "tools.crop_operation", strings({"translate", "rotate", "scale"}), "translate"},
+                {"SEQR", "loop_mode", strings({"once", "loop", "ping_pong"}), "once"},
+                {"SEQR", "preferences.preset", string_parser([](const std::string_view value) {
+                     return video_preset_from_name(value).has_value();
+                 }),
+                 "custom"},
+            };
+            return specs;
+        }
+
+        std::string setting_text(const Json& value) {
+            return value.is_string() ? value.get<std::string>() : value.dump();
+        }
+
+        std::vector<PreparedGuiSessionRestore::UnsupportedSetting>
+        collectUnsupportedSessionSettings(
+            const Json& gui, const Json& view, const Json& sequencer) {
+            using Unsupported = PreparedGuiSessionRestore::UnsupportedSetting;
+            std::vector<Unsupported> result;
+            for (const auto& spec : session_value_specs()) {
+                const Json& root = spec.chapter == "GUIL"   ? gui
+                                   : spec.chapter == "VIEW" ? view
+                                                            : sequencer;
+                const auto* value = session_value_path(root, spec.chapter, spec.path);
+                // A fallback is always supported, e.g. no active tool ("").
+                if (!value || *value == spec.fallback || spec.accepts(*value))
+                    continue;
+                const auto text = setting_text(*value);
+                const auto fallback = setting_text(spec.fallback);
+                result.push_back({std::format("{}.{}", spec.chapter, spec.path), text, fallback, std::string(spec.chapter), std::string(spec.path), {}});
+            }
+
+            if (const auto cameras = find_required_array(view, "panel_cameras");
+                cameras != view.end()) {
+                bool has_primary = false;
+                bool has_secondary = false;
+                for (const auto& camera : *cameras) {
+                    const auto panel = scalar<std::string>(camera, "panel");
+                    has_primary |= panel == "primary";
+                    has_secondary |= panel == "secondary";
+                }
+                for (std::size_t index = 0; index < cameras->size(); ++index) {
+                    const auto panel = scalar<std::string>((*cameras)[index], "panel");
+                    if (panel && *panel != "primary" && *panel != "secondary") {
+                        const auto fallback = !has_primary     ? "primary"
+                                              : !has_secondary ? "secondary"
+                                              : index == 0     ? "primary"
+                                                               : "secondary";
+                        has_primary |= fallback == std::string_view("primary");
+                        has_secondary |= fallback == std::string_view("secondary");
+                        result.push_back({std::format("VIEW.panel_cameras[{}].panel", index),
+                                          *panel, fallback, "VIEW", "panel_cameras[].panel",
+                                          std::to_string(index)});
+                    }
+                }
+            }
+            if (const auto* panels = find_space_payload(gui, "panel_registry"); panels && panels->is_object()) {
+                if (const auto entries = find_required_array(*panels, "panels"); entries != panels->end()) {
+                    for (std::size_t index = 0; index < entries->size(); ++index) {
+                        const auto space = scalar<std::string>((*entries)[index], "space");
+                        if (space && !panel_space_from_name(*space)) {
+                            const auto id = scalar<std::string>((*entries)[index], "id");
+                            const auto fallback = id
+                                                      ? gui::PanelRegistry::instance()
+                                                            .default_space_for_panel(*id)
+                                                      : std::nullopt;
+                            result.push_back({std::format("GUIL.panel_registry.panels[{}].space", index),
+                                              *space,
+                                              fallback ? panel_space_name(*fallback) : "floating",
+                                              "GUIL", "panel_registry.panels",
+                                              id.value_or(std::to_string(index))});
+                        }
+                    }
+                }
+                if (const auto tabs = find_required_object(*panels, "active_tabs"); tabs != panels->end()) {
+                    const auto active = scalar<std::string>(*tabs, "main_panel");
+                    if (active && !active->empty()) {
+                        const auto available = gui::PanelRegistry::instance()
+                                                   .get_panels_for_space(
+                                                       gui::PanelSpace::MainPanelTab);
+                        if (std::ranges::none_of(available, [&](const auto& panel) {
+                                return panel.id == *active;
+                            })) {
+                            result.push_back({"GUIL.panel_registry.active_tabs.main_panel",
+                                              *active,
+                                              available.empty() ? std::string{} : available.front().id,
+                                              "GUIL",
+                                              "panel_registry.active_tabs.main_panel",
+                                              {}});
+                        }
+                    }
+                }
+            }
+            if (const auto* fixed = find_space_payload(gui, "fixed_arrangement")) {
+                const auto bottom_tab = scalar<std::string>(*fixed, "bottom_dock_active_tab");
+                if (bottom_tab && !bottom_tab->empty()) {
+                    const auto available = gui::PanelRegistry::instance()
+                                               .get_panels_for_space(
+                                                   gui::PanelSpace::BottomDock);
+                    if (std::ranges::none_of(available, [&](const auto& panel) {
+                            return panel.id == *bottom_tab;
+                        })) {
+                        result.push_back({"GUIL.fixed_arrangement.bottom_dock_active_tab",
+                                          *bottom_tab,
+                                          available.empty() ? std::string{} : available.front().id,
+                                          "GUIL",
+                                          "fixed_arrangement.bottom_dock_active_tab",
+                                          {}});
+                    }
+                }
+            }
+            return result;
+        }
+
+        template <typename Root>
+        Root* find_json_path(Root& root, const std::string_view path) {
+            Root* current = &root;
+            std::size_t begin = 0;
+            while (begin < path.size()) {
+                const auto end = path.find('.', begin);
+                const auto key = std::string(path.substr(
+                    begin, (end == std::string_view::npos ? path.size() : end) - begin));
+                if (!current->is_object())
+                    return nullptr;
+                auto found = current->find(key);
+                if (found == current->end())
+                    return nullptr;
+                current = &*found;
+                if (end == std::string_view::npos)
+                    return current;
+                begin = end + 1;
+            }
+            return nullptr;
+        }
+
+        bool edit_space_payload(lfs::io::JsonChapterDom& dom, std::string_view type,
+                                const std::function<void(Json&)>& edit) {
+            auto layouts = dom.get_json("layouts");
+            if (!layouts || !layouts->is_array())
+                return false;
+            Json root{{"layouts", std::move(*layouts)}};
+            auto* payload = find_space_payload(root, type);
+            if (!payload || !payload->is_object())
+                return false;
+            edit(*payload);
+            return static_cast<bool>(dom.set_json("layouts", std::move(root["layouts"])));
+        }
+
+        template <typename Chapters>
+        auto* session_dom(Chapters& chapters, std::string_view chapter) {
+            if (chapter == "GUIL")
+                return &chapters.gui_layout.dom();
+            if (chapter == "VIEW")
+                return &chapters.view.dom();
+            if (chapter == "SEQR")
+                return &chapters.sequencer.dom();
+            return static_cast<decltype(&chapters.view.dom())>(nullptr);
+        }
+
+        std::optional<Json> unsupported_value(
+            const lfs::io::JsonChapterDom& dom, const Json& root,
+            const PreparedGuiSessionRestore::UnsupportedSetting& setting) {
+            if (setting.chapter != "GUIL")
+                return dom.get_json(setting.path);
+            if (setting.path == "panel_registry.panels") {
+                const auto* payload = find_space_payload(root, "panel_registry");
+                const auto* panels = payload ? find_json_path(*payload, "panels") : nullptr;
+                if (!panels || !panels->is_array())
+                    return std::nullopt;
+                for (const auto& panel : *panels)
+                    if (scalar<std::string>(panel, "id") == setting.identity)
+                        if (const auto* space = find_json_path(panel, "space"))
+                            return std::optional<Json>{*space};
+                return std::nullopt;
+            }
+            const auto* value = session_value_path(root, setting.chapter, setting.path);
+            return value ? std::optional<Json>{*value} : std::nullopt;
+        }
+
+        bool restore_unsupported_value(
+            lfs::io::JsonChapterDom& dom,
+            const PreparedGuiSessionRestore::UnsupportedSetting& setting, const Json& value) {
+            if (setting.chapter != "GUIL")
+                return static_cast<bool>(dom.set_json(setting.path, value));
+            if (setting.path == "panel_registry.panels") {
+                return edit_space_payload(dom, "panel_registry", [&](Json& payload) {
+                    auto* panels = find_json_path(payload, "panels");
+                    if (!panels || !panels->is_array())
+                        return;
+                    for (auto& panel : *panels)
+                        if (scalar<std::string>(panel, "id") == setting.identity) {
+                            panel["space"] = value;
+                            return;
+                        }
+                });
+            }
+            auto layouts = dom.get_json("layouts");
+            if (!layouts || !layouts->is_array())
+                return false;
+            Json root{{"layouts", std::move(*layouts)}};
+            auto* field = session_value_path(root, setting.chapter, setting.path);
+            if (!field)
+                return false;
+            *field = value;
+            return static_cast<bool>(dom.set_json("layouts", std::move(root["layouts"])));
+        }
+
+        void preserveUnsupportedSessionSettings(
+            lfs::io::project::ProjectSessionChapters& destination,
+            const lfs::io::project::ProjectSessionChapters& source) {
+            auto source_roots = std::array{
+                chapter_root(source.gui_layout.dom(), "GUIL"),
+                chapter_root(source.view.dom(), "VIEW"),
+                chapter_root(source.sequencer.dom(), "SEQR")};
+            auto destination_roots = std::array{
+                chapter_root(destination.gui_layout.dom(), "GUIL"),
+                chapter_root(destination.view.dom(), "VIEW"),
+                chapter_root(destination.sequencer.dom(), "SEQR")};
+            if (std::ranges::any_of(source_roots, [](const auto& root) { return !root; }) ||
+                std::ranges::any_of(destination_roots, [](const auto& root) { return !root; }))
+                return;
+            for (const auto& setting : collectUnsupportedSessionSettings(
+                     *source_roots[0], *source_roots[1], *source_roots[2])) {
+                const auto* source_dom = session_dom(source, setting.chapter);
+                auto* destination_dom = session_dom(destination, setting.chapter);
+                const auto index = setting.chapter == "GUIL" ? 0u : setting.chapter == "VIEW" ? 1u
+                                                                                              : 2u;
+                const auto original = source_dom
+                                          ? unsupported_value(*source_dom, *source_roots[index], setting)
+                                          : std::nullopt;
+                const auto current = destination_dom
+                                         ? unsupported_value(*destination_dom, *destination_roots[index], setting)
+                                         : std::nullopt;
+                if (original && current && setting_text(*original) == setting.value &&
+                    setting_text(*current) == setting.fallback)
+                    (void)restore_unsupported_value(*destination_dom, setting, *original);
+            }
+        }
+
         Json editor_session_json(
             const editor::PythonEditorSessionState&
                 state) {
@@ -1881,49 +2343,29 @@ namespace lfs::vis::project {
             };
         }
 
-        Json find_space_payload(
-            const Json& root,
-            const std::string_view type) {
-            const auto layouts =
-                find_required_array(root, "layouts");
-            if (layouts == root.end())
-                return Json::object();
-            for (const auto& layout : *layouts) {
-                if (const auto active =
-                        scalar<bool>(
-                            layout, "active");
-                    active && !*active)
+        template <typename Root>
+        Root* find_space_payload(Root& root, const std::string_view type) {
+            auto* layouts = find_json_path(root, "layouts");
+            if (!layouts || !layouts->is_array())
+                return nullptr;
+            for (auto& layout : *layouts) {
+                if (scalar<bool>(layout, "active") == false)
                     continue;
-                const auto areas =
-                    find_required_array(
-                        layout, "areas");
-                if (areas == layout.end())
+                auto* areas = find_json_path(layout, "areas");
+                if (!areas || !areas->is_array())
                     continue;
-                for (const auto& area : *areas) {
-                    const auto spaces =
-                        find_required_array(
-                            area, "spaces");
-                    if (spaces == area.end())
+                for (auto& area : *areas) {
+                    auto* spaces = find_json_path(area, "spaces");
+                    if (!spaces || !spaces->is_array())
                         continue;
-                    for (const auto& space :
-                         *spaces) {
-                        const auto space_type =
-                            scalar<std::string>(
-                                space, "type");
-                        if (!space_type ||
-                            *space_type != type)
+                    for (auto& space : *spaces) {
+                        if (scalar<std::string>(space, "type") != type)
                             continue;
-                        const auto payload =
-                            space.find(
-                                "opaque_payload");
-                        if (payload !=
-                            space.end()) {
-                            return *payload;
-                        }
+                        return find_json_path(space, "opaque_payload");
                     }
                 }
             }
-            return Json::object();
+            return nullptr;
         }
 
     } // namespace
@@ -1941,6 +2383,13 @@ namespace lfs::vis::project {
         const std::span<const lfs::core::Uuid>
             omit_node_uuids) {
         auto result = retained;
+        if (const auto* service = viewer.getShaderService()) {
+            auto snapshot = service->captureProject(retained.shaders, omit_node_uuids);
+            if (!snapshot)
+                return std::move(snapshot).error();
+            result.shaders = std::move(snapshot->chapter);
+            result.shader_token = snapshot->token;
+        }
         const auto* gui_manager =
             viewer.getGuiManager();
         const auto* rendering_manager =
@@ -2021,9 +2470,6 @@ namespace lfs::vis::project {
              {
                  {"main_panel",
                   layout.active_tab_id},
-                 {"scene_panel",
-                  gui_manager
-                      ->scenePanelActiveTab()},
              }},
         };
         if (!panel_payloads.empty())
@@ -2145,7 +2591,24 @@ namespace lfs::vis::project {
                      session.items()) {
                     file[key] = value;
                 }
-                if (open_file.modified) {
+                bool embed = open_file.modified;
+                if (open_file.document.kind == editor::DocumentKind::Shader) {
+                    file["kind"] = "shader";
+                    auto target = open_file.document.target;
+                    if (std::ranges::contains(omit_node_uuids, target.node))
+                        target = {};
+                    file["target"] = shaders::shaderTarget(target);
+                    const auto asset = open_file.document.shader_asset;
+                    const auto library = result.shaders.dom().get_json("assets");
+                    const auto found = asset ? std::ranges::find_if(*library, [&](const auto& a) { return a["uuid"] == asset->to_string(); }) : library->end();
+                    embed = found == library->end() || (*found)["source"] != open_file.text;
+                    if (found != library->end())
+                        file["shader_id"] = asset->to_string();
+                    file["modified"] = embed;
+                    if (open_file.modified != embed)
+                        file["file_modified"] = open_file.modified;
+                }
+                if (embed) {
                     file["embedded_buffer"] =
                         open_file.text;
                     file["share_warning"] = true;
@@ -2198,7 +2661,13 @@ namespace lfs::vis::project {
                         continue;
                     }
                     auto entry = *found;
-                    if (!live_file.modified) {
+                    const auto known = std::ranges::find_if(live_files, [&](const auto& f) { return f["locator"] == live_file.locator; });
+                    if (entry.value("kind", std::string{}) == "shader" || live_file.document.kind == editor::DocumentKind::Shader) {
+                        for (const auto* key : {"kind", "shader_id", "target", "file_modified", "embedded_buffer", "share_warning"})
+                            if (!known->contains(key))
+                                entry.erase(key);
+                    }
+                    if (!known->contains("embedded_buffer")) {
                         entry.erase(
                             "embedded_buffer");
                         entry.erase(
@@ -2259,8 +2728,7 @@ namespace lfs::vis::project {
         auto project_render_settings =
             renderSettingsToProjectJson(settings);
         if (!settings.environment_map_path.empty() &&
-            settings.environment_map_path !=
-                lfs::vis::kDefaultEnvironmentMapPath) {
+            !is_builtin_environment(settings.environment_map_path)) {
             std::optional<lfs::core::Uuid>
                 retained_uuid;
             const auto retained_reference =
@@ -2300,7 +2768,7 @@ namespace lfs::vis::project {
                         retained_uuid->to_string();
             }
         }
-        const Json view_known{
+        Json view_known{
             {"version", 1},
             // Opening a browser-authored camera resolves its long-axis FOV
             // against this viewport. Later saves keep the native vertical FOV.
@@ -2324,6 +2792,7 @@ namespace lfs::vis::project {
                  {"view_snap",
                   input_controller
                       ->cameraViewSnapEnabled()},
+                 {"up_axis", std::string(navigationUpAxisName(input_controller->navigationUpAxis()))},
              }},
             {"split",
              {
@@ -2415,6 +2884,16 @@ namespace lfs::vis::project {
                       .show_camera_path},
              }},
         };
+        if (auto retained_view = chapter_root(result.view.dom(), "VIEW"); retained_view) {
+            const auto unsupported = collectUnsupportedSessionSettings(
+                Json::object(), *retained_view, Json::object());
+            for (const auto& setting : unsupported) {
+                if (setting.path == "panel_cameras[].panel") {
+                    const auto index = setting.fallback == "primary" ? 0u : 1u;
+                    view_known["panel_cameras"][index]["panel"] = setting.value;
+                }
+            }
+        }
         if (auto merged =
                 result.view.merge_known_state(
                     view_known);
@@ -2617,6 +3096,27 @@ namespace lfs::vis::project {
             !merged) {
             return std::move(merged).error();
         }
+        // Omission means removal for this live-owned optional field; retain
+        // the other timeline members, including extensions from newer writers.
+        if (!controller.timeline().revealClip()) {
+            if (auto removed = result.sequencer.dom().remove("timeline.reveal_clip"); !removed)
+                return std::move(removed).error();
+        }
+        if (controller.timeline().revealClip() && !controller.timeline().revealClip()->shader_id) {
+            if (auto removed = result.sequencer.dom().remove("timeline.reveal_clip.shader_id"); !removed)
+                return std::move(removed).error();
+        }
+        // The live timeline owns the key list. The additive merge preserves
+        // extension fields on surviving keys, but must not retain removed tails.
+        const auto keyframe_count = sequencer_known["timeline"]["keyframes"].size();
+        if (const auto* merged_keys = result.sequencer.dom().get_json_ref("timeline.keyframes");
+            merged_keys && merged_keys->is_array() && merged_keys->size() > keyframe_count) {
+            Json current_keys(merged_keys->begin(), merged_keys->begin() + keyframe_count);
+            if (auto set = result.sequencer.dom().set_json("timeline.keyframes", std::move(current_keys));
+                !set) {
+                return std::move(set).error();
+            }
+        }
         if (auto merged_clips =
                 result.sequencer.dom()
                     .get_json(
@@ -2659,6 +3159,8 @@ namespace lfs::vis::project {
                 trainer_manager
                     ->captureProjectMetrics();
         }
+
+        preserveUnsupportedSessionSettings(result, retained);
 
         auto prepared =
             prepareGuiSessionRestore(result);
@@ -2748,7 +3250,7 @@ namespace lfs::vis::project {
                     64U * 1024U * 1024U;
             std::error_code error;
             const auto size =
-                std::filesystem::file_size(
+                lfs::core::native_fs::file_size(
                     path, error);
             if (error)
                 return {.text = std::nullopt,
@@ -2844,10 +3346,9 @@ namespace lfs::vis::project {
                         return name &&
                                *name == panel;
                     });
-            if (found == cameras->end())
-                return std::nullopt;
-            return std::optional<Json>{
-                Json(*found)};
+            if (found != cameras->end())
+                return std::optional<Json>{Json(*found)};
+            return std::nullopt;
         }
 
         void apply_guil(
@@ -2858,9 +3359,9 @@ namespace lfs::vis::project {
             if (!gui_manager)
                 return;
 
-            const Json fixed =
-                find_space_payload(
-                    root, "fixed_arrangement");
+            const Json empty_payload = Json::object();
+            const auto* fixed_payload = find_space_payload(root, "fixed_arrangement");
+            const Json& fixed = fixed_payload ? *fixed_payload : empty_payload;
             gui::PanelLayoutProjectState layout =
                 gui_manager->panelLayout()
                     .captureProjectState();
@@ -2872,9 +3373,8 @@ namespace lfs::vis::project {
             if (!fixed.contains("tab_scroll_offset"))
                 layout.tab_scroll_offset = 0.0f;
 
-            const Json registry =
-                find_space_payload(
-                    root, "panel_registry");
+            const auto* registry_payload = find_space_payload(root, "panel_registry");
+            const Json& registry = registry_payload ? *registry_payload : empty_payload;
             if (const auto active_tabs =
                     find_required_object(
                         registry, "active_tabs");
@@ -2882,15 +3382,24 @@ namespace lfs::vis::project {
                 assign_optional(
                     *active_tabs, "main_panel",
                     layout.active_tab_id);
-                if (const auto scene_tab =
-                        scalar<std::string>(
-                            *active_tabs,
-                            "scene_panel")) {
-                    gui_manager
-                        ->setScenePanelActiveTab(
-                            *scene_tab);
-                }
+                const auto main_tabs = gui::PanelRegistry::instance()
+                                           .get_panels_for_space(
+                                               gui::PanelSpace::MainPanelTab);
+                if (!layout.active_tab_id.empty() &&
+                    std::ranges::none_of(main_tabs, [&](const auto& panel) {
+                        return panel.id == layout.active_tab_id;
+                    }))
+                    layout.active_tab_id = main_tabs.empty() ? std::string{} : main_tabs.front().id;
             }
+            const auto bottom_tabs = gui::PanelRegistry::instance()
+                                         .get_panels_for_space(
+                                             gui::PanelSpace::BottomDock);
+            if (!layout.bottom_dock_active_tab_id.empty() &&
+                std::ranges::none_of(bottom_tabs, [&](const auto& panel) {
+                    return panel.id == layout.bottom_dock_active_tab_id;
+                }))
+                layout.bottom_dock_active_tab_id =
+                    bottom_tabs.empty() ? std::string{} : bottom_tabs.front().id;
             if (const auto tree_json =
                     find_required_object(
                         fixed, "scene_tree");
@@ -2950,9 +3459,13 @@ namespace lfs::vis::project {
                             ? panel_space_from_name(
                                   *space_name)
                             : std::nullopt;
-                    if (!id || !space)
+                    if (!id)
                         continue;
                     gui::PanelProjectState state;
+                    state.space = space.value_or(
+                        gui::PanelRegistry::instance()
+                            .default_space_for_panel(*id)
+                            .value_or(gui::PanelSpace::Floating));
                     (void)read_fields(
                         saved,
                         state,
@@ -3016,9 +3529,8 @@ namespace lfs::vis::project {
 #endif
             }
 
-            const Json console =
-                find_space_payload(
-                    root, "python_console");
+            const auto* console_payload = find_space_payload(root, "python_console");
+            const Json& console = console_payload ? *console_payload : empty_payload;
             if (auto* console_state =
                     gui::panels::
                         PythonConsoleState::
@@ -3061,6 +3573,22 @@ namespace lfs::vis::project {
             }
         }
 
+        void shader_restore_warning(VisualizerImpl& viewer, const std::vector<std::string>& warnings) {
+            if (warnings.empty())
+                return;
+            std::string details;
+            for (const auto& warning : warnings) {
+                LOG_WARN("Shader restore: {}", warning);
+                if (details.size() < 2048)
+                    details += warning + "\n";
+            }
+            if (auto* gui = viewer.getGuiManager())
+                gui->enqueueToast({.title = LOC("editor.shader"),
+                                   .message = LOCF("shader.restore_warning", details),
+                                   .level = gui::ErrorNoticeLevel::Warning,
+                                   .fingerprint = std::hash<std::string>{}("shader-restore")});
+        }
+
         void apply_editor(
             VisualizerImpl& viewer,
             const Json& root) {
@@ -3098,12 +3626,34 @@ namespace lfs::vis::project {
                         file, "locator");
                 if (!locator)
                     continue;
-                const bool modified =
-                    scalar<bool>(
-                        file, "modified")
-                        .value_or(false);
+                const bool shader = scalar<std::string>(file, "kind") == "shader";
+                const bool modified = shader ? scalar<bool>(file, "file_modified").value_or(scalar<bool>(file, "modified").value_or(false)) : scalar<bool>(file, "modified").value_or(false);
+                editor::EditorDocument document;
+                if (shader) {
+                    document.kind = editor::DocumentKind::Shader;
+                    if (const auto id = scalar<std::string>(file, "shader_id"))
+                        document.shader_asset = core::Uuid::from_string(*id);
+                    if (const auto target = file.find("target"); target != file.end()) {
+                        auto parsed = shaders::parseShaderTarget(nlohmann::json::parse(target->dump()));
+                        if (parsed && viewer.getShaderService() && viewer.getShaderService()->validateTarget(*parsed))
+                            document.target = *parsed;
+                        else
+                            shader_restore_warning(viewer, {"EDTR.target: invalid shader target"});
+                    }
+                }
                 std::string text;
-                if (modified) {
+                if (shader) {
+                    const auto assets = viewer.getShaderService() ? viewer.getShaderService()->assets() : std::vector<shaders::ShaderAsset>{};
+                    const auto asset = std::ranges::find_if(assets, [&](const auto& a) { return document.shader_asset == a.id; });
+                    if (asset != assets.end()) {
+                        text = asset->source;
+                        document.asset_revision = asset->revision;
+                    } else if (document.shader_asset) {
+                        document.shader_asset.reset();
+                        shader_restore_warning(viewer, {"EDTR.shader_id: missing shader asset"});
+                    }
+                    text = scalar<std::string>(file, "embedded_buffer").value_or(text);
+                } else if (modified) {
                     text = scalar<std::string>(
                                file,
                                "embedded_buffer")
@@ -3134,6 +3684,7 @@ namespace lfs::vis::project {
                             .editor =
                                 editor_state_from_json(
                                     file),
+                            .document = document,
                         });
             }
             if (workspace.active_file &&
@@ -3234,7 +3785,7 @@ namespace lfs::vis::project {
             restored->gut =
                 lfs::rendering::isGutBackend(
                     restored->raster_backend);
-            rendering->updateSettings(*restored);
+            rendering->restoreSettingsFromProject(*restored);
 
             // The service transition creates/copies secondary panel state;
             // saved cameras therefore apply only after this call.
@@ -3310,6 +3861,9 @@ namespace lfs::vis::project {
                         viewer.getViewport(),
                         *camera);
                 }
+            } else {
+                applyPanelCameraProjectState(
+                    viewer.getViewport(), PanelCameraProjectState{});
             }
             if (const auto secondary_json =
                     panel_camera_json(
@@ -3323,6 +3877,9 @@ namespace lfs::vis::project {
                             ->projectSecondaryViewport(),
                         *camera);
                 }
+            } else {
+                applyPanelCameraProjectState(
+                    rendering->projectSecondaryViewport(), PanelCameraProjectState{});
             }
 
             if (const auto navigation =
@@ -3346,7 +3903,8 @@ namespace lfs::vis::project {
                     scalar<bool>(
                         *navigation,
                         "view_snap")
-                        .value_or(false));
+                        .value_or(false),
+                    navigationUpAxisFromName(scalar<std::string>(*navigation, "up_axis").value_or("legacy_y")).value_or(NavigationUpAxis::LegacyY));
             }
 
             bookmarks.clear();
@@ -3390,7 +3948,7 @@ namespace lfs::vis::project {
                         ->getSequencerUIState()
                         .show_camera_path);
             }
-            rendering->markDirty(DirtyFlag::ALL);
+            rendering->markDirty(DirtyFlag::ALL, lfs::vis::FrameReason::SceneChange);
         }
 
         std::optional<ToolType> builtin_tool_type(
@@ -3439,7 +3997,7 @@ namespace lfs::vis::project {
                     .armToolRestoreGuard();
                 gui_manager->panelLayout()
                     .setShowSequencer(sequencer_visible);
-                rendering->markDirty(DirtyFlag::ALL);
+                rendering->markDirty(DirtyFlag::ALL, lfs::vis::FrameReason::SceneChange);
             };
 
             const auto tools =
@@ -3506,6 +4064,11 @@ namespace lfs::vis::project {
                     lfs::core::events::tools::SetSelectionSubMode{
                         .selection_mode =
                             static_cast<int>(*parsed)}
+                        .emit();
+                } else {
+                    lfs::core::events::tools::SetSelectionSubMode{
+                        .selection_mode =
+                            static_cast<int>(SelectionSubMode::Centers)}
                         .emit();
                 }
             }
@@ -3579,26 +4142,12 @@ namespace lfs::vis::project {
                             // Disabled constructor-default boxes are not in near/far encoding.
                             if (settings
                                     ->depth_filter_enabled) {
-                                const float near_plane =
-                                    std::max(0.0f,
-                                             -settings
-                                                  ->depth_filter_max.z);
-                                const float far_plane =
-                                    std::max(near_plane + 0.01f,
-                                             -settings
-                                                  ->depth_filter_min.z);
-                                const float half_width =
-                                    std::max(
-                                        std::abs(settings
-                                                     ->depth_filter_min.x),
-                                        std::abs(settings
-                                                     ->depth_filter_max.x));
                                 selection_tool
-                                    ->setDepthFilterRange(
-                                        settings
-                                            ->depth_filter_enabled,
-                                        near_plane, far_plane,
-                                        half_width);
+                                    ->restoreDepthFilterBox(
+                                        settings->depth_filter_min,
+                                        settings->depth_filter_max,
+                                        settings->split_view_mode ==
+                                            SplitViewMode::IndependentDual);
                             }
                             auto restored =
                                 rendering->getSettings();
@@ -3642,8 +4191,8 @@ namespace lfs::vis::project {
                 const auto standard_json =
                     nlohmann::json::parse(
                         timeline->dump());
-                (void)controller.loadFromJson(
-                    standard_json);
+                if (!controller.loadFromJson(standard_json))
+                    shader_restore_warning(viewer, {"SEQR.timeline: timeline could not be restored"});
             }
 
             if (const auto clips =
@@ -3773,6 +4322,53 @@ namespace lfs::vis::project {
                     ui,
                     "SEQR.preferences",
                     sequencer_preference_fields());
+                // Older projects derived the camera framing from export size.
+                // Preserve that image when introducing an independent camera ratio.
+                if (!preferences->contains("camera_width") || !preferences->contains("camera_height") ||
+                    ui.camera_width < 1 || ui.camera_width > 8192 || ui.camera_height < 1 || ui.camera_height > 8192) {
+                    const int width = std::clamp(ui.outputWidth(), 1, 8192);
+                    const int height = std::clamp(ui.outputHeight(), 1, 8192);
+                    const int divisor = std::gcd(width, height);
+                    ui.camera_width = width / divisor;
+                    ui.camera_height = height / divisor;
+                }
+                const auto fps_integer = [&](const char* key) -> std::optional<int> {
+                    const auto value = preferences->find(key);
+                    if (value == preferences->end())
+                        return std::nullopt;
+                    if (value->is_number_unsigned()) {
+                        const auto number = value->get<uint64_t>();
+                        return std::in_range<int>(number) ? std::optional(static_cast<int>(number)) : std::nullopt;
+                    }
+                    if (!value->is_number_integer())
+                        return std::nullopt;
+                    const auto number = value->get<int64_t>();
+                    return std::in_range<int>(number) ? std::optional(static_cast<int>(number)) : std::nullopt;
+                };
+                const auto legacy_fps = fps_integer("framerate");
+                const auto numerator = fps_integer("framerate_numerator");
+                const auto denominator = fps_integer("framerate_denominator");
+                const auto valid_rate = [](const int n, const int d) {
+                    return d > 0 && n >= d && int64_t{n} <= 1000LL * d;
+                };
+                ui.framerate = std::clamp(legacy_fps.value_or(30), 1, 1000);
+                ui.framerate_denominator = 1;
+                if (numerator && denominator && valid_rate(*numerator, *denominator)) {
+                    const auto rounded = (int64_t{*numerator} + *denominator / 2) / *denominator;
+                    // Old writers preserve unknown exact fields. A changed legacy
+                    // value must win over the stale pair they leave behind.
+                    if (!legacy_fps || *legacy_fps < 1 || *legacy_fps > 1000 || *legacy_fps == rounded) {
+                        ui.framerate = *numerator;
+                        ui.framerate_denominator = *denominator;
+                    }
+                } else if (!preferences->contains("framerate_numerator") && legacy_fps && denominator &&
+                           valid_rate(*legacy_fps, *denominator)) {
+                    // Earlier revisions stored the numerator in the legacy key.
+                    ui.framerate = *legacy_fps;
+                    ui.framerate_denominator = *denominator;
+                }
+                if (!preferences->contains("export_fit") || ui.export_fit < 0 || ui.export_fit > 2)
+                    ui.export_fit = 0;
             }
             // Controller values are canonical over the UI mirrors.
             ui.playback_speed =
@@ -3835,11 +4431,36 @@ namespace lfs::vis::project {
         // keep the event callback noexcept if memory corruption intervenes.
         if (!gui || !editor || !view || !sequencer)
             return;
-
+        for (const auto& spec : session_value_specs()) {
+            Json& root = spec.chapter == "GUIL"   ? *gui
+                         : spec.chapter == "VIEW" ? *view
+                                                  : *sequencer;
+            if (auto* value = session_value_path(root, spec.chapter, spec.path);
+                value && !spec.accepts(*value))
+                *value = spec.fallback;
+        }
         // Panel registration can finish before a newly-visible console has
         // rendered its first frame. Materialize the session owner now so
         // GUIL console settings and EDTR are never consumed by a null owner.
         (void)gui::panels::PythonConsoleState::getInstance();
+
+        if (!prepared.unsupported_settings.empty()) {
+            std::string values;
+            for (const auto& setting : prepared.unsupported_settings) {
+                if (!values.empty())
+                    values += ", ";
+                values += setting.field + "=" + setting.value;
+            }
+            LOG_WARN("Project contains settings from a newer version; fallbacks were used: {}", values);
+            if (auto* gui_manager = viewer.getGuiManager()) {
+                gui_manager->enqueueToast({
+                    .title = LOC("project.session.newer_settings.title"),
+                    .message = LOCF("project.session.newer_settings.message", values),
+                    .level = gui::ErrorNoticeLevel::Warning,
+                    .fingerprint = std::hash<std::string>{}("project-session-newer-settings"),
+                });
+            }
+        }
 
         // VIEW (except tools), GUIL, EDTR, and SEQR apply at the panels-ready
         // boundary. Functional tool activation waits for hydration + SELM.
@@ -3847,10 +4468,35 @@ namespace lfs::vis::project {
             viewer, *view, bookmarks,
             prepared.environment_map_path);
         apply_guil(viewer, *gui);
-        apply_editor(viewer, *editor);
+        if (auto* service = viewer.getShaderService()) {
+            std::optional<core::Uuid> reveal;
+            auto& timeline = (*sequencer)["timeline"];
+            if (timeline.contains("reveal_clip") && timeline["reveal_clip"].is_object()) {
+                auto& clip = timeline["reveal_clip"];
+                if (clip.contains("effect") && clip["effect"] == 12) {
+                    if (const auto id = scalar<std::string>(clip, "shader_id"))
+                        reveal = core::Uuid::from_string(*id);
+                    const auto assets = prepared.chapters.shaders.dom().get_json("assets");
+                    if (!reveal || std::ranges::none_of(*assets, [&](const auto& a) { return a["uuid"] == reveal->to_string(); })) {
+                        timeline.erase("reveal_clip");
+                        reveal.reset();
+                        shader_restore_warning(viewer, {"SEQR.reveal_clip: missing shader asset; only this clip was skipped"});
+                    }
+                }
+            }
+            shader_restore_warning(viewer, service->restoreProject(prepared.chapters.shaders, reveal));
+        }
         apply_sequencer(
             viewer, *sequencer,
             prepared.ply_sequence_directory);
+        apply_editor(viewer, *editor);
+        if (auto* service = viewer.getShaderService()) {
+            auto restored = service->captureProject(prepared.chapters.shaders);
+            if (restored)
+                service->clearDirtyIfUnchanged(restored->token);
+            else
+                shader_restore_warning(viewer, {std::string(restored.error().user_message())});
+        }
         if (auto* trainer =
                 viewer.getTrainerManager()) {
             trainer->restoreProjectMetrics(
@@ -3858,7 +4504,7 @@ namespace lfs::vis::project {
         }
         if (auto* rendering =
                 viewer.getRenderingManager()) {
-            rendering->markDirty(DirtyFlag::ALL);
+            rendering->markDirty(DirtyFlag::ALL, lfs::vis::FrameReason::SceneChange);
         }
     }
 

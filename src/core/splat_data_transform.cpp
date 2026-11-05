@@ -8,6 +8,7 @@
 #include "core/cuda/splat_transform.hpp"
 #include "core/logger.hpp"
 #include "core/point_cloud.hpp"
+#include "core/scene.hpp"
 #include "core/sh_value_quant.hpp"
 #include "core/splat_data.hpp"
 #include "geometry/bounding_box.hpp"
@@ -15,6 +16,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <format>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/quaternion.hpp>
 #include <limits>
@@ -27,6 +29,42 @@
 namespace lfs::core {
 
     namespace {
+
+        // Bounds between the 1st and 99th percentile of every axis of [N, 3] positions. Host positions use selection
+        // instead of a full sort: the same order statistics without the seconds a sort of millions of points takes.
+        void percentile_bounds(const Tensor& means, glm::vec3& min_bounds, glm::vec3& max_bounds, const float padding) {
+            LFS_ASSERT(means.ndim() == 2 && means.size(1) == 3 && means.dtype() == DataType::Float32);
+            const int64_t n = means.size(0);
+            const int64_t lo = n / 100;
+            const int64_t hi = n - 1 - lo;
+            if (means.device() == Device::CUDA) {
+                for (int i = 0; i < 3; ++i) {
+                    const auto sorted = means.slice(1, i, i + 1).squeeze(1).sort(0, false).first;
+                    min_bounds[i] = sorted[lo].item() - padding;
+                    max_bounds[i] = sorted[hi].item() + padding;
+                }
+                return;
+            }
+            const auto host = means.contiguous();
+            const float* const data = host.ptr<float>();
+            // NaN orders last so the comparison stays a strict weak ordering.
+            const auto less = [](const float a, const float b) { return a < b || (!std::isnan(a) && std::isnan(b)); };
+            std::array<std::vector<float>, 3> columns;
+            for (auto& column : columns)
+                column.resize(static_cast<size_t>(n));
+#pragma omp parallel for num_threads(3) if (n > 100000)
+            for (int axis = 0; axis < 3; ++axis) {
+                auto& column = columns[static_cast<size_t>(axis)];
+                for (int64_t row = 0; row < n; ++row)
+                    column[static_cast<size_t>(row)] = data[row * 3 + axis];
+                const auto lower = column.begin() + lo;
+                const auto upper = column.begin() + hi;
+                std::nth_element(column.begin(), lower, column.end(), less);
+                std::nth_element(lower + 1, upper, column.end(), less);
+                min_bounds[axis] = *lower - padding;
+                max_bounds[axis] = *upper + padding;
+            }
+        }
 
         constexpr double SH_C1 = 0.48860251190291987;
         constexpr double SH_C2_0 = 1.0925484305920792;
@@ -465,6 +503,49 @@ namespace lfs::core {
         return inside_both.all(std::span<const int>(reduce_dims), false);
     }
 
+    Tensor compute_crop_polygon_mask(const Tensor& means,
+                                     const std::span<const glm::vec2> vertices,
+                                     const float half_depth,
+                                     const glm::mat4& points_to_polygon) {
+        LFS_ASSERT_MSG(means.is_valid(), "crop polygon means must be valid");
+        LFS_ASSERT_MSG(means.dtype() == DataType::Float32, "crop polygon means must be Float32");
+        LFS_ASSERT_MSG(means.ndim() == 2, "crop polygon means must be a 2D tensor");
+        LFS_ASSERT_MSG(means.size(1) >= 3, "crop polygon means must have at least three columns");
+        LFS_ASSERT_MSG(crop_polygon::isValidOutline(vertices) && crop_polygon::isValidHalfDepth(half_depth),
+                       "crop polygon outline and depth must be valid");
+
+        const size_t num_points = static_cast<size_t>(means.size(0));
+        const auto device = means.device();
+        const auto rotation = Tensor::from_vector(
+            {points_to_polygon[0][0], points_to_polygon[1][0], points_to_polygon[2][0],
+             points_to_polygon[0][1], points_to_polygon[1][1], points_to_polygon[2][1],
+             points_to_polygon[0][2], points_to_polygon[1][2], points_to_polygon[2][2]},
+            {3, 3},
+            device);
+        const auto translation = Tensor::from_vector(
+            {points_to_polygon[3][0], points_to_polygon[3][1], points_to_polygon[3][2]},
+            {1, 3},
+            device);
+        const auto local_pos = means.slice(1, 0, 3).mm(rotation.t()).add(translation);
+        const auto x = local_pos.slice(1, 0, 1).squeeze(1);
+        const auto y = local_pos.slice(1, 1, 2).squeeze(1);
+        const auto z = local_pos.slice(1, 2, 3).squeeze(1);
+
+        // Even-odd rule, vectorised over points with one pass per edge.
+        auto crossings = Tensor::zeros({num_points}, device, DataType::Bool);
+        for (size_t i = 0, j = vertices.size() - 1; i < vertices.size(); j = i++) {
+            const glm::vec2 a = vertices[i];
+            const glm::vec2 b = vertices[j];
+            if (a.y == b.y)
+                continue; // A horizontal edge never straddles a scanline.
+            const float slope = (b.x - a.x) / (b.y - a.y);
+            const auto straddles = (y < a.y).logical_xor(y < b.y);
+            crossings = crossings.logical_xor(straddles.logical_and(x < (y - a.y) * slope + a.x));
+        }
+
+        return (z <= half_depth).logical_and(z >= -half_depth).logical_and(crossings);
+    }
+
     static Tensor compute_cropbox_mask(const Tensor& means,
                                        const lfs::geometry::BoundingBox& bounding_box) {
         const glm::mat4 points_to_cropbox = bounding_box.hasFullTransform()
@@ -646,6 +727,29 @@ namespace lfs::core {
         const auto dist_sq = x * x + y * y + z * z;
         const auto inside_mask = dist_sq <= 1.0f;
         const auto delete_mask = inverse ? inside_mask : inside_mask.logical_not();
+        const int points_to_delete = delete_mask.sum_scalar();
+
+        if (points_to_delete == 0) {
+            return Tensor();
+        }
+
+        return splat_data.soft_delete(delete_mask);
+    }
+
+    Tensor soft_crop_by_polygon(SplatData& splat_data,
+                                const glm::mat4& world_to_local,
+                                const CropPolygonData& polygon) {
+        LOG_TIMER("soft_crop_by_polygon");
+
+        const auto& means = splat_data.means();
+        if (!means.is_valid() || means.size(0) == 0 ||
+            !crop_polygon::isValidOutline(polygon.vertices) ||
+            !crop_polygon::isValidHalfDepth(polygon.half_depth)) {
+            return Tensor();
+        }
+
+        const auto inside_mask = compute_crop_polygon_mask(means, polygon.vertices, polygon.half_depth, world_to_local);
+        const auto delete_mask = polygon.inverse ? inside_mask : inside_mask.logical_not();
         const int points_to_delete = delete_mask.sum_scalar();
 
         if (points_to_delete == 0) {
@@ -878,6 +982,33 @@ namespace lfs::core {
             return false;
         }
 
+        const auto& deleted = splat_data.deleted();
+        const bool masked = splat_data.has_deleted_mask();
+        if (!use_percentile && means.device() == Device::CUDA && means.dtype() == DataType::Float32 &&
+            means.is_contiguous() && (!masked || (deleted.is_contiguous() && deleted.numel() >= means.size(0)))) {
+            // Reduce in place: an index list plus a gathered copy cost 20 bytes per
+            // Gaussian, which a viewport pick cannot take from a training run at the
+            // VRAM limit.
+            const auto stream = means.stream();
+            means.sync_to_stream(stream);
+            if (masked)
+                deleted.sync_to_stream(stream);
+            auto scratch = Tensor::empty({6}, Device::CUDA, DataType::UInt32);
+            scratch.set_stream(stream);
+            float lo[3], hi[3];
+            const bool found = cuda::splat_position_bounds(
+                means.ptr<float>(), masked ? deleted.ptr<uint8_t>() : nullptr, static_cast<std::size_t>(means.size(0)),
+                scratch.ptr<uint32_t>(), lo, hi, stream);
+            scratch.record_stream(stream);
+            if (!found)
+                return false;
+            for (int i = 0; i < 3; ++i) {
+                min_bounds[i] = lo[i] - padding;
+                max_bounds[i] = hi[i] + padding;
+            }
+            return true;
+        }
+
         // Filter deleted gaussians (index_select preserves [N,3] shape)
         Tensor visible_means = means;
         if (splat_data.has_deleted_mask()) {
@@ -894,14 +1025,7 @@ namespace lfs::core {
         const int64_t n = visible_means.size(0);
 
         if (use_percentile && n > 100) {
-            // Exclude 2% outliers (1% each end)
-            const int64_t lo = n / 100;
-            const int64_t hi = n - 1 - lo;
-            for (int i = 0; i < 3; ++i) {
-                const auto sorted = visible_means.slice(1, i, i + 1).squeeze(1).sort(0, false).first;
-                min_bounds[i] = sorted[lo].item() - padding;
-                max_bounds[i] = sorted[hi].item() + padding;
-            }
+            percentile_bounds(visible_means, min_bounds, max_bounds, padding);
         } else {
             for (int i = 0; i < 3; ++i) {
                 const auto col = visible_means.slice(1, i, i + 1).squeeze(1);
@@ -926,14 +1050,7 @@ namespace lfs::core {
         const int64_t n = means.size(0);
 
         if (use_percentile && n > 100) {
-            // Exclude 2% outliers (1% each end)
-            const int64_t lo = n / 100;
-            const int64_t hi = n - 1 - lo;
-            for (int i = 0; i < 3; ++i) {
-                const auto sorted = means.slice(1, i, i + 1).squeeze(1).sort(0, false).first;
-                min_bounds[i] = sorted[lo].item() - padding;
-                max_bounds[i] = sorted[hi].item() + padding;
-            }
+            percentile_bounds(means, min_bounds, max_bounds, padding);
         } else {
             for (int i = 0; i < 3; ++i) {
                 const auto col = means.slice(1, i, i + 1).squeeze(1);
@@ -1024,6 +1141,75 @@ namespace lfs::core {
 
         (void)result.apply_shN_value_quant();
         return result;
+    }
+
+    lfs::Result<SplatData> extract_lod_leaves(const SplatData& splat_data) {
+        LFS_ASSERT(splat_data.lod_tree && splat_data.lod_tree->has_tree());
+        const SplatLodTree& tree = *splat_data.lod_tree;
+        const size_t node_count = tree.total_nodes();
+        if (splat_data.size() < node_count) {
+            return lfs::make_error(lfs::ErrorInit{
+                .code = lfs::ErrorCode::FailedPrecondition,
+                .domain = lfs::ErrorDomain::Core,
+                .detail = std::format(
+                    "only {} of {} LOD nodes are in memory; the full-detail splats stream from disk",
+                    splat_data.size(), node_count),
+                .detection = LFS_SOURCE_SITE_CURRENT(),
+            });
+        }
+        LFS_ASSERT(splat_data.size() == node_count);
+
+        std::vector<bool> is_leaf(node_count);
+        for (size_t i = 0; i < node_count; ++i) {
+            is_leaf[i] = tree.child_count_at(i) == 0;
+        }
+        Tensor keep = Tensor::from_vector(is_leaf, {node_count}, splat_data.means_raw().device());
+        if (splat_data.has_deleted_mask()) {
+            keep = keep.logical_and(splat_data.deleted().logical_not());
+        }
+
+        SplatData leaves = extract_by_mask(splat_data, keep);
+        leaves.lod_tree.reset();
+        if (tree.lod_opacity_encoded && leaves.size() > 0) {
+            leaves.opacity_raw() = leaves.opacity_raw().logit();
+        }
+        return leaves;
+    }
+
+    std::shared_ptr<SplatData> make_lod_leaf_view(const SplatData& splat_data) {
+        LFS_ASSERT(splat_data.lod_tree && splat_data.lod_tree->has_tree());
+        const SplatLodTree& tree = *splat_data.lod_tree;
+        const size_t rows = splat_data.size();
+        LFS_ASSERT(rows <= tree.total_nodes());
+
+        auto view = std::make_shared<SplatData>(
+            splat_data.get_max_sh_degree(),
+            splat_data.means_raw(),
+            splat_data.sh0_raw(),
+            splat_data.shN_raw().is_valid() ? splat_data.shN_raw() : Tensor{},
+            splat_data.scaling_raw(),
+            splat_data.rotation_raw(),
+            tree.lod_opacity_encoded ? splat_data.opacity_raw().logit() : splat_data.opacity_raw(),
+            splat_data.get_scene_scale(),
+            SplatData::ShNLayout::Swizzled);
+        view->set_active_sh_degree(
+            splat_data.get_active_sh_degree(),
+            splat_data.shN_value_quantized() && splat_data.shN_value_bounds().is_valid()
+                ? splat_data.shN_value_bounds()
+                : Tensor{});
+
+        std::vector<bool> interior(rows);
+        for (size_t i = 0; i < rows; ++i) {
+            interior[i] = tree.child_count_at(i) != 0;
+        }
+        Tensor hidden = Tensor::from_vector(interior, {rows}, splat_data.means_raw().device());
+        if (splat_data.has_deleted_mask()) {
+            hidden = hidden.logical_or(splat_data.deleted());
+        }
+        view->deleted() = std::move(hidden);
+        view->notify_deleted_mask_changed();
+        view->refresh_deleted_count();
+        return view;
     }
 
 } // namespace lfs::core

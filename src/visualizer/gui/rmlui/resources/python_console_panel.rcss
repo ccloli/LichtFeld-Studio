@@ -32,9 +32,9 @@ body {
 
 #python-console-toolbar {
     display: flex;
-    align-items: center;
+    flex-direction: column;
+    align-items: stretch;
     min-height: 34dp;
-    height: 34dp;
     padding: 4dp 0;
     border-bottom-width: 1dp;
     border-bottom-color: rgb(55, 59, 70);
@@ -47,11 +47,11 @@ body {
     background-color: rgb(24, 25, 32);
 }
 
+/* Actions wrap onto more rows when the console is narrow or the UI scale is large. */
 .toolbar-row {
     display: flex;
-    align-items: center;
+    align-items: flex-start;
     flex: 1;
-    height: 24dp;
     min-width: 0;
     padding: 0 4dp 0 2dp;
     gap: 4dp;
@@ -60,10 +60,10 @@ body {
 
 .toolbar-actions {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     flex: 1;
     min-width: 0;
-    height: 24dp;
     gap: 4dp;
     overflow: hidden;
 }
@@ -490,7 +490,6 @@ button.disabled {
     overflow: hidden;
     white-space: pre;
     font-family: "JetBrains Mono";
-    background-color: rgb(30, 30, 30);
 }
 
 .terminal-row {
@@ -556,7 +555,6 @@ button.disabled {
 }
 
 .pkg-row {
-    font-family: "JetBrains Mono";
     font-size: 12dp;
 }
 
@@ -591,3 +589,10 @@ button.disabled {
     padding-top: 12dp;
     color: rgb(150, 150, 150);
 }
+
+#shader-controls { display: none; flex-shrink: 0; max-height: 140dp; padding: 4dp; overflow-y: auto; }
+.shader-row, .shader-parameter { display: flex; flex-wrap: wrap; align-items: center; gap: 4dp; }
+#shader-parameters { display: flex; flex-wrap: wrap; gap: 6dp; }
+.shader-parameter input { width: 64dp; }
+#shader-name, #shader-assets { width: 120dp; }
+#shader-target { max-width: 160dp; overflow: hidden; }

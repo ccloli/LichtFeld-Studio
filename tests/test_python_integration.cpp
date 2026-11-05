@@ -16,15 +16,24 @@
 #include "core/logger.hpp"
 #include "core/scene.hpp"
 #include "core/splat_data.hpp"
+#include "gui/line_renderer.hpp"
 #include "io/loader.hpp"
+#include "io/project_document.hpp"
+#include "licht_test_support.hpp"
 #include "python/gil.hpp"
 #include "python/python_buffer_analysis.hpp"
 #include "python/python_runtime.hpp"
 #include "python/runner.hpp"
 #include "rendering/coordinate_conventions.hpp"
+#include "rendering/screen_overlay_renderer.hpp"
 #include "training/control/command_api.hpp"
 #include "visualizer/ipc/view_context.hpp"
+#include "visualizer/operation/undo_history.hpp"
+#include "visualizer/scene/scene_manager.hpp"
+#include "visualizer/training/camera_training_notice.hpp"
 #include "visualizer/visualizer.hpp"
+#include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/type_ptr.hpp>
 
 #include <array>
 #include <atomic>
@@ -33,12 +42,16 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstdlib>
+#include <cuda_runtime.h>
 #include <deque>
 #include <filesystem>
+#include <format>
 #include <fstream>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <numbers>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -70,6 +83,69 @@ protected:
 };
 
 namespace {
+    template <typename ClearCallback, typename HasCallback>
+    void check_callback_lock_order_in_child(
+        const char* registration_code,
+        ClearCallback clear_callback,
+        HasCallback has_callback) {
+        {
+            const lfs::python::GilAcquire gil;
+            ASSERT_EQ(PyRun_SimpleString(registration_code), 0);
+        }
+
+        std::promise<void> gil_acquired;
+        auto gil_acquired_future = gil_acquired.get_future();
+        std::promise<void> clear_started;
+        auto clear_started_future = clear_started.get_future();
+
+        std::packaged_task<void()> gil_task([&] {
+            const lfs::python::GilAcquire gil;
+            gil_acquired.set_value();
+            clear_started_future.wait();
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            (void)has_callback();
+        });
+        auto gil_done = gil_task.get_future();
+        std::thread gil_thread(std::move(gil_task));
+
+        std::packaged_task<void()> clear_task([&] {
+            gil_acquired_future.wait();
+            clear_started.set_value();
+            clear_callback();
+        });
+        auto clear_done = clear_task.get_future();
+        std::thread clear_thread(std::move(clear_task));
+
+        const auto timeout = std::chrono::seconds(2);
+        const bool gil_finished = gil_done.wait_for(timeout) == std::future_status::ready;
+        const bool clear_finished = clear_done.wait_for(timeout) == std::future_status::ready;
+        if (gil_finished && clear_finished) {
+            gil_thread.join();
+            clear_thread.join();
+        } else {
+            ADD_FAILURE() << "Callback clear and has-check deadlocked across the Python GIL and registry mutex";
+            // The child process owns both blocked threads and all their state.
+            std::_Exit(1);
+        }
+
+        gil_done.get();
+        clear_done.get();
+    }
+
+    template <typename ClearCallback, typename HasCallback>
+    void expect_callback_clear_does_not_invert_gil_and_registry_lock(
+        const char* registration_code,
+        ClearCallback clear_callback,
+        HasCallback has_callback) {
+        GTEST_FLAG_SET(death_test_style, "threadsafe");
+        ASSERT_EXIT(
+            {
+                check_callback_lock_order_in_child(registration_code, clear_callback, has_callback);
+                std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
+            },
+            ::testing::ExitedWithCode(0), "");
+    }
+
     struct PythonTensorResult {
         std::vector<int64_t> shape;
         std::vector<float> values;
@@ -219,6 +295,12 @@ namespace {
         void projectWaitWrite() override {
             wait_thread = std::this_thread::get_id();
         }
+        lfs::Result<lfs::vis::ProjectTrainingSource> projectTrainingSource() override {
+            if (training_source)
+                return *training_source;
+            return lfs::vis::Visualizer::projectTrainingSource();
+        }
+        std::optional<lfs::vis::ProjectTrainingSource> training_source;
         std::thread::id poll_thread;
         std::thread::id wait_thread;
         int poll_calls = 0;
@@ -529,6 +611,184 @@ TEST_F(PythonIntegrationTest, InitializationSucceeds) {
     EXPECT_NO_THROW((void)lfs::python::ensure_initialized());
 }
 
+TEST_F(PythonIntegrationTest, PythonCameraTrainingSettersPostNotices) {
+    struct PythonSceneContextReset {
+        ~PythonSceneContextReset() {
+            lfs::vis::op::undoHistory().clear();
+            lfs::python::set_scene_manager(nullptr);
+            lfs::python::set_application_scene(nullptr);
+        }
+    } reset;
+    lfs::vis::op::undoHistory().clear();
+
+    lfs::vis::SceneManager scene_manager;
+    auto& scene = scene_manager.getScene();
+    const auto group = scene.addCameraGroup("Training", lfs::core::NULL_NODE, 1);
+    const auto camera = scene.addCamera(
+        "frame.png", group,
+        std::make_shared<lfs::core::Camera>(
+            lfs::core::Tensor::eye(3, lfs::core::Device::CPU),
+            lfs::core::Tensor::zeros({3}, lfs::core::Device::CPU),
+            100.0f, 100.0f, 32.0f, 32.0f,
+            lfs::core::Tensor(), lfs::core::Tensor(), lfs::core::CameraModelType::PINHOLE,
+            "frame.png", std::filesystem::path{}, std::filesystem::path{}, 64, 64, 0));
+    ASSERT_NE(camera, lfs::core::NULL_NODE);
+    ASSERT_TRUE(scene.getNodeById(camera)->training_enabled);
+
+    lfs::python::set_application_scene(&scene);
+    lfs::python::set_scene_manager(&scene_manager);
+    std::size_t posted = 0;
+    struct ScopedSceneChangedSubscription {
+        explicit ScopedSceneChangedSubscription(const lfs::event::HandlerId id) : id(id) {}
+        ~ScopedSceneChangedSubscription() {
+            if (id != 0)
+                lfs::event::EventBridge::instance().unsubscribe(
+                    typeid(lfs::core::events::state::SceneChanged), id);
+        }
+        lfs::event::HandlerId id;
+    } handler(lfs::core::events::state::SceneChanged::when([&](const auto& event) {
+        lfs::vis::detail::dispatch_camera_training_notice(event.mutation_flags, true,
+                                                          [&] { ++posted; });
+    }));
+
+    {
+        const lfs::python::GilAcquire gil;
+        ASSERT_EQ(PyRun_SimpleString(
+                      "import lichtfeld as lf\n"
+                      "lf.set_camera_training_enabled('frame.png', False)\n"
+                      "lf.set_camera_training_enabled('frame.png', False)\n"),
+                  0);
+    }
+    EXPECT_EQ(posted, 1u);
+
+    {
+        const lfs::python::GilAcquire gil;
+        ASSERT_EQ(PyRun_SimpleString(
+                      "lf.get_scene().set_camera_training_enabled('frame.png', True)\n"),
+                  0);
+    }
+    EXPECT_EQ(posted, 2u);
+}
+
+TEST_F(PythonIntegrationTest, PythonTransientSplatsLeaveNoUndoHistory) {
+    struct PythonSceneContextReset {
+        ~PythonSceneContextReset() {
+            lfs::vis::op::undoHistory().clear();
+            lfs::python::set_scene_manager(nullptr);
+            lfs::python::set_application_scene(nullptr);
+        }
+    } reset;
+    lfs::vis::op::undoHistory().clear();
+
+    lfs::vis::SceneManager scene_manager;
+    auto& scene = scene_manager.getScene();
+    lfs::python::set_application_scene(&scene);
+    lfs::python::set_scene_manager(&scene_manager);
+
+    {
+        const lfs::python::GilAcquire gil;
+        ASSERT_EQ(PyRun_SimpleString(
+                      "import lichtfeld as lf\n"
+                      "def _add_test_splat(name, **kwargs):\n"
+                      "    zeros = lambda *shape: lf.Tensor.zeros(shape, device='cuda')\n"
+                      "    return lf.get_scene().add_splat(name, zeros(1, 3), zeros(1, 1, 3), zeros(1, 0, 3),\n"
+                      "                                    zeros(1, 3), zeros(1, 4), zeros(1, 1), **kwargs)\n"
+                      "assert _add_test_splat('preview', transient=True) >= 0\n"
+                      "lf.get_scene().set_training_model_node('preview')\n"),
+                  0);
+    }
+    const auto* preview = scene.getNode("preview");
+    ASSERT_NE(preview, nullptr);
+    EXPECT_TRUE(preview->transient);
+    EXPECT_EQ(scene.getTrainingModelNodeName(), "preview");
+    EXPECT_EQ(lfs::vis::op::undoHistory().undoCount(), 0u);
+
+    // A bound preview stays out of the document, and it cannot take the
+    // place of a saved training model.
+    {
+        const lfs::python::GilAcquire gil;
+        ASSERT_EQ(PyRun_SimpleString(
+                      "assert _add_test_splat('kept') >= 0\n"
+                      "assert not lf.get_scene().set_node_transient('missing', True)\n"
+                      "def _raises(call):\n"
+                      "    try:\n"
+                      "        call()\n"
+                      "    except RuntimeError:\n"
+                      "        return True\n"
+                      "    return False\n"
+                      "assert _raises(lambda: lf.get_scene().set_node_transient('preview', False))\n"
+                      "lf.get_scene().set_training_model_node('kept')\n"
+                      "assert _raises(lambda: lf.get_scene().set_training_model_node('preview'))\n"
+                      "assert _raises(lambda: lf.get_scene().set_node_transient('kept', True))\n"
+                      "lf.get_scene().remove_node('preview')\n"),
+                  0);
+    }
+    const auto* kept = scene.getNode("kept");
+    ASSERT_NE(kept, nullptr);
+    EXPECT_FALSE(kept->transient);
+    EXPECT_EQ(scene.getNode("preview"), nullptr);
+    EXPECT_EQ(scene.getTrainingModelNodeName(), "kept");
+    ASSERT_EQ(lfs::vis::op::undoHistory().undoCount(), 2u);
+
+    // Undoing the binding does not need the preview it replaced.
+    EXPECT_TRUE(lfs::vis::op::undoHistory().undo().success);
+    EXPECT_TRUE(scene.getTrainingModelNodeUuid().is_nil());
+    EXPECT_EQ(lfs::vis::op::undoHistory().undoCount(), 1u);
+}
+
+// The histogram panel trims its samples with scene.apply_crop_filter: a crop
+// polygon trims its own splat by the even-odd rule and leaves the others alone.
+TEST_F(PythonIntegrationTest, PythonCropFilterTrimsOnlyTheCropPolygonsSplat) {
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0)
+        GTEST_SKIP() << "CUDA device unavailable";
+    struct PythonSceneContextReset {
+        ~PythonSceneContextReset() { lfs::python::set_application_scene(nullptr); }
+    } reset;
+
+    const auto make_splat = [](const std::vector<float>& means) {
+        using lfs::core::DataType;
+        using lfs::core::Device;
+        using lfs::core::Tensor;
+        const size_t n = means.size() / 3;
+        std::vector<float> rotation(n * 4, 0.0f);
+        for (size_t i = 0; i < n; ++i)
+            rotation[i * 4] = 1.0f;
+        return std::make_unique<lfs::core::SplatData>(
+            1, Tensor::from_vector(means, {n, size_t{3}}, Device::CUDA),
+            Tensor::zeros({n, size_t{1}, size_t{3}}, Device::CUDA, DataType::Float32),
+            Tensor::zeros({n, size_t{3}, size_t{3}}, Device::CUDA, DataType::Float32),
+            Tensor::zeros({n, size_t{3}}, Device::CUDA, DataType::Float32),
+            Tensor::from_vector(rotation, {n, size_t{4}}, Device::CUDA),
+            Tensor::zeros({n, size_t{1}}, Device::CUDA, DataType::Float32), 1.0f);
+    };
+    lfs::core::Scene scene;
+    // Inside, in the notch of the L, beyond a cap; then the other splat's point.
+    const auto model = scene.addSplat("Model", make_splat({10.0f, 0.0f, 0.0f, 11.5f, 1.5f, 0.0f, 10.0f, 0.0f, 1.5f}));
+    ASSERT_NE(scene.addSplat("Other", make_splat({13.0f, 0.0f, 0.0f})), lfs::core::NULL_NODE);
+    scene.setNodeTransform(model, glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 0.0f, 5.0f)));
+    lfs::core::CropPolygonData polygon;
+    polygon.vertices = {{-2.0f, -2.0f}, {2.0f, -2.0f}, {2.0f, 1.0f}, {1.0f, 1.0f}, {1.0f, 2.0f}, {-2.0f, 2.0f}};
+    polygon.half_depth = 1.0f;
+    ASSERT_NE(scene.addCropPolygon("Model_crop_polygon", model, polygon,
+                                   glm::translate(glm::mat4(1.0f), glm::vec3(10.0f, 0.0f, 0.0f))),
+              lfs::core::NULL_NODE);
+    lfs::python::set_application_scene(&scene);
+
+    const lfs::python::GilAcquire gil;
+    ASSERT_EQ(PyRun_SimpleString(
+                  "import lichtfeld as lf\n"
+                  "scene = lf.get_scene()\n"
+                  "polygon = scene.get_node('Model_crop_polygon').crop_polygon()\n"
+                  "for inverse in (False, True):\n"
+                  "    polygon.inverse = inverse\n"
+                  "    mask = lf.Tensor.ones([4], dtype='bool', device='cuda')\n"
+                  "    scene.apply_crop_filter(mask)\n"
+                  "    kept = [bool(value) for value in mask.cpu().tolist()]\n"
+                  "    assert kept == [not inverse, inverse, inverse, True], (inverse, kept)\n"),
+              0);
+}
+
 TEST_F(PythonIntegrationTest, SceneTimeCallbackSupportsSetTickClearAndUnsetTick) {
     struct SceneTimeCallbackReset {
         ~SceneTimeCallbackReset() { lfs::python::clear_scene_time_callback(); }
@@ -551,6 +811,60 @@ TEST_F(PythonIntegrationTest, SceneTimeCallbackSupportsSetTickClearAndUnsetTick)
     EXPECT_FALSE(lfs::python::has_scene_time_callback());
     EXPECT_NO_THROW(lfs::python::tick_scene_time_callback(2.0f));
     EXPECT_EQ(clip_times, (std::vector<float>{0.0f, 1.25f}));
+}
+
+TEST_F(PythonIntegrationTest, FrameCallbackSupportsReplaceClearAndExpiry) {
+    struct FrameCallbackReset {
+        ~FrameCallbackReset() { lfs::python::clear_frame_callback(); }
+    } reset;
+    std::vector<float> values;
+    lfs::python::set_frame_callback([&](float dt) { values.push_back(dt); }, 60.0);
+    EXPECT_TRUE(lfs::python::has_frame_callback());
+    lfs::python::tick_frame_callback(0.25f);
+    lfs::python::set_frame_callback([&](float dt) { values.push_back(2.0f * dt); }, 60.0);
+    lfs::python::tick_frame_callback(0.5f);
+    lfs::python::clear_frame_callback();
+    EXPECT_FALSE(lfs::python::has_frame_callback());
+    lfs::python::tick_frame_callback(1.0f);
+    lfs::python::set_frame_callback([&](float dt) { values.push_back(dt); }, 0.0);
+    EXPECT_FALSE(lfs::python::has_frame_callback());
+    lfs::python::tick_frame_callback(2.0f);
+    EXPECT_EQ(values, (std::vector<float>{0.25f, 1.0f}));
+}
+
+TEST_F(PythonIntegrationTest, SceneTimeCallbackClearDoesNotInvertGilAndRegistryLock) {
+    expect_callback_clear_does_not_invert_gil_and_registry_lock(
+        "import lichtfeld as lf\nlf.on_scene_time(lambda t: None)",
+        lfs::python::clear_scene_time_callback,
+        lfs::python::has_scene_time_callback);
+}
+
+TEST_F(PythonIntegrationTest, FrameCallbackClearDoesNotInvertGilAndRegistryLock) {
+    expect_callback_clear_does_not_invert_gil_and_registry_lock(
+        "import lichtfeld as lf\nlf.on_frame(lambda t: None, duration_s=60.0)",
+        lfs::python::clear_frame_callback,
+        lfs::python::has_frame_callback);
+}
+
+TEST_F(PythonIntegrationTest, SceneTimeCallbackReplaceDoesNotInvertGilAndRegistryLock) {
+    expect_callback_clear_does_not_invert_gil_and_registry_lock(
+        "import lichtfeld as lf\nlf.on_scene_time(lambda t: None)",
+        [] { lfs::python::set_scene_time_callback([](float) {}); },
+        lfs::python::has_scene_time_callback);
+}
+
+TEST_F(PythonIntegrationTest, FrameCallbackReplaceDoesNotInvertGilAndRegistryLock) {
+    expect_callback_clear_does_not_invert_gil_and_registry_lock(
+        "import lichtfeld as lf\nlf.on_frame(lambda t: None, duration_s=60.0)",
+        [] { lfs::python::set_frame_callback([](float) {}, 60.0); },
+        lfs::python::has_frame_callback);
+}
+
+TEST_F(PythonIntegrationTest, FrameCallbackExpiryDoesNotInvertGilAndRegistryLock) {
+    expect_callback_clear_does_not_invert_gil_and_registry_lock(
+        "import lichtfeld as lf\nlf.on_frame(lambda t: None, duration_s=0.000001)",
+        [] { EXPECT_FALSE(lfs::python::has_frame_callback()); },
+        lfs::python::has_frame_callback);
 }
 
 TEST_F(PythonIntegrationTest, ForcedInitFailureLatchesQueryableError) {
@@ -836,6 +1150,27 @@ TEST_F(PythonIntegrationTest, CleanPythonCodeRepairsUnindentedFunctionBlock) {
     EXPECT_NE(result.code.find("    return safe or \"splat\""), std::string::npos);
 }
 
+// Catches Format commenting out valid leading statements that the preamble heuristic does not recognize.
+TEST_F(PythonIntegrationTest, FormatPythonCodeKeepsLeadingStatements) {
+    const auto result = lfs::python::format_python_code("x=[1,2 ,3];print( 'a' ,x)\nfirst, second = 1, 2\n");
+
+    if (formatterUnavailable(result)) {
+        GTEST_SKIP() << result.error;
+    }
+    ASSERT_TRUE(result.success) << result.error;
+    EXPECT_EQ(result.code, "x = [1, 2, 3]\nprint(\"a\", x)\nfirst, second = 1, 2\n");
+}
+
+TEST_F(PythonIntegrationTest, CleanPythonCodeCommentsProsePreambleButKeepsAssignment) {
+    const auto result = lfs::python::clean_python_code("Here is the script:\nscene = lf.get_scene()\n");
+
+    if (formatterUnavailable(result)) {
+        GTEST_SKIP() << result.error;
+    }
+    ASSERT_TRUE(result.success) << result.error;
+    EXPECT_EQ(result.code, "# Here is the script:\nscene = lf.get_scene()\n");
+}
+
 TEST_F(PythonIntegrationTest, FormatPythonCodeReportsSyntaxErrorWithoutUnexpectedResultFallback) {
     const auto result = lfs::python::format_python_code("import os\nif True print('x')\n");
 
@@ -1003,6 +1338,32 @@ result_values = [1.0 if outcome is lf.ProjectOpenOutcome.RECOVERY_PROMPT_PENDING
     ASSERT_EQ(result.values.size(), 1u);
     EXPECT_FLOAT_EQ(result.values[0], 1.0F);
     EXPECT_EQ(viewer.post_work_calls, 1);
+}
+
+TEST_F(PythonIntegrationTest, StrategyMutationRunsOnViewerThread) {
+    using namespace std::chrono_literals;
+    for (const auto* setter : {"p.set_strategy('mcmc')", "p.set('strategy', 'mcmc')"}) {
+        TestVisualizer viewer;
+        viewer.queue_posted_work = true;
+        const ScopedVisualizer scoped_viewer(&viewer);
+        bool work_ran = false;
+        std::jthread viewer_worker([&]() {
+            if (viewer.waitForQueuedWork(1s)) {
+                // Also prove that the waiting Python caller releases its GIL.
+                const lfs::python::GilAcquire gil;
+                viewer.on_viewer_thread = true;
+                work_ran = viewer.runNextQueuedWork();
+            }
+        });
+        const auto result = runPythonTensorSnippet(
+            std::string("import lichtfeld as lf\np = lf.optimization_params()\n") + setter +
+            "\nresult_shape = (1,)\nresult_values = [float(p.strategy == 'mcmc')]\n");
+        viewer_worker.join();
+        EXPECT_TRUE(work_ran) << setter;
+        EXPECT_EQ(viewer.post_work_calls, 1) << setter;
+        ASSERT_EQ(result.values.size(), 1u);
+        EXPECT_FLOAT_EQ(result.values[0], 1.0F);
+    }
 }
 
 TEST_F(PythonIntegrationTest, ProjectWritePollRunsOnViewerThread) {
@@ -1195,6 +1556,56 @@ result_values = [1.0 if set_ok else 0.0, 1.0 if clear_ok else 0.0]
     ASSERT_EQ(result.values.size(), 2u);
     EXPECT_FLOAT_EQ(result.values[0], 1.0F);
     EXPECT_FLOAT_EQ(result.values[1], 1.0F);
+}
+
+// The binding writes the viewer's training source with the GIL released, calls the
+// progress callback, honours cancel, and runs inline when called on the viewer thread.
+TEST_F(PythonIntegrationTest, ProjectWriteTrainingCopyReportsProgressAndHonoursCancel) {
+    namespace licht = lfs::test::licht;
+    licht::TemporaryDirectory temporary;
+    const auto dataset = temporary.path / "dataset";
+    std::filesystem::create_directories(dataset / "images");
+    std::filesystem::create_directories(dataset / "sparse" / "0");
+    for (const auto* name : {"images/a.jpg", "sparse/0/cameras.bin", "sparse/0/images.bin", "sparse/0/points3D.bin"})
+        licht::write_file_bytes(dataset / name, licht::byte_vector(name));
+    auto parameters = licht::require_result(
+        licht::require_result(lfs::io::project::ProjectDocument::create(lfs::core::generate_uuid_v4()))
+            .parameters()
+            .snapshot());
+    parameters.dataset.images = "images";
+
+    TestVisualizer viewer;
+    viewer.training_source = lfs::vis::ProjectTrainingSource{.parameters = parameters, .dataset_root = dataset};
+    const ScopedVisualizer scoped_viewer(&viewer);
+    const auto script = [&](const std::string_view name) {
+        return std::format(R"PY(
+import lichtfeld as lf
+fractions = []
+copy = lf.project_write_training_copy("{0}/{1}.licht", progress=lambda value, message, out=fractions: out.append(value))
+canceled = 0.0
+try:
+    lf.project_write_training_copy("{0}/{1}-canceled.licht", cancel=lambda: True)
+except lf.Error as error:
+    canceled = 1.0 if error.code == "Cancelled" else 0.0
+result_shape = (3,)
+result_values = [float(copy.images_embedded), fractions[-1] if fractions else 0.0, canceled]
+)PY",
+                           temporary.path.generic_string(), name);
+    };
+
+    const auto posted = runPythonTensorSnippet(script("posted"));
+    EXPECT_EQ(posted.values, (std::vector<float>{1.0F, 1.0F, 1.0F}));
+    EXPECT_EQ(viewer.post_work_calls, 2);
+
+    viewer.on_viewer_thread = true;
+    const auto inline_on_viewer_thread = runPythonTensorSnippet(script("inline"));
+    EXPECT_EQ(inline_on_viewer_thread.values, (std::vector<float>{1.0F, 1.0F, 1.0F}));
+    EXPECT_EQ(viewer.post_work_calls, 2);
+
+    EXPECT_TRUE(std::filesystem::exists(temporary.path / "posted.licht"));
+    EXPECT_TRUE(std::filesystem::exists(temporary.path / "inline.licht"));
+    EXPECT_FALSE(std::filesystem::exists(temporary.path / "posted-canceled.licht"));
+    EXPECT_FALSE(std::filesystem::exists(temporary.path / "inline-canceled.licht"));
 }
 
 TEST_F(PythonIntegrationTest, CaptureViewportReleasesGilWhileWaitingForViewerThread) {
@@ -1546,6 +1957,46 @@ TEST_F(PythonIntegrationTest, ConcurrentEnsureInitializedLatchesOnceUnderRace) {
     EXPECT_LE(consumer.count.load(), 1);
 }
 
+TEST_F(PythonIntegrationTest, RejectedRenderSettingsRestoreReusableProxy) {
+    lfs::vis::RenderSettingsProxy applied;
+    applied.environment_map_path = "previous.hdr";
+    lfs::vis::set_render_settings_callbacks(
+        [&]() -> std::optional<lfs::vis::RenderSettingsProxy> { return applied; },
+        [&](const lfs::vis::RenderSettingsProxy& candidate) {
+            if (candidate.environment_map_path == "invalid.hdr") {
+                throw std::invalid_argument("Environment map cannot be read");
+            }
+            applied = candidate;
+        });
+    struct ResetCallbacks {
+        ~ResetCallbacks() { lfs::vis::set_render_settings_callbacks(nullptr, nullptr); }
+    } reset;
+    const lfs::python::GilAcquire gil;
+    std::unique_ptr<PyObject, decltype(&Py_DecRef)> globals(PyDict_New(), Py_DecRef);
+    ASSERT_NE(globals, nullptr);
+    PyDict_SetItemString(globals.get(), "__builtins__", PyEval_GetBuiltins());
+    auto* result = PyRun_String(R"PY(
+import lichtfeld as lf
+settings = lf.get_render_settings()
+try:
+    settings.environment_map_path = 'invalid.hdr'
+except ValueError:
+    pass
+else:
+    raise AssertionError('invalid map was accepted')
+assert settings.environment_map_path == 'previous.hdr'
+settings.environment_rotation_degrees = 90.0
+assert settings.environment_map_path == 'previous.hdr'
+assert settings.environment_rotation_degrees == 90.0
+)PY",
+                                Py_file_input, globals.get(), globals.get());
+    if (!result)
+        ADD_FAILURE() << consumePythonError();
+    Py_XDECREF(result);
+    EXPECT_EQ(applied.environment_map_path, "previous.hdr");
+    EXPECT_EQ(applied.environment_rotation_degrees, 90.0f);
+}
+
 // NOTE: Tests that actually execute Python scripts require the lichtfeld module
 // to be importable, which depends on the CommandCenter and training infrastructure.
 // These are better tested via integration tests (running training with --python-script).
@@ -1624,4 +2075,89 @@ try:
 finally:
     lf.ui.on_show_load_file_confirmation_with_batch(lambda paths, is_dataset, replace, user_batch: None)
 )PY"));
+}
+
+TEST_F(PythonIntegrationTest, CustomGizmoOverlayDispatchesPerViewAndRetainsInstance) {
+    const lfs::python::GilAcquire gil;
+    std::unique_ptr<PyObject, decltype(&Py_DecRef)> globals(PyDict_New(), Py_DecRef);
+    PyDict_SetItemString(globals.get(), "__builtins__", PyEval_GetBuiltins());
+    const auto run = [&](const char* code) {
+        auto* result = PyRun_String(code, Py_file_input, globals.get(), globals.get());
+        if (!result)
+            ADD_FAILURE() << consumePythonError();
+        const bool success = result != nullptr;
+        Py_XDECREF(result);
+        return success;
+    };
+    ASSERT_TRUE(run(R"PY(
+import lichtfeld as lf
+calls = []
+instances = []
+class CustomOverlay:
+    gizmo_id = "test.custom.overlay"
+    enabled = True
+    def __init__(self):
+        self.frames = 0
+        instances.append(self)
+    @classmethod
+    def poll(cls, ctx):
+        return cls.enabled
+    def draw(self, ctx):
+        self.frames += 1
+        point = ctx.world_to_screen((0, 0, 0))
+        calls.append((self.frames, point, ctx.camera_position, ctx.camera_forward,
+                      ctx.screen_to_world_ray(point)))
+        ctx.draw_line_3d((0, 0, 0), (1, 0, 0), (1, 0, 0, 1), 2)
+        ctx.draw_filled_circle(point, 4, (0, 1, 0, 1))
+lf.register_gizmo(CustomOverlay)
+)PY"));
+    EXPECT_TRUE(lfs::python::has_viewport_draw_handlers());
+    const glm::mat4 proj = glm::perspective(glm::radians(60.0f), 2.0f, 0.1f, 100.0f);
+    const glm::vec2 size(400, 200);
+    lfs::vis::gui::NativeOverlayDrawList draw_list;
+    lfs::rendering::ScreenOverlayRenderer overlay;
+    for (int i = 0; i < 2; ++i) {
+        const glm::vec2 pos(100 + i * 400, 50);
+        const glm::vec3 camera(i == 0 ? 0 : 5, 0, i == 0 ? 5 : 0);
+        const glm::vec3 forward = glm::normalize(-camera);
+        const glm::mat4 view = glm::lookAt(camera, glm::vec3(0), glm::vec3(0, 1, 0));
+        overlay.beginFrame();
+        lfs::python::invoke_viewport_overlay(glm::value_ptr(view), glm::value_ptr(proj),
+                                             glm::value_ptr(pos), glm::value_ptr(size),
+                                             glm::value_ptr(camera), glm::value_ptr(forward),
+                                             &overlay, &draw_list);
+        overlay.endFrame();
+        const auto commands = overlay.consumeCommands();
+        EXPECT_EQ(commands.size(), 2u);
+        for (const auto& command : commands) {
+            EXPECT_NEAR(command.p0.x, pos.x + size.x / 2, 0.001f);
+            EXPECT_NEAR(command.p0.y, pos.y + size.y / 2, 0.001f);
+            EXPECT_TRUE(command.clip.has_value());
+            if (command.clip) {
+                EXPECT_EQ(command.clip->min, pos);
+                EXPECT_EQ(command.clip->max, pos + size);
+            }
+        }
+    }
+    EXPECT_TRUE(run(R"PY(
+assert len(instances) == 1, len(instances)
+assert [c[0] for c in calls] == [1, 2], calls
+for c, point, camera, forward in zip(calls, [(300, 150), (700, 150)],
+                                    [(0, 0, 5), (5, 0, 0)], [(0, 0, -1), (-1, 0, 0)]):
+    for got, want in zip(c[1:], [point, camera, forward, forward]):
+        assert all(abs(a-b) < 0.001 for a, b in zip(got, want)), (got, want)
+)PY"));
+    EXPECT_TRUE(run("CustomOverlay.enabled = False"));
+    const glm::mat4 view(1);
+    const glm::vec2 pos(0);
+    const glm::vec3 camera(0), forward(0, 0, -1);
+    overlay.beginFrame();
+    lfs::python::invoke_viewport_overlay(glm::value_ptr(view), glm::value_ptr(proj),
+                                         glm::value_ptr(pos), glm::value_ptr(size),
+                                         glm::value_ptr(camera), glm::value_ptr(forward),
+                                         &overlay, &draw_list);
+    EXPECT_TRUE(overlay.consumeCommands().empty());
+    EXPECT_TRUE(run("lf.unregister_gizmo(CustomOverlay.gizmo_id)"));
+    EXPECT_FALSE(lfs::python::has_viewport_draw_handlers());
+    overlay.endFrame();
 }

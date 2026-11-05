@@ -3,6 +3,9 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #version 450
+#extension GL_GOOGLE_include_directive : require
+#define LFS_EQUIRECT_GLSL
+#include "../../../../rendering/rasterizer/vulkan/shader/src/slang/equirect_projection.inc"
 
 layout(location = 0) in vec3 in_position;
 layout(location = 1) in vec3 in_color;
@@ -35,11 +38,16 @@ layout(set = 0, binding = 6) readonly buffer DeletedMask {
     uint deleted_mask[];
 };
 
+// Crop polygon outline in its local XY plane; read only with FLAG_CROP_POLYGON.
+layout(set = 0, binding = 7) readonly buffer CropPolygon {
+    vec2 crop_polygon[];
+};
+
 layout(push_constant) uniform PushConstants {
     mat4 view_proj;
     mat4 view;
     mat4 crop_to_local;
-    vec4 crop_min;             // xyz = min, w unused
+    vec4 crop_min;             // xyz = min (polygon: x = half depth, y = vertex count), w = depth view min
     vec4 crop_max;             // xyz = max, w unused
     vec4 voxel_focal_ortho;    // x = voxel_size * scaling_modifier, y = focal_y, z = ortho pixels_per_world, w = depth_view
     ivec4 counts;              // x = n_transforms, y = n_visibility, z = flags, w = max_point_size
@@ -55,10 +63,15 @@ const int FLAG_HAS_PREVIEW     = 1 << 6;
 const int FLAG_PREVIEW_ADD     = 1 << 7;
 const int FLAG_HAS_DELETED     = 1 << 9;
 const int FLAG_CROP_ELLIPSOID  = 1 << 10;
+const int FLAG_EQUIRECTANGULAR = 1 << 11;
+const int FLAG_CROP_POLYGON    = 1 << 12;
 const uint SELECTION_GROUP_MAX = 255u;
 const uint SELECTION_PREVIEW_COLOR_INDEX = 256u;
 const float SELECTION_COMMITTED_BLEND = 0.75;
 const float SELECTION_PREVIEW_BLEND = 0.9;
+const float SELECTION_COMMITTED_SCALE = 1.35;
+const float SELECTION_PREVIEW_SCALE = 1.6;
+const float DESATURATE_BLEND = 0.75;
 
 #define PC_N_TRANSFORMS    pc.counts.x
 #define PC_N_VISIBILITY    pc.counts.y
@@ -120,6 +133,23 @@ void main() {
             vec3 radii = max(abs(pc.crop_min.xyz), vec3(1e-8));
             float norm = dot(local / radii, local / radii);
             inside = norm <= 1.0;
+        } else if ((PC_FLAGS & FLAG_CROP_POLYGON) != 0) {
+            // |z| <= half depth and the even-odd rule over the outline, as in soft_crop_by_polygon.
+            int count = int(pc.crop_min.y);
+            inside = abs(local.z) <= pc.crop_min.x && count >= 3;
+            if (inside) {
+                bool crossing = false;
+                vec2 b = crop_polygon[count - 1];
+                for (int i = 0; i < count; ++i) {
+                    vec2 a = crop_polygon[i];
+                    if ((a.y > local.y) != (b.y > local.y) &&
+                        local.x < (b.x - a.x) * (local.y - a.y) / (b.y - a.y) + a.x) {
+                        crossing = !crossing;
+                    }
+                    b = a;
+                }
+                inside = crossing;
+            }
         } else {
             inside = all(greaterThanEqual(local, pc.crop_min.xyz)) &&
                      all(lessThanEqual(local, pc.crop_max.xyz));
@@ -135,23 +165,36 @@ void main() {
     }
 
     vec4 view_pos = pc.view * vec4(ws, 1.0);
-    vec4 clip = pc.view_proj * vec4(ws, 1.0);
+    bool equirectangular = (PC_FLAGS & FLAG_EQUIRECTANGULAR) != 0;
+    bool orthographic = (PC_FLAGS & FLAG_ORTHOGRAPHIC) != 0;
+    float view_z_positive = -view_pos.z;
+    vec4 clip;
+    if (equirectangular) {
+        float distance = length(view_pos.xyz);
+        if (distance <= 1e-6) {
+            reject();
+            return;
+        }
+        vec2 uv = lfs_equirect_uv(view_pos.xyz / distance);
+        clip = pc.view_proj * vec4(0.0, 0.0, -distance, 1.0);
+        clip.xy = (2.0 * uv - 1.0) * clip.w;
+        view_z_positive = distance;
+    } else {
+        clip = pc.view_proj * vec4(ws, 1.0);
+        if (!orthographic && view_z_positive < 1e-4) {
+            reject();
+            return;
+        }
+    }
 
     if (abs(clip.w) <= 1e-6) {
         reject();
         return;
     }
 
-    bool orthographic = (PC_FLAGS & FLAG_ORTHOGRAPHIC) != 0;
-    float view_z_positive = -view_pos.z;
-    if (!orthographic && view_z_positive < 1e-4) {
-        reject();
-        return;
-    }
-
     float voxel = max(pc.voxel_focal_ortho.x, 1e-5);
     float radius_px;
-    if (orthographic) {
+    if (orthographic && !equirectangular) {
         float pixels_per_world = max(pc.voxel_focal_ortho.z, 1e-5);
         radius_px = max(1.0, ceil(voxel * pixels_per_world * 0.5));
     } else {
@@ -165,7 +208,7 @@ void main() {
     vec3 color = clamp(in_color, vec3(0.0), vec3(1.0));
     if (desaturate) {
         float gray = dot(color, vec3(0.299, 0.587, 0.114));
-        color = mix(color, vec3(gray), 0.75);
+        color = mix(color, vec3(gray), DESATURATE_BLEND);
     }
 
     uint selection_group = 0u;
@@ -182,10 +225,10 @@ void main() {
     }
     if (is_preview) {
         color = mix(color, selection_colors[SELECTION_PREVIEW_COLOR_INDEX].xyz, SELECTION_PREVIEW_BLEND);
-        diameter_px = clamp(max(diameter_px + 2.0, diameter_px * 1.6), 1.0, max_size);
+        diameter_px = clamp(max(diameter_px + 2.0, diameter_px * SELECTION_PREVIEW_SCALE), 1.0, max_size);
     } else if (is_committed) {
         color = mix(color, selection_colors[selection_group].xyz, SELECTION_COMMITTED_BLEND);
-        diameter_px = clamp(max(diameter_px + 2.0, diameter_px * 1.35), 1.0, max_size);
+        diameter_px = clamp(max(diameter_px + 2.0, diameter_px * SELECTION_COMMITTED_SCALE), 1.0, max_size);
     }
 
     gl_Position = clip;

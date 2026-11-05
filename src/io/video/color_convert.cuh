@@ -3,10 +3,14 @@
 
 #pragma once
 
+#include "io/video/video_frame_geometry.hpp"
 #include <cstdint>
 #include <cuda_runtime.h>
 
 namespace lfs::io::video {
+
+    void reframeRgbCuda(const float* src, float* dst, int source_width, int source_height,
+                        int width, int height, VideoFrameMapping mapping, cudaStream_t stream = nullptr);
 
     // Convert RGB float32 (0.0-1.0) to NV12 (Y plane + interleaved UV plane) on GPU
     // NV12 is NVENC's preferred input format
@@ -42,7 +46,8 @@ namespace lfs::io::video {
         int height,
         int y_pitch = 0,  // Y plane pitch (0 = use width)
         int uv_pitch = 0, // UV plane pitch (0 = use width)
-        cudaStream_t stream = nullptr);
+        cudaStream_t stream = nullptr,
+        bool full_range = false);
 
     // Rotate RGB uint8 image on GPU by 90/180/270 degrees
     // src and dst must be separate GPU buffers

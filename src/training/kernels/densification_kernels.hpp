@@ -141,6 +141,10 @@ namespace lfs::training::kernels {
     /// order. Synchronizes the stream to return the value.
     [[nodiscard]] float launch_select_median(const float* values, size_t n, cudaStream_t stream);
 
+    /// The median launch_normalize_by_positive_median divides by, without
+    /// touching the values: 0 when none is positive. Synchronizes the stream.
+    [[nodiscard]] float launch_select_positive_median(const float* values, size_t n, cudaStream_t stream);
+
     /// Accumulate the image-clipped projected bounding rectangle area / image area.
     /// radii and means2d are [N, 2]; zero radii exclude culled splats. Call once
     /// per completed training frame, independently of tile batching.
@@ -155,17 +159,6 @@ namespace lfs::training::kernels {
         const float* max_share,
         const bool* frozen_mask,
         size_t frozen_n,
-        float limit,
-        size_t n,
-        cudaStream_t stream = nullptr);
-
-    /// out[i] = sqrt(error) * (share/limit) when share > limit and error > 0, else 0.
-    void launch_oversize_split_scores(
-        const float* error_score, // [N]
-        const float* max_share,   // [N]
-        const bool* frozen_mask,
-        size_t frozen_n,
-        float* out_scores, // [N]
         float limit,
         size_t n,
         cudaStream_t stream = nullptr);

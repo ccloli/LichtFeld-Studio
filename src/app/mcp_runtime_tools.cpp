@@ -4,13 +4,17 @@
 #include "app/mcp_runtime_tools.hpp"
 #include "app/mcp_app_utils.hpp"
 #include "app/mcp_event_handlers.hpp"
+#include "shaders/shader_api.hpp"
 
+#include "core/event_bridge/localization_manager.hpp"
 #include "core/event_bridge/scoped_handler.hpp"
 #include "core/events.hpp"
 #include "core/path_utils.hpp"
+#include "visualizer/apriltag_calibration.hpp"
 #include "visualizer/gui/async_task_manager.hpp"
 #include "visualizer/gui/gui_manager.hpp"
 #include "visualizer/gui/panels/python_console_panel.hpp"
+#include "visualizer/gui_capabilities.hpp"
 #include "visualizer/operator/operator_registry.hpp"
 #include "visualizer/training/training_manager.hpp"
 #include "visualizer/training/training_state.hpp"
@@ -40,14 +44,52 @@ namespace lfs::app {
         using json = nlohmann::json;
         using mcp::McpResourceContent;
 
-        constexpr std::array<std::string_view, 7> kRuntimeJobIds = {
+        json frame_snapshot_json(const vis::FrameLedgerSnapshot& snapshot) {
+            json presents_by_reason = json::object();
+            json view_renders_by_reason = json::object();
+            json holders = json::array();
+            json last_frame_reasons = json::array();
+            for (std::size_t i = 0; i < static_cast<std::size_t>(vis::FrameReason::Count); ++i) {
+                const auto reason = static_cast<vis::FrameReason>(i);
+                presents_by_reason[vis::frameReasonName(reason)] = snapshot.presents_by_reason[i];
+                view_renders_by_reason[vis::frameReasonName(reason)] = snapshot.view_renders_by_reason[i];
+                if (snapshot.last_frame_reasons.test(i))
+                    last_frame_reasons.push_back(vis::frameReasonName(reason));
+            }
+            for (const auto& holder : snapshot.live_holders) {
+                holders.push_back(json{{"reason", vis::frameReasonName(holder.reason)},
+                                       {"scope", holder.scope == vis::FrameScope::Gui ? "gui" : "view"},
+                                       {"detail", holder.detail},
+                                       {"age_ms", std::chrono::duration<double, std::milli>(holder.age).count()}});
+            }
+            return json{{"frames_presented", snapshot.frames_presented},
+                        {"views_rendered", snapshot.views_rendered[0]},
+                        {"views_rendered_by_view", snapshot.views_rendered},
+                        {"presents_by_reason", std::move(presents_by_reason)},
+                        {"view_renders_by_reason", std::move(view_renders_by_reason)},
+                        {"frames_without_reason", snapshot.frames_without_reason},
+                        {"wakes_without_frame", snapshot.wakes_without_frame},
+                        {"holders_expired", snapshot.holders_expired},
+                        {"preview_skipped_no_step", snapshot.preview_skipped_no_step},
+                        {"stale_detections", snapshot.stale_detections},
+                        {"requests_dropped", snapshot.requests_dropped},
+                        {"last_frame_reasons", std::move(last_frame_reasons)},
+                        {"last_frame_details", snapshot.last_frame_details},
+                        {"live_holders", std::move(holders)}};
+        }
+
+        constexpr std::array<std::string_view, 11> kRuntimeJobIds = {
+            "collision.main",
             "editor.python",
+            "shader.compile",
             "training.main",
             "export.scene",
             "import.dataset",
             "export.video",
             "mesh2splat",
             "operator.modal",
+            "apriltag.scan",
+            "camera.selection",
         };
 
         json supported_runtime_job_ids_json() {
@@ -75,6 +117,12 @@ namespace lfs::app {
         }
 
         std::string_view runtime_job_label(const std::string_view job_id) {
+            if (job_id == "apriltag.scan")
+                return LOC("runtime.apriltag_scan");
+            if (job_id == "camera.selection")
+                return LOC("scene.camera_selection");
+            if (job_id == "collision.main")
+                return "Collision";
             if (job_id == "editor.python") {
                 return "Python Editor";
             }
@@ -172,6 +220,8 @@ namespace lfs::app {
             }
 
             return json{
+                {"shader_catalog_uri", "lichtfeld://shaders/catalog"},
+                {"shader_state_uri", "lichtfeld://shaders/state"},
                 {"catalog_uri", "lichtfeld://runtime/catalog"},
                 {"state_uri", "lichtfeld://runtime/state"},
                 {"jobs_uri", "lichtfeld://runtime/jobs"},
@@ -370,14 +420,15 @@ namespace lfs::app {
                     "Trainer manager is not initialized");
             }
 
-            const auto state = trainer->getState();
+            const bool preparing = viewer.isTrainingStartPending();
+            const auto state = preparing ? vis::TrainingState::Starting : trainer->getState();
             const int total_iterations = trainer->getTotalIterations();
             const int current_iteration = trainer->getCurrentIteration();
             json payload{
                 {"id", "training.main"},
                 {"label", "Training"},
                 {"kind", "training"},
-                {"active", trainer->isTrainingActive()},
+                {"active", preparing || trainer->isTrainingActive()},
                 {"status",
                  state == vis::TrainingState::Finished && !trainer->getLastError().empty()
                      ? "failed"
@@ -619,6 +670,71 @@ namespace lfs::app {
             return payload;
         }
 
+        json apriltag_job_json(vis::gui::GuiManager& gui) {
+            auto& tasks = gui.asyncTasks();
+            const auto state = tasks.aprilTagScanStatus();
+            const bool active = state && state->running();
+            const bool completed = state && state->status == vis::JobStatus::Completed;
+            const bool canceled = state && state->status == vis::JobStatus::Canceled;
+            const bool failed = state && state->status == vis::JobStatus::Failed;
+            json payload{
+                {"id", "apriltag.scan"},
+                {"label", LOC("runtime.apriltag_scan")},
+                {"kind", "calibration"},
+                {"active", active},
+                {"status", active ? "running" : completed ? "finished"
+                                            : failed      ? "failed"
+                                                          : "idle"},
+                {"outcome", active ? "running" : completed ? "completed"
+                                             : canceled    ? "cancelled"
+                                             : failed      ? "failed"
+                                                           : "idle"},
+                {"progress", state ? state->progress : 0.0f},
+                {"stage", state ? state->stage : ""},
+                {"cancel_supported", true},
+                {"dismiss_supported", false},
+                {"actions", {{"start", false}, {"pause", false}, {"resume", false}, {"cancel", active}, {"dismiss", false}}},
+            };
+            if (state) {
+                payload["cancel_requested"] = state->cancel_requested;
+                if (!state->error.empty())
+                    payload["error"] = state->error;
+            }
+            if (completed || failed) {
+                auto output = vis::aprilTagResultJson(tasks.aprilTagScanResult());
+                output["success"] = completed && tasks.aprilTagScanResult().scale_report.success;
+                output.erase("manifest_json");
+                payload["result"] = std::move(output);
+            }
+            add_runtime_job_links(payload);
+            return payload;
+        }
+
+        json camera_selection_job_json(vis::gui::GuiManager& gui) {
+            const auto state = gui.asyncTasks().cameraSelectionStatus();
+            const bool active = state && state->running();
+            const bool completed = state && state->status == vis::JobStatus::Completed;
+            const bool canceled = state && state->status == vis::JobStatus::Canceled;
+            const bool failed = state && state->status == vis::JobStatus::Failed;
+            json payload{{"id", "camera.selection"}, {"label", LOC("scene.camera_selection")}, {"kind", "selection"}, {"active", active}, {"status", active ? "running" : completed ? "finished"
+                                                                                                                                                                      : failed      ? "failed"
+                                                                                                                                                                      : canceled    ? "cancelled"
+                                                                                                                                                                                    : "idle"},
+                         {"outcome", active ? "running" : completed ? "completed"
+                                                      : failed      ? "failed"
+                                                      : canceled    ? "cancelled"
+                                                                    : "idle"},
+                         {"progress", state ? state->progress : 0.0F},
+                         {"stage", state ? state->stage : ""},
+                         {"cancel_supported", active},
+                         {"dismiss_supported", false},
+                         {"actions", {{"start", false}, {"pause", false}, {"resume", false}, {"cancel", active}, {"dismiss", false}}}};
+            if (state && !state->error.empty())
+                payload["error"] = state->error;
+            add_runtime_job_links(payload);
+            return payload;
+        }
+
         json operator_modal_job_json() {
             auto& operators = vis::op::operators();
             const auto modal_state = operators.modalState();
@@ -662,7 +778,25 @@ namespace lfs::app {
             }
 
             auto* const gui = viewer_impl->getGuiManager();
+            if (job_id == "shader.compile") {
+                auto* service = viewer_impl->getShaderService();
+                if (!service)
+                    return unavailable_job_json(job_id, "Shaders", "shader", "Shader service is unavailable");
+                auto payload = vis::shaders::shaderJob(service->work());
+                add_runtime_job_links(payload);
+                return payload;
+            }
 
+            if (job_id == "apriltag.scan") {
+                return gui ? std::expected<json, std::string>(apriltag_job_json(*gui))
+                           : std::expected<json, std::string>(unavailable_job_json(
+                                 "apriltag.scan", LOC("runtime.apriltag_scan"), "calibration", "GUI manager is not initialized"));
+            }
+            if (job_id == "camera.selection") {
+                if (gui)
+                    return camera_selection_job_json(*gui);
+                return unavailable_job_json("camera.selection", LOC("scene.camera_selection"), "selection", "GUI manager is not initialized");
+            }
             if (job_id == "editor.python") {
                 return editor_job_json(include_output, output_max_chars, output_tail);
             }
@@ -701,6 +835,17 @@ namespace lfs::app {
                                  "conversion",
                                  "GUI manager is not initialized"));
             }
+            if (job_id == "collision.main") {
+                if (!gui)
+                    return unavailable_job_json("collision.main", "Collision", "conversion", "GUI manager is not initialized");
+                const auto state = gui->asyncTasks().collisionJob();
+                const bool active = state && state->running();
+                const std::string status = !state ? "idle" : active                                  ? "running"
+                                                         : state->status == vis::JobStatus::Failed   ? "failed"
+                                                         : state->status == vis::JobStatus::Canceled ? "cancelled"
+                                                                                                     : "finished";
+                return json{{"id", "collision.main"}, {"label", "Collision"}, {"kind", "conversion"}, {"active", active}, {"status", status}, {"outcome", status}, {"progress", state ? state->progress : 0.f}, {"stage", state ? state->stage : ""}, {"error", state ? state->error : ""}, {"cancel_supported", active}, {"actions", {{"cancel", active}, {"start", false}, {"pause", false}, {"resume", false}, {"dismiss", false}}}};
+            }
             if (job_id == "operator.modal") {
                 return operator_modal_job_json();
             }
@@ -738,6 +883,17 @@ namespace lfs::app {
                 }
             }
 
+            json frames = json::object();
+            if (viewer) {
+                if (auto* const rendering = viewer->getRenderingManager()) {
+                    const auto snapshot = rendering->frameDemandLedger().snapshot();
+                    frames = frame_snapshot_json(snapshot);
+                    const auto rates = rendering->getFrameRates();
+                    frames["ui_fps"] = rates.ui;
+                    frames["viewport_fps"] = rates.view;
+                }
+            }
+
             return json{
                 {"catalog_uri", "lichtfeld://runtime/catalog"},
                 {"state_uri", "lichtfeld://runtime/state"},
@@ -749,6 +905,7 @@ namespace lfs::app {
                 {"active_job_count", active_jobs},
                 {"cancellable_job_count", cancellable_jobs},
                 {"jobs", std::move(jobs)},
+                {"frames", std::move(frames)},
             };
         }
 
@@ -948,6 +1105,24 @@ namespace lfs::app {
 
             auto* const gui = viewer_impl->getGuiManager();
 
+            if (job_id == "apriltag.scan") {
+                if (action != "cancel" || !gui)
+                    return std::unexpected("Only cancellation is supported for apriltag.scan");
+                const auto state = gui->asyncTasks().aprilTagScanStatus();
+                if (!state || !state->running())
+                    return std::unexpected("AprilTag scan is not running");
+                gui->asyncTasks().cancelAprilTagScan();
+                return {};
+            }
+            if (job_id == "camera.selection") {
+                if (action != "cancel" || !gui)
+                    return std::unexpected("Only cancellation is supported for camera.selection");
+                const auto state = gui->asyncTasks().cameraSelectionStatus();
+                if (!state || !state->running())
+                    return std::unexpected("Camera selection is not running");
+                gui->asyncTasks().cancelCameraSelection();
+                return {};
+            }
             if (job_id == "editor.python") {
                 auto& console = vis::gui::panels::PythonConsoleState::getInstance();
                 if (action != "cancel") {
@@ -1030,6 +1205,12 @@ namespace lfs::app {
                 return {};
             }
 
+            if (job_id == "collision.main") {
+                if (action != "cancel" || !gui)
+                    return std::unexpected("Collision supports cancel only while the GUI is active");
+                gui->asyncTasks().cancelCollision();
+                return {};
+            }
             if (job_id == "mesh2splat") {
                 return std::unexpected("mesh2splat does not currently support runtime control");
             }
@@ -1086,6 +1267,37 @@ namespace lfs::app {
                     (*payload)["event_count"] = static_cast<int64_t>(RuntimeEventJournal::instance().size());
                     return *payload;
                 });
+            });
+
+        registry.register_tool(
+            mcp::McpTool{
+                .name = "runtime.frame_ledger",
+                .description = "Read frame-demand counters, current holders, and the latest frame reasons",
+                .input_schema = {
+                    .type = "object",
+                    .properties = json{
+                        {"reset", json{{"type", "boolean"}, {"description", "Reset counters before taking the snapshot (default: false)"}}}},
+                    .required = {}},
+                .metadata = mcp::McpToolMetadata{
+                    .category = "runtime",
+                    .kind = "query",
+                    .runtime = "any",
+                    .thread_affinity = "any_thread",
+                }},
+            [viewer](const json& args) -> json {
+                const bool reset = args.value("reset", false);
+                auto* const rendering = viewer ? viewer->getRenderingManager() : nullptr;
+                if (!rendering)
+                    return json{{"success", false}, {"error", "Rendering manager is unavailable"}};
+                auto& ledger = rendering->frameDemandLedger();
+                if (reset)
+                    ledger.resetCounters();
+                const auto snapshot = ledger.snapshot();
+                auto frames = frame_snapshot_json(snapshot);
+                const auto rates = rendering->getFrameRates();
+                frames["ui_fps"] = rates.ui;
+                frames["viewport_fps"] = rates.view;
+                return json{{"success", true}, {"frames", std::move(frames)}};
             });
 
         registry.register_tool(
@@ -1180,8 +1392,11 @@ namespace lfs::app {
                     return json{{"error", baseline.error()}};
                 }
 
+                auto* shader_service = as_visualizer_impl(viewer)->getShaderService();
+                auto changes = job_id == "shader.compile" && shader_service ? shader_service->changes() : nullptr;
                 const auto start = std::chrono::steady_clock::now();
                 while (true) {
+                    const auto generation = changes ? changes->generation.load(std::memory_order_acquire) : 0;
                     auto current = describe();
                     if (!current) {
                         return json{{"error", current.error()}};
@@ -1198,7 +1413,7 @@ namespace lfs::app {
 
                     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::steady_clock::now() - start);
-                    if (elapsed.count() >= timeout_ms) {
+                    if (elapsed.count() >= timeout_ms || (changes && changes->cancelled(generation))) {
                         (*current)["success"] = true;
                         (*current)["until"] = until;
                         (*current)["timed_out"] = true;
@@ -1206,7 +1421,10 @@ namespace lfs::app {
                         return *current;
                     }
 
-                    std::this_thread::sleep_for(std::chrono::milliseconds(poll_interval_ms));
+                    if (changes)
+                        changes->wait(generation, start + std::chrono::milliseconds(timeout_ms));
+                    else
+                        std::this_thread::sleep_for(std::chrono::milliseconds(poll_interval_ms));
                 }
             });
 

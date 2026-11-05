@@ -31,6 +31,12 @@ namespace lfs::vis {
         p.use_crop_box = s.use_crop_box;
         p.show_ellipsoid = s.show_ellipsoid;
         p.use_ellipsoid = s.use_ellipsoid;
+        p.selection_outline = s.selection_outline;
+        p.selection_outline_opacity = s.selection_outline_opacity;
+        p.selection_outline_width = s.selection_outline_width;
+        p.selection_outline_threshold = s.selection_outline_threshold;
+        p.selection_outline_holes = s.selection_outline_holes;
+        p.selection_outline_color = detail::to_array(s.selection_outline_color);
         p.desaturate_unselected = s.desaturate_unselected;
         p.desaturate_cropping = s.desaturate_cropping;
         p.hide_outside_depth_box = s.hide_outside_depth_box;
@@ -52,6 +58,7 @@ namespace lfs::vis {
         p.show_grid = s.show_grid;
         p.grid_plane = s.grid_plane;
         p.grid_opacity = s.grid_opacity;
+        p.collision_preview_opacity = s.collision_preview_opacity;
         p.point_cloud_mode = s.point_cloud_mode;
         p.voxel_size = s.voxel_size;
         p.show_rings = s.show_rings;
@@ -59,6 +66,7 @@ namespace lfs::vis {
         p.show_center_markers = s.show_center_markers;
         p.show_camera_frustums = s.show_camera_frustums;
         p.camera_frustum_scale = s.camera_frustum_scale;
+        p.hide_disabled_camera_frustums = s.hide_disabled_camera_frustums;
         p.train_camera_color = detail::to_array(s.train_camera_color);
         p.eval_camera_color = detail::to_array(s.eval_camera_color);
         p.show_pivot = s.show_pivot;
@@ -67,6 +75,8 @@ namespace lfs::vis {
         p.split_position = s.split_position;
         p.split_view_offset = s.split_view_offset;
         p.raster_backend = static_cast<int>(s.raster_backend);
+        p.transparency_mode = static_cast<int>(s.transparency_mode);
+        p.stochastic_max_frames = s.stochastic_max_frames;
         p.gut = lfs::rendering::isGutBackend(s.raster_backend);
         p.equirectangular = s.equirectangular;
         p.orthographic = s.orthographic;
@@ -75,7 +85,6 @@ namespace lfs::vis {
         p.depth_view_min = s.depth_view_min;
         p.depth_view_max = s.depth_view_max;
         p.depth_visualization_mode = static_cast<int>(s.depth_visualization_mode);
-        p.selection_color_committed = detail::to_array(s.selection_color_committed);
         p.selection_color_preview = detail::to_array(s.selection_color_preview);
         p.selection_color_center_marker = detail::to_array(s.selection_color_center_marker);
         p.depth_clip_enabled = s.depth_clip_enabled;
@@ -124,6 +133,12 @@ namespace lfs::vis {
         s.use_crop_box = p.use_crop_box;
         s.show_ellipsoid = p.show_ellipsoid;
         s.use_ellipsoid = p.use_ellipsoid;
+        s.selection_outline = p.selection_outline;
+        s.selection_outline_opacity = p.selection_outline_opacity;
+        s.selection_outline_width = p.selection_outline_width;
+        s.selection_outline_threshold = p.selection_outline_threshold;
+        s.selection_outline_holes = p.selection_outline_holes;
+        s.selection_outline_color = detail::to_vec3(p.selection_outline_color);
         s.desaturate_unselected = p.desaturate_unselected;
         s.desaturate_cropping = p.desaturate_cropping;
         s.hide_outside_depth_box = p.hide_outside_depth_box;
@@ -145,6 +160,7 @@ namespace lfs::vis {
         s.show_grid = p.show_grid;
         s.grid_plane = p.grid_plane;
         s.grid_opacity = p.grid_opacity;
+        s.collision_preview_opacity = p.collision_preview_opacity;
         s.point_cloud_mode = p.point_cloud_mode;
         s.voxel_size = p.voxel_size;
         s.show_rings = p.show_rings;
@@ -152,6 +168,7 @@ namespace lfs::vis {
         s.show_center_markers = p.show_center_markers;
         s.show_camera_frustums = p.show_camera_frustums;
         s.camera_frustum_scale = p.camera_frustum_scale;
+        s.hide_disabled_camera_frustums = p.hide_disabled_camera_frustums;
         s.train_camera_color = detail::to_vec3(p.train_camera_color);
         s.eval_camera_color = detail::to_vec3(p.eval_camera_color);
         s.show_pivot = p.show_pivot;
@@ -161,6 +178,9 @@ namespace lfs::vis {
         s.split_position = p.split_position;
         s.split_view_offset = p.split_view_offset;
         const auto previous_backend = s.raster_backend;
+        s.transparency_mode = static_cast<lfs::rendering::GaussianTransparencyMode>(
+            std::clamp(p.transparency_mode, 0, 2));
+        s.stochastic_max_frames = std::clamp(p.stochastic_max_frames, 1, 1024);
         const bool previous_gut = s.gut;
         const auto requested_backend = static_cast<lfs::rendering::GaussianRasterBackend>(p.raster_backend);
         const bool gut_toggle_only = requested_backend == previous_backend && p.gut != previous_gut;
@@ -169,7 +189,7 @@ namespace lfs::vis {
                                : lfs::rendering::normalizeViewerRasterBackend(requested_backend, p.gut);
         s.gut = lfs::rendering::isGutBackend(s.raster_backend);
         s.equirectangular = p.equirectangular;
-        enforceProjectionBackend(s);
+        enforceProjectionBackend(s, true);
         s.orthographic = p.orthographic;
         s.ortho_scale = p.ortho_scale;
         s.depth_view = p.depth_view;
@@ -178,7 +198,6 @@ namespace lfs::vis {
         s.depth_visualization_mode =
             static_cast<lfs::rendering::DepthVisualizationMode>(p.depth_visualization_mode);
         sanitizeDepthViewSettings(s);
-        s.selection_color_committed = detail::to_vec3(p.selection_color_committed);
         s.selection_color_preview = detail::to_vec3(p.selection_color_preview);
         s.selection_color_center_marker = detail::to_vec3(p.selection_color_center_marker);
         s.depth_clip_enabled = p.depth_clip_enabled;

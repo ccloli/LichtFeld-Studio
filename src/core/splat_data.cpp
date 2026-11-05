@@ -3,12 +3,14 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "core/splat_data.hpp"
+#include "core/cuda/initial_scales.hpp"
 #include "core/cuda/sh_layout.cuh"
 #include "core/cuda_error.hpp"
 #include "core/logger.hpp"
 #include "core/parameters.hpp"
 #include "core/pinned_memory_allocator.hpp"
 #include "core/point_cloud.hpp"
+#include "core/sh_value_codec.cuh"
 #include "core/sh_value_quant.hpp"
 #include "core/sh_value_quant_kernels.hpp"
 #include "core/shareable_allocation_limit.hpp"
@@ -30,6 +32,7 @@
 #include <format>
 #include <ios>
 #include <limits>
+#include <stdexcept>
 #include <tbb/blocked_range.h>
 #include <tbb/parallel_for.h>
 #include <vector>
@@ -146,7 +149,6 @@ namespace {
 
         PointCloudAdaptor cloud(data, num_points);
         KDTree index(3, cloud, nanoflann::KDTreeSingleIndexAdaptorParams(10));
-        index.buildIndex();
 
         auto result = lfs::core::Tensor::zeros({static_cast<size_t>(num_points)}, lfs::core::Device::CPU);
         float* result_data = result.ptr<float>();
@@ -177,117 +179,6 @@ namespace {
             }
 
             result_data[i] = (valid_neighbors > 0) ? (sum_dist / valid_neighbors) : 0.01f;
-        }
-
-        return result.to(points.device());
-    }
-
-    lfs::core::Tensor compute_mrnf_knn_log_scales(const lfs::core::Tensor& points) {
-        auto cpu_points = points.cpu();
-        const int num_points = cpu_points.size(0);
-
-        if (cpu_points.ndim() != 2 || cpu_points.size(1) != 3) {
-            LOG_ERROR("Input points must have shape [N, 3], got {}", cpu_points.shape().str());
-            return lfs::core::Tensor();
-        }
-
-        if (cpu_points.dtype() != lfs::core::DataType::Float32) {
-            LOG_ERROR("Input points must be float32");
-            return lfs::core::Tensor();
-        }
-
-        // Match MRNF: if there are too few points, use log_scale=0.
-        if (num_points < 3) {
-            auto zeros = lfs::core::Tensor::zeros(
-                {static_cast<size_t>(num_points), 3},
-                lfs::core::Device::CPU);
-            return zeros.to(points.device());
-        }
-
-        const float* data = cpu_points.ptr<float>();
-
-        constexpr float percentile = 0.75f;
-        std::vector<float> x_vals;
-        std::vector<float> y_vals;
-        std::vector<float> z_vals;
-        x_vals.reserve(num_points);
-        y_vals.reserve(num_points);
-        z_vals.reserve(num_points);
-        for (int i = 0; i < num_points; ++i) {
-            const float x = data[i * 3 + 0];
-            const float y = data[i * 3 + 1];
-            const float z = data[i * 3 + 2];
-            if (std::isfinite(x))
-                x_vals.push_back(x);
-            if (std::isfinite(y))
-                y_vals.push_back(y);
-            if (std::isfinite(z))
-                z_vals.push_back(z);
-        }
-
-        if (x_vals.empty() || y_vals.empty() || z_vals.empty()) {
-            auto zeros = lfs::core::Tensor::zeros(
-                {static_cast<size_t>(num_points), 3},
-                lfs::core::Device::CPU);
-            return zeros.to(points.device());
-        }
-
-        std::sort(x_vals.begin(), x_vals.end());
-        std::sort(y_vals.begin(), y_vals.end());
-        std::sort(z_vals.begin(), z_vals.end());
-
-        const auto idx_pair = [percentile](const size_t len) {
-            const size_t lower_idx = static_cast<size_t>(((1.0f - percentile) / 2.0f) * static_cast<float>(len));
-            const size_t upper_idx =
-                std::min(len - 1, static_cast<size_t>(((1.0f + percentile) / 2.0f) * static_cast<float>(len)));
-            return std::pair<size_t, size_t>{lower_idx, upper_idx};
-        };
-
-        const auto [lx, ux] = idx_pair(x_vals.size());
-        const auto [ly, uy] = idx_pair(y_vals.size());
-        const auto [lz, uz] = idx_pair(z_vals.size());
-
-        const float ex = (x_vals[ux] - x_vals[lx]) * 0.5f;
-        const float ey = (y_vals[uy] - y_vals[ly]) * 0.5f;
-        const float ez = (z_vals[uz] - z_vals[lz]) * 0.5f;
-
-        float sorted_extents[3] = {ex, ey, ez};
-        std::sort(sorted_extents, sorted_extents + 3);
-        const float median_size = std::max(sorted_extents[1] * 2.0f, 0.01f);
-        const float max_scale = median_size * 0.1f;
-
-        PointCloudAdaptor cloud(data, num_points);
-        KDTree index(3, cloud, nanoflann::KDTreeSingleIndexAdaptorParams(10));
-        index.buildIndex();
-
-        auto result = lfs::core::Tensor::zeros(
-            {static_cast<size_t>(num_points), 3},
-            lfs::core::Device::CPU);
-        float* result_data = result.ptr<float>();
-
-#pragma omp parallel for if (num_points > 1000)
-        for (int i = 0; i < num_points; i++) {
-            const float query_pt[3] = {
-                data[i * 3 + 0],
-                data[i * 3 + 1],
-                data[i * 3 + 2]};
-
-            constexpr size_t num_results = 3; // self + 2 nearest neighbors
-            std::vector<size_t> ret_indices(num_results);
-            std::vector<float> out_dists_sqr(num_results);
-
-            nanoflann::KNNResultSet<float> result_set(num_results);
-            result_set.init(&ret_indices[0], &out_dists_sqr[0]);
-            index.findNeighbors(result_set, &query_pt[0], nanoflann::SearchParameters(10));
-
-            const float a1 = std::sqrt(std::max(out_dists_sqr[1], 0.0f));
-            const float a2 = std::sqrt(std::max(out_dists_sqr[2], 0.0f));
-            const float dist = (a1 + a2) * 0.25f;
-            const float log_scale = std::log(std::clamp(dist, 1e-3f, max_scale));
-
-            result_data[i * 3 + 0] = log_scale;
-            result_data[i * 3 + 1] = log_scale;
-            result_data[i * 3 + 2] = log_scale;
         }
 
         return result.to(points.device());
@@ -976,6 +867,17 @@ namespace lfs::core {
 
     SplatData::~SplatData() = default;
 
+    SplatData::DensificationRows SplatData::densification_rows(const size_t n) {
+        auto& info = _densification_info;
+        if (!info.is_valid() || info.numel() == 0 || info.dtype() != DataType::Float32 || n == 0)
+            return {};
+        if (info.ndim() == 2 && info.shape()[0] >= 2 && info.shape()[1] >= n)
+            return {info.ptr<float>(), info.ptr<float>() + info.shape()[1]};
+        if (info.ndim() == 1 && info.shape()[0] >= n)
+            return {nullptr, info.ptr<float>()};
+        return {};
+    }
+
     SplatData SplatData::clone() const {
         // Tensor::clone() copies neither the name nor the row capacity.
         const auto cloned = [](const Tensor& src, const char* name = nullptr) {
@@ -1283,6 +1185,83 @@ namespace lfs::core {
             static_cast<size_t>(shN_cpu.numel()),
             n,
             k);
+    }
+
+    Tensor SplatData::shN_canonical_cpu_rows(const Tensor& row_indices) const {
+        return shN_canonical_cpu_rows(row_indices, get_max_sh_degree());
+    }
+
+    Tensor SplatData::shN_canonical_cpu_rows(const Tensor& row_indices, const int degree) const {
+        if (!row_indices.is_valid() || row_indices.device() != Device::CPU || row_indices.ndim() != 1 ||
+            (row_indices.dtype() != DataType::Int32 && row_indices.dtype() != DataType::Int64)) {
+            throw std::invalid_argument("SH rows must be a rank-1 CPU integer tensor");
+        }
+        if (degree < 0 || degree > get_max_sh_degree() || degree > MAX_SUPPORTED_SH_DEGREE) {
+            throw std::invalid_argument("SH degree is outside the model's supported range");
+        }
+        // Own the indices before validation and asynchronous device transfer.
+        const auto indices = row_indices.to(DataType::Int64).contiguous().clone();
+        const auto* rows = indices.ptr<int64_t>();
+        const size_t selected = indices.numel();
+        const size_t n = size();
+        for (size_t i = 0; i < selected; ++i) {
+            if (rows[i] < 0 || static_cast<uint64_t>(rows[i]) >= n)
+                throw std::out_of_range("SH row index is outside the model");
+        }
+        const auto k = sh_rest_coefficients_for_degree(degree);
+        if (selected == 0 || k == 0)
+            return Tensor::empty_pageable_host({selected, k, SH_CHANNELS}, DataType::Float32);
+
+        const auto layout = static_cast<uint32_t>(max_sh_coeffs_rest());
+        const bool quantized = shN_value_quantized();
+        const bool half = _shN.is_valid() && _shN.dtype() == DataType::Float16;
+        const size_t storage_cells = quantized ? sh_swizzled_padded_n(n) * layout * SH_CHANNELS
+                                               : sh_swizzled_float_count(n, layout);
+        if (!_shN.is_valid() || !_shN.is_contiguous() ||
+            (!half && _shN.dtype() != DataType::Float32) || _shN.numel() < storage_cells ||
+            (quantized && (!_shN_value_bounds.is_contiguous() || _shN_value_bounds.dtype() != DataType::Float32 ||
+                           _shN_value_bounds.device() != _shN.device() ||
+                           _shN_value_bounds.numel() < ((n + 255u) / 256u) * 2u))) {
+            throw std::invalid_argument("SH rows require complete resident storage");
+        }
+        if (_shN.device() == Device::CUDA) {
+            const auto stream = prepare_inputs_for_stream({&_shN});
+            const CUDAStreamGuard guard(stream);
+            const auto device_rows = indices.to(Device::CUDA, stream);
+            device_rows.sync_to_stream(stream);
+            auto out = Tensor::empty({selected, k, SH_CHANNELS}, Device::CUDA, DataType::Float32);
+            if (quantized) {
+                _shN_value_bounds.sync_to_stream(stream);
+                sh_value_quant::decode_shN_u16_gathered_to_canonical(
+                    static_cast<const uint16_t*>(_shN.data_ptr()), _shN_value_bounds.ptr<float>(),
+                    device_rows.ptr<int64_t>(), out.ptr<float>(), selected, n, layout, stream, k, true);
+            } else {
+                sh_value_quant::decode_shN_float_gathered_to_canonical(
+                    _shN.data_ptr(), half, device_rows.ptr<int64_t>(), out.ptr<float>(), selected, n,
+                    layout, k, stream);
+            }
+            return out.to_pageable_host(stream);
+        }
+        auto out = Tensor::empty_pageable_host({selected, k, SH_CHANNELS}, DataType::Float32);
+        auto* dst = out.ptr<float>();
+        tbb::parallel_for(tbb::blocked_range<size_t>(0, selected), [&](const tbb::blocked_range<size_t>& range) {
+            for (size_t i = range.begin(); i != range.end(); ++i) {
+                const auto row = static_cast<uint32_t>(rows[i]);
+                for (uint32_t cell = 0; cell < k * SH_CHANNELS; ++cell) {
+                    float value;
+                    if (quantized) {
+                        const auto q = static_cast<const uint16_t*>(_shN.data_ptr())[sh_value::shAtU16(row, cell, layout * SH_CHANNELS)];
+                        value = decode_q16_host(q, _shN_value_bounds.ptr<float>()[row / 256u * 2u],
+                                                _shN_value_bounds.ptr<float>()[row / 256u * 2u + 1u]);
+                    } else {
+                        const size_t offset = static_cast<size_t>(sh_swizzled_index(row, cell / 4u, layout)) * 4u + cell % 4u;
+                        value = half ? static_cast<float>(_shN.ptr<__half>()[offset]) : _shN.ptr<float>()[offset];
+                    }
+                    dst[i * k * SH_CHANNELS + cell] = value;
+                }
+            }
+        });
+        return out;
     }
 
     Tensor SplatData::shN_canonical_cpu_gpu_decoded() const {
@@ -2521,23 +2500,20 @@ namespace lfs::core {
         }
 
         Tensor loaded_deleted;
+        size_t loaded_deleted_count = 0;
         if (has_deleted) {
             Tensor deleted_host = deleted.device() == Device::CPU ? deleted : deleted.cpu();
             if (!deleted_host.is_contiguous()) {
                 deleted_host = deleted_host.contiguous();
             }
-            bool any_deleted = false;
             if (deleted_host.numel() > 0) {
                 const auto* const bytes =
                     static_cast<const unsigned char*>(deleted_host.data_ptr());
                 for (size_t i = 0, count = deleted_host.numel(); i < count; ++i) {
-                    if (bytes[i] != 0) {
-                        any_deleted = true;
-                        break;
-                    }
+                    loaded_deleted_count += bytes[i] != 0;
                 }
             }
-            if (any_deleted) {
+            if (loaded_deleted_count > 0) {
                 upload_keep_alive.push_back(deleted_host.to(DataType::Bool));
                 loaded_deleted = upload_keep_alive.back().to(Device::CUDA, upload_stream);
                 if (!loaded_deleted.is_contiguous()) {
@@ -2576,6 +2552,7 @@ namespace lfs::core {
         _opacity = std::move(loaded_opacity);
         _shN = std::move(loaded_shN);
         _deleted = std::move(loaded_deleted);
+        _deleted_count.store(loaded_deleted_count, std::memory_order_relaxed);
         _densification_info = std::move(loaded_densification);
         _frozen_ranges = std::move(loaded_frozen_ranges);
         _max_sh_degree = max_sh;
@@ -2797,8 +2774,12 @@ namespace lfs::core {
                     shN_canonical.cuda(), result->_shN, n,
                     static_cast<std::size_t>(sh_rest_coefficients_for_degree(max_sh_degree)),
                     static_cast<std::size_t>(sh_rest_coefficients_for_degree(max_sh_degree)));
-            if (deleted.is_valid())
-                result->_deleted = std::move(deleted).to(DataType::Bool).cuda();
+            if (deleted.is_valid()) {
+                auto deleted_bool = std::move(deleted).to(DataType::Bool);
+                result->_deleted_count.store(
+                    static_cast<size_t>(deleted_bool.sum_scalar()), std::memory_order_relaxed);
+                result->_deleted = std::move(deleted_bool).cuda();
+            }
             if (densification.is_valid() && densification.numel() > 0)
                 result->_densification_info = std::move(densification).cuda();
             result->_frozen_ranges = std::move(frozen_ranges);
@@ -2904,8 +2885,8 @@ namespace lfs::core {
             const float scene_scale = sorted_dists.first[dists.size(0) / 2].item();
 
             // RGB to SH conversion (DC component)
+            static constexpr float kInvSH = 0.28209479177387814f;
             auto rgb_to_sh = [](const Tensor& rgb) {
-                constexpr float kInvSH = 0.28209479177387814f;
                 return rgb.sub(0.5f).div(kInvSH);
             };
 
@@ -2991,218 +2972,38 @@ namespace lfs::core {
                 LOG_DEBUG("Computing and filling values...");
             }
 
-            // Compute parameter values on CPU to avoid pool allocations
-            Tensor means_cpu, scaling_cpu, rotation_cpu, opacity_cpu, sh0_cpu, shN_cpu;
-
             if (capacity > 0) {
-                LOG_DEBUG("Computing values on CPU");
-                LOG_DEBUG("  positions tensor: is_valid={}, device={}, shape={}, numel={}",
-                          positions.is_valid(), positions.device() == Device::CUDA ? "CUDA" : "CPU",
-                          positions.shape().str(), positions.numel());
+                // Fill the preallocated parameters in place so the pool sees no full-size temporaries.
+                means_.copy_from(params.optimization.random ? positions.mul(scene_scale) : positions);
 
-                // Compute means on CPU
-                auto positions_cpu = positions.cpu();
-                LOG_DEBUG("  positions_cpu after .cpu(): is_valid={}, ptr={}, device={}, shape={}, numel={}",
-                          positions_cpu.is_valid(), static_cast<const void*>(positions_cpu.ptr<float>()),
-                          positions_cpu.device() == Device::CUDA ? "CUDA" : "CPU",
-                          positions_cpu.shape().str(), positions_cpu.numel());
-
-                if (params.optimization.random) {
-                    means_cpu = positions_cpu.mul(scene_scale);
-                } else {
-                    means_cpu = positions_cpu;
-                }
-                LOG_DEBUG("  means_cpu computed: is_valid={}, ptr={}, device={}, shape={}, numel={}",
-                          means_cpu.is_valid(), static_cast<const void*>(means_cpu.ptr<float>()),
-                          means_cpu.device() == Device::CUDA ? "CUDA" : "CPU",
-                          means_cpu.shape().str(), means_cpu.numel());
-
-                // Compute scaling on CPU
-                LOG_DEBUG("  Computing neighbor distances...");
                 if (lfs::core::param::is_mrnf_strategy(params.optimization.strategy)) {
-                    scaling_cpu = compute_mrnf_knn_log_scales(means_cpu);
+                    if (num_points >= 3)
+                        cuda::mrnf_knn_log_scales(means_, scaling_);
+                    else
+                        scaling_.zero_();
                 } else {
-                    auto nn_dist = compute_mean_neighbor_distances(means_cpu).clamp_min(1e-7f);
-                    LOG_DEBUG("  nn_dist computed: is_valid={}, shape={}, numel={}",
-                              nn_dist.is_valid(), nn_dist.shape().str(), nn_dist.numel());
-
+                    auto nn_dist = compute_mean_neighbor_distances(means_).clamp_min(1e-7f);
                     std::vector<int> scale_expand_shape = {static_cast<int>(num_points), 3};
-                    scaling_cpu = nn_dist.sqrt()
-                                      .mul(params.optimization.init_scaling)
-                                      .log()
-                                      .unsqueeze(-1)
-                                      .expand(std::span<const int>(scale_expand_shape));
-                }
-                LOG_DEBUG("  scaling_cpu computed: is_valid={}, ptr={}, device={}, shape={}, numel={}",
-                          scaling_cpu.is_valid(), static_cast<const void*>(scaling_cpu.ptr<float>()),
-                          scaling_cpu.device() == Device::CUDA ? "CUDA" : "CPU",
-                          scaling_cpu.shape().str(), scaling_cpu.numel());
-
-                // Create identity quaternion rotations on CPU
-                LOG_DEBUG("  Creating identity quaternions...");
-                rotation_cpu = Tensor::zeros({num_points, 4}, Device::CPU);
-                auto rot_acc = rotation_cpu.accessor<float, 2>();
-                for (size_t i = 0; i < num_points; i++) {
-                    rot_acc(i, 0) = 1.0f;
-                }
-                LOG_DEBUG("  rotation_cpu created: is_valid={}, ptr={}, shape={}, numel={}",
-                          rotation_cpu.is_valid(), static_cast<const void*>(rotation_cpu.ptr<float>()),
-                          rotation_cpu.shape().str(), rotation_cpu.numel());
-
-                // Compute opacity on CPU
-                LOG_DEBUG("  Computing opacity (init_val={})...", params.optimization.init_opacity);
-                auto init_val = params.optimization.init_opacity;
-                opacity_cpu = Tensor::full({num_points, 1}, init_val, Device::CPU).logit();
-                LOG_DEBUG("  opacity_cpu computed: is_valid={}, ptr={}, shape={}, numel={}",
-                          opacity_cpu.is_valid(), static_cast<const void*>(opacity_cpu.ptr<float>()),
-                          opacity_cpu.shape().str(), opacity_cpu.numel());
-
-                // Compute SH coefficients on CPU
-                LOG_DEBUG("  Computing SH coefficients...");
-                LOG_DEBUG("    colors tensor: is_valid={}, device={}, shape={}, numel={}",
-                          colors.is_valid(), colors.device() == Device::CUDA ? "CUDA" : "CPU",
-                          colors.shape().str(), colors.numel());
-
-                auto colors_cpu = colors.cpu();
-                LOG_DEBUG("    colors_cpu: is_valid={}, ptr={}, shape={}, numel={}",
-                          colors_cpu.is_valid(), static_cast<const void*>(colors_cpu.ptr<float>()),
-                          colors_cpu.shape().str(), colors_cpu.numel());
-
-                auto fused_color = rgb_to_sh(colors_cpu);
-                LOG_DEBUG("    fused_color: is_valid={}, shape={}, numel={}",
-                          fused_color.is_valid(), fused_color.shape().str(), fused_color.numel());
-
-                if (direct_q16) {
-                    sh0_cpu = fused_color.unsqueeze(1).contiguous();
-                } else {
-                    auto shs_cpu_tensor = Tensor::zeros(
-                        {fused_color.size(0), static_cast<size_t>(feature_shape), 3},
-                        Device::CPU);
-                    auto shs_acc = shs_cpu_tensor.accessor<float, 3>();
-                    auto fused_acc = fused_color.accessor<float, 2>();
-                    for (size_t i = 0; i < fused_color.size(0); ++i) {
-                        for (size_t c = 0; c < 3; ++c) {
-                            shs_acc(i, 0, c) = fused_acc(i, c);
-                        }
-                    }
-                    sh0_cpu = shs_cpu_tensor.slice(1, 0, 1).contiguous();
-                    if (feature_shape > 1) {
-                        shN_cpu = shs_cpu_tensor.slice(1, 1, feature_shape).contiguous();
-                    } else {
-                        shN_cpu = Tensor::zeros({shs_cpu_tensor.size(0), 0, 3}, Device::CPU);
-                    }
-                }
-                LOG_DEBUG("  sh0_cpu: is_valid={}, ptr={}, shape={}, numel={}",
-                          sh0_cpu.is_valid(), static_cast<const void*>(sh0_cpu.ptr<float>()),
-                          sh0_cpu.shape().str(), sh0_cpu.numel());
-                if (shN_cpu.is_valid()) {
-                    LOG_DEBUG("  shN_cpu: shape={}, numel={}",
-                              shN_cpu.shape().str(), shN_cpu.numel());
+                    scaling_.copy_from(nn_dist
+                                           .mul(params.optimization.init_scaling)
+                                           .log()
+                                           .unsqueeze(-1)
+                                           .expand(std::span<const int>(scale_expand_shape))
+                                           .contiguous());
                 }
 
-                // Copy CPU data to direct CUDA tensors
-                LOG_DEBUG("Copying CPU values to direct CUDA tensors");
-                cudaError_t err;
+                rotation_.zero_();
+                rotation_.slice(1, 0, 1).fill_(1.0f);
 
-                // Means copy
-                LOG_DEBUG("  Copying means: src_ptr={}, dst_ptr={}, bytes={}",
-                          static_cast<const void*>(means_cpu.ptr<float>()),
-                          static_cast<void*>(means_.ptr<float>()),
-                          means_cpu.numel() * sizeof(float));
-                err = cudaMemcpy(means_.ptr<float>(), means_cpu.ptr<float>(),
-                                 means_cpu.numel() * sizeof(float), cudaMemcpyHostToDevice);
-                if (err != cudaSuccess) {
-                    LOG_ERROR("cudaMemcpy failed for means:");
-                    LOG_ERROR("  src (CPU): is_valid={}, ptr={}, device={}, numel={}",
-                              means_cpu.is_valid(), static_cast<const void*>(means_cpu.ptr<float>()),
-                              means_cpu.device() == Device::CPU ? "CPU" : "CUDA", means_cpu.numel());
-                    LOG_ERROR("  dst (CUDA): is_valid={}, ptr={}, device={}, numel={}",
-                              means_.is_valid(), static_cast<void*>(means_.ptr<float>()),
-                              means_.device() == Device::CPU ? "CPU" : "CUDA", means_.numel());
-                    throw TensorError("cudaMemcpy failed for means: " + std::string(cudaGetErrorString(err)));
-                }
-                LOG_DEBUG("  Means copy successful");
+                const float init_opacity = std::clamp(params.optimization.init_opacity, 1e-7f, 1.0f - 1e-7f);
+                opacity_.fill_(std::log(init_opacity / (1.0f - init_opacity)));
 
-                // Scaling copy
-                LOG_DEBUG("  Copying scaling: src_ptr={}, dst_ptr={}, bytes={}",
-                          static_cast<const void*>(scaling_cpu.ptr<float>()),
-                          static_cast<void*>(scaling_.ptr<float>()),
-                          scaling_cpu.numel() * sizeof(float));
-                err = cudaMemcpy(scaling_.ptr<float>(), scaling_cpu.ptr<float>(),
-                                 scaling_cpu.numel() * sizeof(float), cudaMemcpyHostToDevice);
-                if (err != cudaSuccess) {
-                    LOG_ERROR("cudaMemcpy failed for scaling:");
-                    LOG_ERROR("  src (CPU): is_valid={}, ptr={}, numel={}",
-                              scaling_cpu.is_valid(), static_cast<const void*>(scaling_cpu.ptr<float>()), scaling_cpu.numel());
-                    LOG_ERROR("  dst (CUDA): is_valid={}, ptr={}, numel={}",
-                              scaling_.is_valid(), static_cast<void*>(scaling_.ptr<float>()), scaling_.numel());
-                    throw TensorError("cudaMemcpy failed for scaling: " + std::string(cudaGetErrorString(err)));
-                }
-                LOG_DEBUG("  Scaling copy successful");
-
-                // Rotation copy
-                LOG_DEBUG("  Copying rotation: src_ptr={}, dst_ptr={}, bytes={}",
-                          static_cast<const void*>(rotation_cpu.ptr<float>()),
-                          static_cast<void*>(rotation_.ptr<float>()),
-                          rotation_cpu.numel() * sizeof(float));
-                err = cudaMemcpy(rotation_.ptr<float>(), rotation_cpu.ptr<float>(),
-                                 rotation_cpu.numel() * sizeof(float), cudaMemcpyHostToDevice);
-                if (err != cudaSuccess) {
-                    LOG_ERROR("cudaMemcpy failed for rotation:");
-                    LOG_ERROR("  src (CPU): is_valid={}, ptr={}, numel={}",
-                              rotation_cpu.is_valid(), static_cast<const void*>(rotation_cpu.ptr<float>()), rotation_cpu.numel());
-                    LOG_ERROR("  dst (CUDA): is_valid={}, ptr={}, numel={}",
-                              rotation_.is_valid(), static_cast<void*>(rotation_.ptr<float>()), rotation_.numel());
-                    throw TensorError("cudaMemcpy failed for rotation: " + std::string(cudaGetErrorString(err)));
-                }
-                LOG_DEBUG("  Rotation copy successful");
-
-                // Opacity copy
-                LOG_DEBUG("  Copying opacity: src_ptr={}, dst_ptr={}, bytes={}",
-                          static_cast<const void*>(opacity_cpu.ptr<float>()),
-                          static_cast<void*>(opacity_.ptr<float>()),
-                          opacity_cpu.numel() * sizeof(float));
-                err = cudaMemcpy(opacity_.ptr<float>(), opacity_cpu.ptr<float>(),
-                                 opacity_cpu.numel() * sizeof(float), cudaMemcpyHostToDevice);
-                if (err != cudaSuccess) {
-                    LOG_ERROR("cudaMemcpy failed for opacity:");
-                    LOG_ERROR("  src (CPU): is_valid={}, ptr={}, numel={}",
-                              opacity_cpu.is_valid(), static_cast<const void*>(opacity_cpu.ptr<float>()), opacity_cpu.numel());
-                    LOG_ERROR("  dst (CUDA): is_valid={}, ptr={}, numel={}",
-                              opacity_.is_valid(), static_cast<void*>(opacity_.ptr<float>()), opacity_.numel());
-                    throw TensorError("cudaMemcpy failed for opacity: " + std::string(cudaGetErrorString(err)));
-                }
-                LOG_DEBUG("  Opacity copy successful");
-
-                // SH0 copy
-                LOG_DEBUG("  Copying sh0: src_ptr={}, dst_ptr={}, bytes={}",
-                          static_cast<const void*>(sh0_cpu.ptr<float>()),
-                          static_cast<void*>(sh0_.ptr<float>()),
-                          sh0_cpu.numel() * sizeof(float));
-                err = cudaMemcpy(sh0_.ptr<float>(), sh0_cpu.ptr<float>(),
-                                 sh0_cpu.numel() * sizeof(float), cudaMemcpyHostToDevice);
-                if (err != cudaSuccess) {
-                    LOG_ERROR("cudaMemcpy failed for sh0:");
-                    LOG_ERROR("  src (CPU): is_valid={}, ptr={}, numel={}",
-                              sh0_cpu.is_valid(), static_cast<const void*>(sh0_cpu.ptr<float>()), sh0_cpu.numel());
-                    LOG_ERROR("  dst (CUDA): is_valid={}, ptr={}, numel={}",
-                              sh0_.is_valid(), static_cast<void*>(sh0_.ptr<float>()), sh0_.numel());
-                    throw TensorError("cudaMemcpy failed for sh0: " + std::string(cudaGetErrorString(err)));
-                }
-                LOG_DEBUG("  SH0 copy successful");
+                sh0_.copy_from(colors.unsqueeze(1));
+                sh0_.sub_(0.5f).div_(kInvSH);
 
                 if (!direct_q16) {
-                    reorder_canonical_into_swizzled(
-                        shN_cpu, shN_, num_points,
-                        static_cast<uint32_t>(feature_shape - 1),
-                        static_cast<uint32_t>(feature_shape - 1));
-                    err = cudaGetLastError();
-                    if (err != cudaSuccess) {
-                        throw TensorError("SH swizzle failed for shN: " + std::string(cudaGetErrorString(err)));
-                    }
+                    shN_.zero_();
                 }
-
-                LOG_DEBUG("All CPU to CUDA copies completed successfully");
             } else {
                 // No capacity specified - use pool
                 Tensor means_temp;
@@ -3214,11 +3015,13 @@ namespace lfs::core {
 
                 Tensor scaling_temp;
                 if (lfs::core::param::is_mrnf_strategy(params.optimization.strategy)) {
-                    scaling_temp = compute_mrnf_knn_log_scales(means_temp).cuda();
+                    scaling_temp = Tensor::zeros({num_points, 3}, Device::CUDA);
+                    if (num_points >= 3)
+                        cuda::mrnf_knn_log_scales(means_temp, scaling_temp);
                 } else {
                     auto nn_dist = compute_mean_neighbor_distances(means_temp).clamp_min(1e-7f);
                     std::vector<int> scale_expand_shape = {static_cast<int>(num_points), 3};
-                    scaling_temp = nn_dist.sqrt()
+                    scaling_temp = nn_dist
                                        .mul(params.optimization.init_scaling)
                                        .log()
                                        .unsqueeze(-1)
@@ -3267,8 +3070,6 @@ namespace lfs::core {
             }
 
             LOG_INFO("Scene scale: {}", scene_scale);
-            LOG_INFO("Initialized SplatData: {} points, max SH degree: {}, SH coefficients: {}, sh0 shape: {}, shN shape: {}",
-                     num_points, params.optimization.sh_degree, feature_shape, sh0_.shape().str(), shN_.shape().str());
 
             auto result = SplatData(
                 params.optimization.sh_degree,
@@ -3367,7 +3168,7 @@ namespace lfs::core {
             n,
             rest,
             stream);
-        LFS_CUDA_CHECK_MSG(cudaDeviceSynchronize(), "sh_value quant codec device barrier");
+        LFS_CUDA_CHECK_MSG(cudaStreamSynchronize(stream), "sh_value quant codec stream barrier");
 
         shN = std::move(u16);
         shN_value_bounds() = std::move(bounds);

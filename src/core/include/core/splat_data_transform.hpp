@@ -4,8 +4,13 @@
 
 #pragma once
 
+#include "core/error.hpp"
 #include "core/export.hpp"
+#include <expected>
 #include <glm/glm.hpp>
+#include <memory>
+#include <span>
+#include <string>
 
 namespace lfs::geometry {
     class BoundingBox;
@@ -17,6 +22,7 @@ namespace lfs::core {
     class SplatData;
     class Tensor;
     struct PointCloud;
+    struct CropPolygonData;
 
     /**
      * @brief Apply a transformation matrix to SplatData
@@ -30,6 +36,13 @@ namespace lfs::core {
                                              const glm::vec3& crop_min,
                                              const glm::vec3& crop_max,
                                              const glm::mat4& points_to_cropbox);
+
+    // Rows of means (first three columns) inside the extruded polygon: |z| <= half_depth in the
+    // polygon frame and the even-odd rule over the outline, the test crop_polygon::containsPoint makes.
+    LFS_CORE_API Tensor compute_crop_polygon_mask(const Tensor& means,
+                                                  std::span<const glm::vec2> vertices,
+                                                  float half_depth,
+                                                  const glm::mat4& points_to_polygon);
 
     /**
      * @brief Crop SplatData by a bounding box (creates new filtered copy)
@@ -55,6 +68,13 @@ namespace lfs::core {
                                                const glm::mat4& transform,
                                                const glm::vec3& radii,
                                                bool inverse = false);
+
+    // Soft crop by an extruded polygon: mark gaussians as deleted if outside the prism
+    // world_to_local: world-to-polygon-local transform (combined with node world transform)
+    // Inside means |z| <= half_depth and the even-odd rule holds for (x, y).
+    LFS_CORE_API Tensor soft_crop_by_polygon(SplatData& splat_data,
+                                             const glm::mat4& world_to_local,
+                                             const CropPolygonData& polygon);
 
     /**
      * @brief Randomly select a subset of splats
@@ -96,5 +116,14 @@ namespace lfs::core {
 
     // Extract gaussians where mask is non-zero
     LFS_CORE_API SplatData extract_by_mask(const SplatData& splat_data, const Tensor& mask);
+
+    // Full-detail splats of a model with an LOD tree: the leaves that are not soft-deleted, with
+    // LOD-encoded linear opacity converted back to logits. Fails when the leaves stream from disk.
+    LFS_CORE_API lfs::Result<SplatData> extract_lod_leaves(const SplatData& splat_data);
+
+    // Flat render view of a model with an LOD tree: shares its tensors, hides the interior nodes
+    // through the deleted mask and converts LOD-encoded linear opacity to logits. Rows keep their
+    // order, so selection and transform indices stay valid.
+    LFS_CORE_API std::shared_ptr<SplatData> make_lod_leaf_view(const SplatData& splat_data);
 
 } // namespace lfs::core
